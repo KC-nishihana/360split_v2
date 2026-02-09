@@ -209,14 +209,16 @@ def run_cli(args):
 
     # 動画読み込み
     loader = VideoLoader()
-    if not loader.load(video_path):
-        logger.error("動画の読み込みに失敗しました。")
+    try:
+        loader.load(video_path)
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.error(f"動画の読み込みに失敗しました: {e}")
         sys.exit(1)
 
     meta = loader.get_metadata()
-    logger.info(f"動画情報: {meta['width']}x{meta['height']}, "
-                f"{meta['fps']:.1f}fps, {meta['frame_count']}フレーム, "
-                f"{meta['duration']:.1f}秒")
+    logger.info(f"動画情報: {meta.width}x{meta.height}, "
+                f"{meta.fps:.1f}fps, {meta.frame_count}フレーム, "
+                f"{meta.duration:.1f}秒")
 
     # キーフレーム選択
     selector = KeyframeSelector(config)
@@ -295,10 +297,10 @@ def run_cli(args):
     # メタデータ出力
     metadata = {
         "video_path": str(Path(video_path).resolve()),
-        "total_frames": meta["frame_count"],
-        "fps": meta["fps"],
-        "duration": meta["duration"],
-        "resolution": f"{meta['width']}x{meta['height']}",
+        "total_frames": meta.frame_count,
+        "fps": meta.fps,
+        "duration": meta.duration,
+        "resolution": f"{meta.width}x{meta.height}",
         "keyframe_count": len(keyframes),
         "settings": config,
         "keyframes": [

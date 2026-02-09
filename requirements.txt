@@ -1,6 +1,15 @@
+# === 必須 ===
 PySide6>=6.5.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 scipy>=1.11.0
 scikit-image>=0.21.0
 Pillow>=10.0.0
+
+# === GPU高速化（オプショナル） ===
+# Apple Silicon (MPS): pip install torch torchvision
+# Windows CUDA:        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Windows CUDA OpenCV: pip install opencv-contrib-python  (CUDA対応ビルド)
+#
+# torch>=2.0.0
+# torchvision>=0.15.0

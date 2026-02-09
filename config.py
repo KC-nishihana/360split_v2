@@ -39,6 +39,16 @@ WEIGHT_EXPOSURE = 0.15                # 露光スコア重み
 WEIGHT_GEOMETRIC = 0.30               # 幾何学的スコア重み
 WEIGHT_CONTENT = 0.25                 # コンテンツ変化スコア重み
 
+# === 高速化パラメータ ===
+EVAL_SCALE = 0.5                      # 品質評価時のダウンスケール率（0.25-1.0）
+SSIM_SCALE = 0.5                      # SSIM計算時のダウンスケール率
+FRAME_CACHE_SIZE = 100                # フレームキャッシュ容量（LRU）
+PREFETCH_AHEAD = 10                   # フレームプリフェッチ先読み数
+BATCH_SIZE = 32                       # バッチ処理サイズ（並列処理用）
+FEATURE_CACHE_SIZE = 50               # 特徴点キャッシュ容量
+STAGE1_QUALITY_THRESHOLD = 0.3        # Stage 1 品質フィルタ閾値（低品質除外）
+USE_SPARSE_FLOW = True                # スパースオプティカルフロー使用（True推奨）
+
 # === GUI設定 ===
 THUMBNAIL_SIZE = (192, 108)           # サムネイルサイズ
 TIMELINE_HEIGHT = 80                  # タイムラインウィジェット高さ

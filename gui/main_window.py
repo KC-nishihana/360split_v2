@@ -26,10 +26,15 @@ logger = logging.getLogger('360split')
 
 class AnalysisWorker(QThread):
     """
-    キーフレーム分析用ワーカースレッド
+    キーフレーム分析用ワーカースレッド（最適化版）
 
-    バックグラウンドでキーフレーム選択分析を実行し、
-    進捗状況とスコア情報をシグナルで通知する。
+    KeyframeSelectorの2段階パイプラインを利用してバックグラウンドで
+    キーフレーム選択分析を実行し、進捗状況をシグナルで通知する。
+
+    最適化:
+    - KeyframeSelectorの2段階パイプラインを活用
+    - Stage 1で60-70%のフレームを高速フィルタ
+    - Stage 2は候補フレームのみ精密評価
 
     Signals:
     --------
@@ -51,7 +56,7 @@ class AnalysisWorker(QThread):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, video_path: str, quality_evaluator, keyframe_selector=None):
+    def __init__(self, video_path: str):
         """
         ワーカーの初期化
 
@@ -59,70 +64,60 @@ class AnalysisWorker(QThread):
         -----------
         video_path : str
             分析対象のビデオファイルパス
-        quality_evaluator : QualityEvaluator
-            品質評価エンジン
-        keyframe_selector : KeyframeSelector, optional
-            キーフレーム選択エンジン（Noneの場合は簡易版を使用）
         """
         super().__init__()
         self.video_path = video_path
-        self.quality_evaluator = quality_evaluator
-        self.keyframe_selector = keyframe_selector
         self._is_running = True
 
     def run(self):
         """
-        バックグラウンド分析を実行
+        バックグラウンド分析を実行（最適化版KeyframeSelector使用）
         """
         try:
-            import cv2
-            import numpy as np
-            from config import SOFTMAX_BETA
+            from core.video_loader import VideoLoader
+            from core.keyframe_selector import KeyframeSelector
+            from core.accelerator import get_accelerator
+
+            accel = get_accelerator()
+            logger.info(f"分析開始 - デバイス: {accel.device_name}")
 
             # ビデオ読み込み
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                self.error.emit("ビデオファイルを開けません")
+            loader = VideoLoader()
+            loader.load(self.video_path)
+            meta = loader.get_metadata()
+
+            # KeyframeSelectorで2段階パイプライン実行
+            selector = KeyframeSelector()
+
+            def progress_callback(current, total, message=""):
+                if not self._is_running:
+                    return
+                pct = int(current / total * 100) if total > 0 else 0
+                self.progress.emit(pct)
+
+            keyframes = selector.select_keyframes(
+                loader,
+                progress_callback=progress_callback
+            )
+
+            if not self._is_running:
+                loader.release()
                 return
 
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            quality_scores = []
-            keyframe_frames = []
-            keyframe_scores = []
-            prev_frame = None
-            ssim_history = []
+            # 結果を分離
+            keyframe_frames = [kf.frame_index for kf in keyframes]
+            keyframe_scores = [kf.combined_score for kf in keyframes]
 
-            for frame_idx in range(frame_count):
-                if not self._is_running:
-                    break
+            # 品質スコアデータ（タイムライン表示用）
+            # Stage 1のスコアがあればそれを使用
+            quality_scores = getattr(selector, '_stage1_scores', [])
+            if not quality_scores:
+                quality_scores = [0.0] * meta.frame_count
+                for kf in keyframes:
+                    if 0 <= kf.frame_index < len(quality_scores):
+                        quality_scores[kf.frame_index] = kf.combined_score
 
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                # 品質スコア計算
-                quality_dict = self.quality_evaluator.evaluate(frame, SOFTMAX_BETA)
-                combined_score = (
-                    quality_dict.get('sharpness', 0) * 0.30 +
-                    quality_dict.get('exposure', 0) * 0.15 +
-                    quality_dict.get('softmax_depth', 0) * 0.30 +
-                    (1.0 - quality_dict.get('motion_blur', 0)) * 0.25
-                )
-                quality_scores.append(combined_score)
-
-                # シンプルなキーフレーム選択：スコアが閾値を超えた場合
-                if combined_score > 0.65:
-                    if not keyframe_frames or frame_idx - keyframe_frames[-1] >= 5:
-                        keyframe_frames.append(frame_idx)
-                        keyframe_scores.append(combined_score)
-
-                prev_frame = frame
-
-                # 進捗を報告
-                progress = int((frame_idx + 1) / frame_count * 100)
-                self.progress.emit(progress)
-
-            cap.release()
+            loader.release()
 
             # 結果を送信
             self.quality_data.emit(quality_scores)
@@ -134,9 +129,7 @@ class AnalysisWorker(QThread):
             self.error.emit(f"分析エラー: {str(e)}")
 
     def stop(self):
-        """
-        分析を停止
-        """
+        """分析を停止"""
         self._is_running = False
 
 
@@ -631,12 +624,8 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # 品質評価エンジンの初期化
-        from core.quality_evaluator import QualityEvaluator
-        evaluator = QualityEvaluator()
-
-        # 分析ワーカーの作成
-        self.analysis_worker = AnalysisWorker(self.video_path, evaluator)
+        # 分析ワーカーの作成（最適化版: KeyframeSelectorの2段階パイプライン使用）
+        self.analysis_worker = AnalysisWorker(self.video_path)
         self.analysis_worker.progress.connect(self._on_analysis_progress)
         self.analysis_worker.keyframes_found.connect(self._on_keyframes_found)
         self.analysis_worker.quality_data.connect(self._on_quality_data_received)

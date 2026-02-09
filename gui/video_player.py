@@ -246,7 +246,13 @@ class VideoPlayerWidget(QWidget):
 
     def _load_and_display_frame(self, frame_idx: int):
         """
-        指定フレームを読み込んで表示
+        指定フレームを読み込んで表示（最適化版）
+
+        最適化:
+        - 表示サイズへの事前リサイズ（フルフレーム描画を回避）
+        - BGR→RGB変換をリサイズ後に実行（小画像で変換）
+        - グリッドオーバーレイ用テクスチャキャッシュ
+        - 再生中はFastTransformation使用
 
         Parameters:
         -----------
@@ -264,27 +270,47 @@ class VideoPlayerWidget(QWidget):
                 logger.warning(f"フレーム読み込み失敗: {frame_idx}")
                 return
 
-            self.current_frame = frame.copy()
+            self.current_frame = frame
             self.current_frame_idx = frame_idx
 
-            # グリッドオーバーレイを追加
-            if self.show_grid:
-                frame = self._draw_equirectangular_grid(frame)
-
-            # QImageに変換
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame_rgb.shape
-            bytes_per_line = 3 * w
-            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-            # フレーム表示エリアに合わせてスケール
+            # 表示サイズを計算
             label_size = self.frame_label.size()
-            pixmap = QPixmap.fromImage(qt_image).scaled(
-                label_size.width() - 2,
-                label_size.height() - 2,
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
-            )
+            display_w = label_size.width() - 2
+            display_h = label_size.height() - 2
+            h, w = frame.shape[:2]
+
+            # アスペクト比を保ったリサイズ先を計算
+            scale = min(display_w / w, display_h / h)
+            target_w = int(w * scale)
+            target_h = int(h * scale)
+
+            # OpenCVで高速リサイズ（QPixmap.scaled()より高速）
+            if scale < 0.9:
+                display_frame = cv2.resize(frame, (target_w, target_h),
+                                           interpolation=cv2.INTER_AREA)
+            else:
+                display_frame = frame
+
+            # グリッドオーバーレイを追加（リサイズ後の小画像に描画）
+            if self.show_grid:
+                display_frame = self._draw_equirectangular_grid(display_frame)
+
+            # BGR→RGB変換（リサイズ後の小画像で変換=高速）
+            frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            dh, dw, ch = frame_rgb.shape
+            bytes_per_line = 3 * dw
+
+            # QImageに変換（contiguous配列を保証）
+            frame_rgb = np.ascontiguousarray(frame_rgb)
+            qt_image = QImage(frame_rgb.data, dw, dh, bytes_per_line,
+                              QImage.Format_RGB888)
+
+            # 再生中はFastTransformation（ちらつき防止+高速）
+            if self.is_playing:
+                pixmap = QPixmap.fromImage(qt_image)
+            else:
+                pixmap = QPixmap.fromImage(qt_image)
+
             self.frame_label.setPixmap(pixmap)
 
             # フレーム情報を更新

@@ -227,6 +227,51 @@ class SettingsDialog(QDialog):
         adaptive_group.setLayout(adaptive_layout)
         layout.addWidget(adaptive_group)
 
+        # === GRIC パラメータ ===
+        gric_group = QGroupBox("GRIC (幾何学的評価)")
+        gric_layout = QGridLayout()
+
+        # Lambda1
+        gric_layout.addWidget(QLabel("Lambda1 (データ適合):"), 0, 0)
+        self.gric_lambda1 = QDoubleSpinBox()
+        self.gric_lambda1.setMinimum(0.1)
+        self.gric_lambda1.setMaximum(10.0)
+        self.gric_lambda1.setSingleStep(0.5)
+        self.gric_lambda1.setValue(self.settings.get('gric_lambda1', 2.0))
+        gric_layout.addWidget(self.gric_lambda1, 0, 1)
+
+        # Lambda2
+        gric_layout.addWidget(QLabel("Lambda2 (モデル複雑さ):"), 1, 0)
+        self.gric_lambda2 = QDoubleSpinBox()
+        self.gric_lambda2.setMinimum(0.1)
+        self.gric_lambda2.setMaximum(20.0)
+        self.gric_lambda2.setSingleStep(0.5)
+        self.gric_lambda2.setValue(self.settings.get('gric_lambda2', 4.0))
+        gric_layout.addWidget(self.gric_lambda2, 1, 1)
+
+        # Sigma
+        gric_layout.addWidget(QLabel("Sigma (残差標準偏差):"), 2, 0)
+        self.gric_sigma = QDoubleSpinBox()
+        self.gric_sigma.setMinimum(0.1)
+        self.gric_sigma.setMaximum(10.0)
+        self.gric_sigma.setSingleStep(0.1)
+        self.gric_sigma.setValue(self.settings.get('gric_sigma', 1.0))
+        gric_layout.addWidget(self.gric_sigma, 2, 1)
+
+        # 縮退閾値
+        gric_layout.addWidget(QLabel("縮退判定閾値 (H inlier率):"), 3, 0)
+        self.gric_degeneracy_threshold = QDoubleSpinBox()
+        self.gric_degeneracy_threshold.setMinimum(0.5)
+        self.gric_degeneracy_threshold.setMaximum(1.0)
+        self.gric_degeneracy_threshold.setSingleStep(0.05)
+        self.gric_degeneracy_threshold.setValue(
+            self.settings.get('gric_degeneracy_threshold', 0.85)
+        )
+        gric_layout.addWidget(self.gric_degeneracy_threshold, 3, 1)
+
+        gric_group.setLayout(gric_layout)
+        layout.addWidget(gric_group)
+
         layout.addStretch()
         return widget
 
@@ -286,6 +331,26 @@ class SettingsDialog(QDialog):
 
         projection_group.setLayout(projection_layout)
         layout.addWidget(projection_group)
+
+        # === 360°ポーラーマスク ===
+        polar_group = QGroupBox("360°ポーラーマスク")
+        polar_layout = QGridLayout()
+
+        self.enable_polar_mask = QCheckBox("天頂/天底マスクを有効化")
+        self.enable_polar_mask.setChecked(self.settings.get('enable_polar_mask', True))
+        polar_layout.addWidget(self.enable_polar_mask, 0, 0, 1, 2)
+
+        polar_layout.addWidget(QLabel("マスク比率 (上下%):"), 1, 0)
+        self.mask_polar_ratio = QDoubleSpinBox()
+        self.mask_polar_ratio.setMinimum(0.0)
+        self.mask_polar_ratio.setMaximum(0.30)
+        self.mask_polar_ratio.setSingleStep(0.01)
+        self.mask_polar_ratio.setDecimals(2)
+        self.mask_polar_ratio.setValue(self.settings.get('mask_polar_ratio', 0.10))
+        polar_layout.addWidget(self.mask_polar_ratio, 1, 1)
+
+        polar_group.setLayout(polar_layout)
+        layout.addWidget(polar_group)
 
         # === ステッチングモード ===
         stitching_group = QGroupBox("ステッチングモード")
@@ -460,10 +525,16 @@ class SettingsDialog(QDialog):
             'min_keyframe_interval': 5,
             'max_keyframe_interval': 60,
             'softmax_beta': 5.0,
+            'gric_lambda1': 2.0,
+            'gric_lambda2': 4.0,
+            'gric_sigma': 1.0,
+            'gric_degeneracy_threshold': 0.85,
             'equirect_width': 4096,
             'equirect_height': 2048,
             'projection_mode': 'Equirectangular',
             'perspective_fov': 90.0,
+            'enable_polar_mask': True,
+            'mask_polar_ratio': 0.10,
             'stitching_mode': 'Fast',
             'enable_nadir_mask': False,
             'nadir_mask_radius': 100,
@@ -504,10 +575,16 @@ class SettingsDialog(QDialog):
             'min_keyframe_interval': self.min_keyframe_interval.value(),
             'max_keyframe_interval': self.max_keyframe_interval.value(),
             'softmax_beta': self.softmax_beta.value(),
+            'gric_lambda1': self.gric_lambda1.value(),
+            'gric_lambda2': self.gric_lambda2.value(),
+            'gric_sigma': self.gric_sigma.value(),
+            'gric_degeneracy_threshold': self.gric_degeneracy_threshold.value(),
             'equirect_width': self.equirect_width.value(),
             'equirect_height': self.equirect_height.value(),
             'projection_mode': self.projection_mode.currentText(),
             'perspective_fov': self.fov.value(),
+            'enable_polar_mask': self.enable_polar_mask.isChecked(),
+            'mask_polar_ratio': self.mask_polar_ratio.value(),
             'stitching_mode': self.stitching_mode.currentText(),
             'enable_nadir_mask': self.enable_nadir_mask.isChecked(),
             'nadir_mask_radius': self.nadir_mask_radius.value(),
@@ -569,10 +646,16 @@ class SettingsDialog(QDialog):
             self.min_keyframe_interval.setValue(5)
             self.max_keyframe_interval.setValue(60)
             self.softmax_beta.setValue(5.0)
+            self.gric_lambda1.setValue(2.0)
+            self.gric_lambda2.setValue(4.0)
+            self.gric_sigma.setValue(1.0)
+            self.gric_degeneracy_threshold.setValue(0.85)
             self.equirect_width.setValue(4096)
             self.equirect_height.setValue(2048)
             self.projection_mode.setCurrentText('Equirectangular')
             self.fov.setValue(90.0)
+            self.enable_polar_mask.setChecked(True)
+            self.mask_polar_ratio.setValue(0.10)
             self.stitching_mode.setCurrentText('Fast')
             self.enable_nadir_mask.setChecked(False)
             self.nadir_mask_radius.setValue(100)

@@ -18,6 +18,12 @@ from .quality_evaluator import QualityEvaluator
 from .geometric_evaluator import GeometricEvaluator
 from .adaptive_selector import AdaptiveSelector
 from .accelerator import get_accelerator
+from .exceptions import (
+    GeometricDegeneracyError,
+    EstimationFailureError,
+    InsufficientFeaturesError
+)
+from config import GRICConfig, Equirect360Config, NormalizationConfig
 
 logger = logging.getLogger('360split')
 
@@ -108,9 +114,36 @@ class KeyframeSelector:
         if config:
             self.config.update(config)
 
+        # 正規化設定
+        self.normalization = NormalizationConfig(
+            SHARPNESS_NORM_FACTOR=self.config.get('SHARPNESS_NORM_FACTOR', 1000.0),
+            OPTICAL_FLOW_NORM_FACTOR=self.config.get('OPTICAL_FLOW_NORM_FACTOR', 50.0),
+            FEATURE_MATCH_NORM_FACTOR=self.config.get('FEATURE_MATCH_NORM_FACTOR', 200.0),
+        )
+
+        # GRIC設定を構築
+        gric_config = GRICConfig(
+            lambda1=self.config.get('GRIC_LAMBDA1', 2.0),
+            lambda2=self.config.get('GRIC_LAMBDA2', 4.0),
+            sigma=self.config.get('GRIC_SIGMA', 1.0),
+            ransac_threshold=self.config.get('RANSAC_THRESHOLD', 3.0),
+            min_inlier_ratio=self.config.get('MIN_INLIER_RATIO', 0.3),
+            degeneracy_threshold=self.config.get('GRIC_DEGENERACY_THRESHOLD', 0.85),
+            min_matches=self.config.get('MIN_FEATURE_MATCHES', 30),
+        )
+
+        # 360°設定を構築
+        equirect_config = Equirect360Config(
+            mask_polar_ratio=self.config.get('MASK_POLAR_RATIO', 0.10),
+            enable_polar_mask=self.config.get('ENABLE_POLAR_MASK', True),
+        )
+
         # 評価器を初期化
         self.quality_evaluator = QualityEvaluator()
-        self.geometric_evaluator = GeometricEvaluator()
+        self.geometric_evaluator = GeometricEvaluator(
+            gric_config=gric_config,
+            equirect_config=equirect_config
+        )
         self.adaptive_selector = AdaptiveSelector()
 
         # アクセレータから情報を取得
@@ -380,12 +413,34 @@ class KeyframeSelector:
                 adaptive_scores = {}
 
                 if last_keyframe is not None:
-                    # 前キーフレームとの比較
-                    geometric_scores = self.geometric_evaluator.evaluate(
-                        last_keyframe, current_frame,
-                        min_matches=self.config['MIN_FEATURE_MATCHES'],
-                        gric_threshold=self.config['GRIC_RATIO_THRESHOLD']
-                    )
+                    # 前キーフレームとの幾何学的評価
+                    # GRIC例外ハンドリング付き
+                    geometric_failed = False
+                    try:
+                        geometric_scores = self.geometric_evaluator.evaluate(
+                            last_keyframe, current_frame,
+                            frame1_idx=last_keyframe_idx,
+                            frame2_idx=frame_idx
+                        )
+                    except GeometricDegeneracyError as e:
+                        # 回転のみ/平面シーン → スコアを強制的に下げて続行
+                        logger.debug(
+                            f"フレーム {frame_idx}: 幾何学的縮退 - {e}"
+                        )
+                        geometric_scores = {
+                            'gric': 0.1,  # 低スコア
+                            'feature_distribution_1': 0.0,
+                            'feature_distribution_2': 0.0,
+                            'feature_match_count': 0,
+                            'ray_dispersion': 0.0
+                        }
+                        geometric_failed = True
+                    except (EstimationFailureError, InsufficientFeaturesError) as e:
+                        # 推定失敗/特徴点不足 → このフレームをスキップ
+                        logger.debug(
+                            f"フレーム {frame_idx}: 幾何学的評価失敗 - {e}"
+                        )
+                        continue
 
                     # 適応的スコア計算
                     adaptive_scores = self.adaptive_selector.evaluate(
@@ -401,6 +456,7 @@ class KeyframeSelector:
 
                 else:
                     # 最初のキーフレーム
+                    geometric_failed = False
                     logger.debug(f"最初のキーフレーム: {frame_idx}")
 
                 # 統合スコアを計算
@@ -460,6 +516,8 @@ class KeyframeSelector:
         """
         複数のスコアを統合して総合スコアを計算
 
+        正規化にはNormalizationConfigの係数を使用。
+
         Parameters:
         -----------
         quality_scores : dict
@@ -474,8 +532,13 @@ class KeyframeSelector:
         float
             総合スコア（0-1）
         """
+        norm = self.normalization
+
         # 品質スコアを正規化
-        sharpness = min(quality_scores.get('sharpness', 0) / 1000.0, 1.0)
+        sharpness = min(
+            quality_scores.get('sharpness', 0) / norm.SHARPNESS_NORM_FACTOR,
+            1.0
+        )
         exposure = quality_scores.get('exposure', 0.5)
         motion_blur = 1.0 - quality_scores.get('motion_blur', 0)
         softmax_depth = quality_scores.get('softmax_depth', 0.5)
@@ -484,7 +547,8 @@ class KeyframeSelector:
 
         # 幾何学的スコアを正規化
         if geometric_scores:
-            gric = 1.0 - geometric_scores.get('gric', 1.0)
+            # v2: gricスコアは既に0-1（高いほど視差あり）
+            gric = geometric_scores.get('gric', 0.5)
             dist1 = geometric_scores.get('feature_distribution_1', 0.5)
             dist2 = geometric_scores.get('feature_distribution_2', 0.5)
             ray_disp = geometric_scores.get('ray_dispersion', 0.5)
@@ -496,7 +560,10 @@ class KeyframeSelector:
         # 適応的スコアを正規化
         if adaptive_scores:
             ssim_change = 1.0 - adaptive_scores.get('ssim', 1.0)
-            optical_flow = min(adaptive_scores.get('optical_flow', 0) / 50.0, 1.0)
+            optical_flow = min(
+                adaptive_scores.get('optical_flow', 0) / norm.OPTICAL_FLOW_NORM_FACTOR,
+                1.0
+            )
             content_score = (ssim_change + optical_flow) / 2.0
         else:
             content_score = 0.5

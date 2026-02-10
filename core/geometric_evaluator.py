@@ -1,6 +1,12 @@
 """
-幾何学的評価モジュール - 360Split用
-特徴点ベースの幾何学的性質を評価
+幾何学的評価モジュール - 360Split v2
+GRIC (Geometric Robust Information Criterion) ベースの視差評価
+
+GRIC = sum(rho(r_i^2, sigma)) + lambda1 * d * n + lambda2 * k
+
+ホモグラフィH vs 基礎行列Fを比較して視差（パラレックス）を判定。
+カスタム例外による縮退・推定失敗の明示的な通知。
+360°ポーラーマスクによる歪み領域の除外。
 """
 
 import cv2
@@ -10,6 +16,12 @@ from collections import OrderedDict
 import logging
 
 from core.accelerator import get_accelerator
+from core.exceptions import (
+    GeometricDegeneracyError,
+    EstimationFailureError,
+    InsufficientFeaturesError
+)
+from config import GRICConfig, Equirect360Config
 
 logger = logging.getLogger('360split')
 
@@ -23,79 +35,50 @@ class FeatureCache:
     """
 
     def __init__(self, max_entries: int = 50):
-        """
-        初期化
-
-        Parameters:
-        -----------
-        max_entries : int
-            最大キャッシュサイズ
-        """
         self.max_entries = max_entries
         self.cache = OrderedDict()
 
     def get(self, frame_idx: int) -> Optional[Tuple[List, np.ndarray]]:
-        """
-        キャッシュから取得（LRU更新）
-
-        Parameters:
-        -----------
-        frame_idx : int
-            フレームインデックス
-
-        Returns:
-        --------
-        tuple or None
-            (キーポイント, 記述子) のタプル、なければNone
-        """
         if frame_idx not in self.cache:
             return None
-
-        # アクセスされたので末尾に移動（LRU）
         self.cache.move_to_end(frame_idx)
         return self.cache[frame_idx]
 
     def put(self, frame_idx: int, keypoints: List, descriptors: np.ndarray):
-        """
-        キャッシュに保存
-
-        Parameters:
-        -----------
-        frame_idx : int
-            フレームインデックス
-        keypoints : list
-            検出されたキーポイント
-        descriptors : np.ndarray
-            特徴記述子
-        """
         if frame_idx in self.cache:
             self.cache.move_to_end(frame_idx)
         else:
             self.cache[frame_idx] = (keypoints, descriptors)
-            # キャッシュサイズ超過時は最も古いエントリを削除
             if len(self.cache) > self.max_entries:
                 self.cache.popitem(last=False)
 
     def clear(self):
-        """キャッシュをクリア"""
         self.cache.clear()
 
 
 class GeometricEvaluator:
     """
-    フレーム間の幾何学的性質の評価
+    GRICベースのフレーム間幾何学的評価 (v2)
 
-    特徴点検出とマッチング、ホモグラフィ/基礎行列の比較、
-    特徴点分布、3D光線の分散を評価する。
+    2Dモデル（ホモグラフィH）と3Dモデル（基礎行列F）の
+    両方をRANSACで推定し、GRICで比較。
+
+    GRIC判定:
+    - GRIC_F < GRIC_H → 有効な並進運動（3D再構成に有用）→ 高スコア
+    - GRIC_H <= GRIC_F → 回転のみ/平面シーン → 低スコア or 例外
+
+    360°特有処理:
+    - 天頂/天底ポーラーマスクによる歪み領域の除外
 
     最適化:
     - 特徴記述子のLRUキャッシング
-    - FLANN マッチャーによる高速化（3-5倍）
-    - ベクトル化された分布・分散計算
-    - GPU最適化パス対応
+    - FLANNマッチャーによる高速化
+    - ベクトル化された残差・GRIC計算
     """
 
-    def __init__(self, use_sift: bool = False):
+    def __init__(self, use_sift: bool = False,
+                 gric_config: GRICConfig = None,
+                 equirect_config: Equirect360Config = None):
         """
         初期化
 
@@ -103,9 +86,18 @@ class GeometricEvaluator:
         -----------
         use_sift : bool
             SIFTを使用するか（False=ORB）
+        gric_config : GRICConfig, optional
+            GRIC計算パラメータ。Noneの場合はデフォルト値
+        equirect_config : Equirect360Config, optional
+            360°処理設定。Noneの場合はデフォルト値
         """
         self.use_sift = use_sift
         self.accelerator = get_accelerator()
+
+        # GRIC設定
+        self.gric_config = gric_config or GRICConfig()
+        # 360°設定
+        self.equirect_config = equirect_config or Equirect360Config()
 
         # 特徴検出器を初期化
         if use_sift:
@@ -117,7 +109,7 @@ class GeometricEvaluator:
         else:
             self.detector = cv2.ORB_create(nfeatures=5000)
 
-        # FLANN マッチャーを初期化（ORB用LSHパラメータ）
+        # FLANN マッチャーを初期化
         self._init_matcher()
 
         # 特徴記述子キャッシュ
@@ -131,7 +123,6 @@ class GeometricEvaluator:
         失敗時はBFMatcherにフォールバック
         """
         try:
-            # ORB (binary descriptors) 用LSHパラメータ
             FLANN_INDEX_LSH = 6
             index_params = dict(
                 algorithm=FLANN_INDEX_LSH,
@@ -148,17 +139,43 @@ class GeometricEvaluator:
             self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
             self.use_flann = False
 
-    def _detect_and_compute_cached(self, frame: np.ndarray,
-                                   frame_idx: Optional[int] = None) -> Tuple[List, np.ndarray]:
+    def _create_polar_mask(self, h: int, w: int) -> np.ndarray:
         """
-        特徴点を検出して記述子を計算（キャッシュチェック付き）
+        360°画像用ポーラーマスクを生成
+
+        天頂（上端）と天底（下端）の歪みが大きい領域をマスクする。
+
+        Parameters:
+        -----------
+        h, w : int
+            画像の高さと幅
+
+        Returns:
+        --------
+        np.ndarray
+            マスク画像 (uint8, 0=除外, 255=有効)
+        """
+        mask = np.ones((h, w), dtype=np.uint8) * 255
+        margin = int(h * self.equirect_config.mask_polar_ratio)
+        if margin > 0:
+            mask[:margin, :] = 0       # 天頂マスク
+            mask[h - margin:, :] = 0   # 天底マスク
+        return mask
+
+    def _detect_and_compute_cached(self, frame: np.ndarray,
+                                   frame_idx: Optional[int] = None,
+                                   use_polar_mask: bool = False) -> Tuple[List, Optional[np.ndarray]]:
+        """
+        特徴点を検出して記述子を計算（キャッシュ・ポーラーマスク対応）
 
         Parameters:
         -----------
         frame : np.ndarray
             入力フレーム（BGR形式）
         frame_idx : int, optional
-            フレームインデックス（キャッシュキーとして使用）
+            フレームインデックス（キャッシュキー）
+        use_polar_mask : bool
+            360°ポーラーマスクを適用するか
 
         Returns:
         --------
@@ -174,19 +191,28 @@ class GeometricEvaluator:
         # グレースケール変換
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
 
+        # ポーラーマスク適用
+        mask = None
+        if use_polar_mask and self.equirect_config.enable_polar_mask:
+            h, w = gray.shape[:2]
+            mask = self._create_polar_mask(h, w)
+
         # 特徴点検出と記述子計算
-        keypoints, descriptors = self.detector.detectAndCompute(gray, None)
+        keypoints, descriptors = self.detector.detectAndCompute(gray, mask)
 
         # キャッシュに保存
         if frame_idx is not None:
-            self.feature_cache.put(frame_idx, keypoints, descriptors)
+            self.feature_cache.put(
+                frame_idx, keypoints,
+                descriptors if descriptors is not None else np.array([])
+            )
 
         return keypoints, descriptors
 
     def _match_features(self, desc1: np.ndarray, desc2: np.ndarray,
                        kp1: List, kp2: List) -> List[Tuple[int, int]]:
         """
-        特徴点をマッチング（FLANN または BFMatcher）
+        特徴点をマッチング（Lowe's ratio test）
 
         Parameters:
         -----------
@@ -204,134 +230,305 @@ class GeometricEvaluator:
             return []
 
         try:
-            # K-NN マッチングで最良の2つを取得
             matches = self.matcher.knnMatch(desc1, desc2, k=2)
-
-            # Lowe's ratio testでフィルタリング
             good_matches = []
             for match_pair in matches:
                 if len(match_pair) == 2:
                     m, n = match_pair
                     if m.distance < 0.7 * n.distance:
                         good_matches.append((m.queryIdx, m.trainIdx))
-
             return good_matches
         except Exception as e:
             logger.warning(f"特徴点マッチング失敗: {e}")
             return []
 
-    def compute_gric_score(self, frame1: np.ndarray, frame2: np.ndarray,
-                          ransac_threshold: float = 3.0) -> float:
+    def _compute_reprojection_errors_H(self, pts1: np.ndarray, pts2: np.ndarray,
+                                        H: np.ndarray) -> np.ndarray:
         """
-        GRIC スコア計算
+        ホモグラフィの対称転送誤差を計算
 
-        ホモグラフィと基礎行列のフィッティングを比較して、
-        シーン内の視差（パラレックス）の度合いを評価。
+        Parameters:
+        -----------
+        pts1, pts2 : np.ndarray
+            対応点座標 (N, 2)
+        H : np.ndarray
+            ホモグラフィ行列 (3, 3)
 
-        GRICスコア = min(error_H, error_F) / max(error_H, error_F)
+        Returns:
+        --------
+        np.ndarray
+            各点の対称転送誤差 (N,)
+        """
+        n = pts1.shape[0]
 
-        スコアが低いほど（視差が大きいほど）より良い
+        # Forward: pts1 → H → pts2_pred
+        pts1_h = np.hstack([pts1, np.ones((n, 1))])
+        pts2_pred = (H @ pts1_h.T).T
+        w = pts2_pred[:, 2:3]
+        w = np.where(np.abs(w) < 1e-10, 1e-10, w)
+        pts2_pred = pts2_pred[:, :2] / w
+        err_forward = np.sum((pts2_pred - pts2) ** 2, axis=1)
+
+        # Backward: pts2 → H_inv → pts1_pred
+        try:
+            H_inv = np.linalg.inv(H)
+            pts2_h = np.hstack([pts2, np.ones((n, 1))])
+            pts1_pred = (H_inv @ pts2_h.T).T
+            w = pts1_pred[:, 2:3]
+            w = np.where(np.abs(w) < 1e-10, 1e-10, w)
+            pts1_pred = pts1_pred[:, :2] / w
+            err_backward = np.sum((pts1_pred - pts1) ** 2, axis=1)
+        except np.linalg.LinAlgError:
+            err_backward = err_forward
+
+        return (err_forward + err_backward) / 2.0
+
+    def _compute_sampson_errors_F(self, pts1: np.ndarray, pts2: np.ndarray,
+                                   F: np.ndarray) -> np.ndarray:
+        """
+        基礎行列のSampson距離を計算
+
+        Parameters:
+        -----------
+        pts1, pts2 : np.ndarray
+            対応点座標 (N, 2)
+        F : np.ndarray
+            基礎行列 (3, 3)
+
+        Returns:
+        --------
+        np.ndarray
+            各点のSampson距離 (N,)
+        """
+        n = pts1.shape[0]
+        pts1_h = np.hstack([pts1, np.ones((n, 1))])
+        pts2_h = np.hstack([pts2, np.ones((n, 1))])
+
+        Fx1 = (F @ pts1_h.T).T
+        Ftx2 = (F.T @ pts2_h.T).T
+
+        x2tFx1 = np.sum(pts2_h * Fx1, axis=1)
+
+        denom = Fx1[:, 0]**2 + Fx1[:, 1]**2 + Ftx2[:, 0]**2 + Ftx2[:, 1]**2
+        denom = np.maximum(denom, 1e-10)
+
+        return x2tFx1**2 / denom
+
+    def _compute_gric(self, residuals: np.ndarray, sigma: float,
+                      d_model: int, k_model: int, n_points: int,
+                      lambda1: float, lambda2: float) -> float:
+        """
+        GRIC値を計算 (Torr 1998)
+
+        GRIC = sum_i rho(e_i^2) + lambda1 * d_model * n + lambda2 * k_model
+
+        rho(e^2) = min(e^2 / sigma^2, 2*(r - d_model))
+        r = 4 (2D-2D対応のデータ空間次元)
+
+        Parameters:
+        -----------
+        residuals : np.ndarray
+            各対応点の残差 (N,)
+        sigma : float
+            残差標準偏差推定値
+        d_model : int
+            モデルの多様体次元 (H=2, F=3)
+        k_model : int
+            モデルパラメータ数 (H=8, F=7)
+        n_points : int
+            対応点数
+        lambda1, lambda2 : float
+            正則化係数
+
+        Returns:
+        --------
+        float
+            GRIC値
+        """
+        r = 4  # データ空間の次元（2D-2D対応）
+        penalty = 2.0 * (r - d_model)
+
+        # ロバスト誤差関数
+        sigma_sq = sigma ** 2
+        if sigma_sq < 1e-10:
+            sigma_sq = 1e-10
+        normalized_residuals = residuals / sigma_sq
+        rho_values = np.minimum(normalized_residuals, penalty)
+
+        gric = np.sum(rho_values) + lambda1 * d_model * n_points + lambda2 * k_model
+        return float(gric)
+
+    def compute_gric_score(self, frame1: np.ndarray, frame2: np.ndarray,
+                           frame1_idx: Optional[int] = None,
+                           frame2_idx: Optional[int] = None) -> float:
+        """
+        GRICベースの視差スコアを計算
+
+        ホモグラフィHと基礎行列Fの両方をRANSACで推定し、
+        それぞれのGRIC値を比較して視差の有無を判定する。
+
+        判定ロジック:
+        - GRIC_F < GRIC_H → 有効な視差あり（並進運動）→ 高スコア
+        - GRIC_H <= GRIC_F → 回転のみ/平面 → 低スコア
 
         Parameters:
         -----------
         frame1, frame2 : np.ndarray
             比較するフレーム
-        ransac_threshold : float
-            RANSAC再投影誤差閾値
+        frame1_idx, frame2_idx : int, optional
+            フレームインデックス（キャッシュ用）
 
         Returns:
         --------
         float
-            GRICスコア（0-1、低いほど視差あり）
-        """
-        kp1, desc1 = self._detect_and_compute_cached(frame1, frame_idx=0)
-        kp2, desc2 = self._detect_and_compute_cached(frame2, frame_idx=1)
+            視差スコア (0.0-1.0, 高いほど有効な視差)
 
+        Raises:
+        -------
+        InsufficientFeaturesError
+            マッチ数が min_matches 未満の場合
+        EstimationFailureError
+            H/F行列の推定に失敗した場合
+        GeometricDegeneracyError
+            回転のみ/平面シーンと判定された場合
+        """
+        cfg = self.gric_config
+
+        # 特徴点検出（360°ポーラーマスク適用）
+        kp1, desc1 = self._detect_and_compute_cached(
+            frame1, frame_idx=frame1_idx, use_polar_mask=True
+        )
+        kp2, desc2 = self._detect_and_compute_cached(
+            frame2, frame_idx=frame2_idx, use_polar_mask=True
+        )
+
+        # マッチング
         matches = self._match_features(desc1, desc2, kp1, kp2)
 
-        if len(matches) < 8:  # ホモグラフィと基礎行列計算に最低8点必要
-            return 1.0  # 視差なし
+        # 最小マッチ数チェック
+        if len(matches) < cfg.min_matches:
+            raise InsufficientFeaturesError(
+                match_count=len(matches),
+                required_count=cfg.min_matches
+            )
 
-        # マッチ点を座標に変換
+        # 座標変換
         pts1 = np.float32([kp1[m[0]].pt for m in matches])
         pts2 = np.float32([kp2[m[1]].pt for m in matches])
+        n_points = len(pts1)
 
-        # ホモグラフィ行列を計算
-        H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, ransac_threshold)
+        # ===== ホモグラフィH推定 =====
+        H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, cfg.ransac_threshold)
+        if H is None or mask_H is None:
+            raise EstimationFailureError(
+                reason="ホモグラフィ推定失敗（RANSAC収束不可）",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
 
-        # 基礎行列を計算
-        F, mask_F = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, ransac_threshold)
+        # ===== 基礎行列F推定 =====
+        F, mask_F = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, cfg.ransac_threshold)
+        if F is None or mask_F is None:
+            raise EstimationFailureError(
+                reason="基礎行列推定失敗（RANSAC収束不可）",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
 
-        # 再投影誤差を計算
-        error_H = np.inf
-        error_F = np.inf
+        # インライア率
+        inlier_ratio_H = float(np.sum(mask_H.ravel())) / n_points
+        inlier_ratio_F = float(np.sum(mask_F.ravel())) / n_points
 
-        if H is not None and mask_H is not None:
-            # ホモグラフィの再投影誤差
-            pts1_h = np.hstack([pts1, np.ones((pts1.shape[0], 1))])
-            pts2_h = np.hstack([pts2, np.ones((pts2.shape[0], 1))])
+        # 両方のインライア率が最低要件を満たさない場合
+        if inlier_ratio_H < cfg.min_inlier_ratio and inlier_ratio_F < cfg.min_inlier_ratio:
+            raise EstimationFailureError(
+                reason=f"インライア率不足 (H={inlier_ratio_H:.2f}, F={inlier_ratio_F:.2f})",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
 
-            pts1_proj = (H @ pts1_h.T).T
-            pts1_proj = pts1_proj[:, :2] / (pts1_proj[:, 2:3] + 1e-6)
+        # ===== 残差計算 =====
+        errors_H = self._compute_reprojection_errors_H(pts1, pts2, H)
+        errors_F = self._compute_sampson_errors_F(pts1, pts2, F)
 
-            error_H = np.mean(np.linalg.norm(pts1_proj - pts2, axis=1))
+        # ===== GRIC計算 =====
+        # H: d=2 (2DOF/点), k=8 | F: d=3 (3DOF/点), k=7
+        gric_H = self._compute_gric(
+            errors_H, cfg.sigma, d_model=2, k_model=8,
+            n_points=n_points, lambda1=cfg.lambda1, lambda2=cfg.lambda2
+        )
+        gric_F = self._compute_gric(
+            errors_F, cfg.sigma, d_model=3, k_model=7,
+            n_points=n_points, lambda1=cfg.lambda1, lambda2=cfg.lambda2
+        )
 
-        if F is not None and mask_F is not None:
-            # 基礎行列の幾何学的誤差（Sampson distance）
-            pts1_h = np.hstack([pts1, np.ones((pts1.shape[0], 1))])
-            pts2_h = np.hstack([pts2, np.ones((pts2.shape[0], 1))])
+        logger.debug(
+            f"GRIC: H={gric_H:.2f}, F={gric_F:.2f}, "
+            f"inlier_H={inlier_ratio_H:.3f}, inlier_F={inlier_ratio_F:.3f}, "
+            f"matches={n_points}"
+        )
 
-            # エピポーラ線の計算
-            l2 = (F @ pts1_h.T).T  # pts1対応のエピポーラ線
-            l1 = (F.T @ pts2_h.T).T  # pts2対応のエピポーラ線
+        # ===== 縮退判定: Hのインライア率が非常に高い =====
+        if inlier_ratio_H >= cfg.degeneracy_threshold:
+            raise GeometricDegeneracyError(
+                message="Hインライア率が高すぎる（純回転/平面シーン）",
+                gric_h=gric_H,
+                gric_f=gric_F,
+                inlier_ratio_h=inlier_ratio_H
+            )
 
-            # Sampson distance
-            Fx1 = (F @ pts1_h.T).T
-            Ftx2 = (F.T @ pts2_h.T).T
-
-            x2Fx1 = np.sum(pts2_h * Fx1, axis=1)
-
-            denom = Fx1[:, 0] ** 2 + Fx1[:, 1] ** 2 + Ftx2[:, 0] ** 2 + Ftx2[:, 1] ** 2
-            denom = np.maximum(denom, 1e-6)
-
-            error_F = np.mean(x2Fx1 ** 2 / denom)
-
-        # GRIC比率を計算
-        if error_H < 1e-6 or error_F < 1e-6:
-            gric_ratio = 0.0  # 視差なし（どちらかのモデルが完全にフィット）
+        # ===== GRIC比較による視差スコア算出 =====
+        if gric_F < gric_H:
+            # Fモデルが優位 → 有効な並進運動（視差あり）
+            gric_sum = gric_H + gric_F + 1e-10
+            ratio = (gric_H - gric_F) / gric_sum
+            score = float(np.clip(0.5 + ratio, 0.3, 1.0))
         else:
-            gric_ratio = min(error_H, error_F) / max(error_H, error_F)
+            # Hモデルが優位 → 回転のみ/平面の傾向
+            gric_sum = gric_H + gric_F + 1e-10
+            ratio = (gric_F - gric_H) / gric_sum
+            score = float(np.clip(0.5 - ratio, 0.0, 0.5))
 
-        return float(np.clip(gric_ratio, 0.0, 1.0))
+            # 明確にHが優位（スコアが非常に低い）場合は縮退
+            if score < 0.15:
+                raise GeometricDegeneracyError(
+                    message="GRIC判定: ホモグラフィが明確に優位（視差不十分）",
+                    gric_h=gric_H,
+                    gric_f=gric_F,
+                    inlier_ratio_h=inlier_ratio_H
+                )
 
-    def compute_feature_distribution(self, frame: np.ndarray) -> float:
+        return score
+
+    def compute_feature_distribution(self, frame: np.ndarray,
+                                     frame_idx: Optional[int] = None) -> float:
         """
         特徴点分布スコア
 
         画像をグリッドに分割し、各セルの特徴点数の
-        分布エントロピーを計算。均等に分布していほど
+        分布エントロピーを計算。均等に分布しているほど
         スコアが高い。
-
-        最適化: np.histogram2d() を使用してベクトル化
 
         Parameters:
         -----------
         frame : np.ndarray
             入力フレーム
+        frame_idx : int, optional
+            フレームインデックス
 
         Returns:
         --------
         float
             分布スコア（0-1、高いほど均等分布）
         """
-        kp, _ = self._detect_and_compute_cached(frame, frame_idx=2)
+        kp, _ = self._detect_and_compute_cached(
+            frame, frame_idx=frame_idx, use_polar_mask=True
+        )
 
         if len(kp) == 0:
             return 0.0
 
         h, w = frame.shape[:2]
-
-        # 画像を4x4のグリッドに分割
         grid_cols, grid_rows = 4, 4
 
         # キーポイント座標を抽出（ベクトル化）
@@ -346,7 +543,6 @@ class GeometricEvaluator:
             range=[[0, w], [0, h]]
         )
 
-        # セル数の分布を正規化
         cell_counts = cell_counts.flatten()
         total_count = np.sum(cell_counts)
 
@@ -356,17 +552,17 @@ class GeometricEvaluator:
         # 確率分布として正規化
         prob_dist = cell_counts / total_count
 
-        # エントロピーを計算（0 = 集中、高 = 均等分布）
-        # 最大エントロピーは log(grid_cols * grid_rows)
+        # エントロピーを計算
         entropy = -np.sum(prob_dist[prob_dist > 0] * np.log(prob_dist[prob_dist > 0] + 1e-10))
         max_entropy = np.log(grid_rows * grid_cols)
 
-        # 正規化されたスコア
         distribution_score = entropy / max_entropy if max_entropy > 0 else 0.0
 
         return float(np.clip(distribution_score, 0.0, 1.0))
 
-    def compute_feature_match_count(self, frame1: np.ndarray, frame2: np.ndarray) -> int:
+    def compute_feature_match_count(self, frame1: np.ndarray, frame2: np.ndarray,
+                                    frame1_idx: Optional[int] = None,
+                                    frame2_idx: Optional[int] = None) -> int:
         """
         フレーム間のロバスト特徴マッチ数を計算
 
@@ -374,29 +570,32 @@ class GeometricEvaluator:
         -----------
         frame1, frame2 : np.ndarray
             比較するフレーム
+        frame1_idx, frame2_idx : int, optional
+            フレームインデックス
 
         Returns:
         --------
         int
             マッチした特徴点数
         """
-        kp1, desc1 = self._detect_and_compute_cached(frame1, frame_idx=3)
-        kp2, desc2 = self._detect_and_compute_cached(frame2, frame_idx=4)
+        kp1, desc1 = self._detect_and_compute_cached(
+            frame1, frame_idx=frame1_idx, use_polar_mask=True
+        )
+        kp2, desc2 = self._detect_and_compute_cached(
+            frame2, frame_idx=frame2_idx, use_polar_mask=True
+        )
 
         matches = self._match_features(desc1, desc2, kp1, kp2)
-
         return len(matches)
 
     def compute_ray_dispersion(self, frame: np.ndarray,
-                              is_equirectangular: bool = False) -> float:
+                              is_equirectangular: bool = False,
+                              frame_idx: Optional[int] = None) -> float:
         """
         特徴点光線の分散スコア
 
-        特徴点に対応する光線（画像座標をカメラ光線に変換）の
-        3D空間における分散を計算。高いほど多様な方向から
-        観察している。
-
-        最適化: 完全なベクトル化、keypoint制限を500に増加
+        特徴点に対応する光線の3D空間における分散を計算。
+        高いほど多様な方向から観察している。
 
         Parameters:
         -----------
@@ -404,46 +603,43 @@ class GeometricEvaluator:
             入力フレーム
         is_equirectangular : bool
             エクイレクタングラ画像か
+        frame_idx : int, optional
+            フレームインデックス
 
         Returns:
         --------
         float
             光線分散スコア（0-1）
         """
-        kp, _ = self._detect_and_compute_cached(frame, frame_idx=5)
+        kp, _ = self._detect_and_compute_cached(
+            frame, frame_idx=frame_idx, use_polar_mask=True
+        )
 
         if len(kp) < 4:
             return 0.0
 
         h, w = frame.shape[:2]
 
-        # キーポイント数を制限（最大500に増加）
+        # キーポイント数を制限
         kp_subset = kp[:500]
 
-        # キーポイント座標を抽出（ベクトル化）
         kp_coords = np.array([kp_point.pt for kp_point in kp_subset])
         x_coords = kp_coords[:, 0]
         y_coords = kp_coords[:, 1]
 
         if is_equirectangular:
-            # エクイレクタングラ画像の場合
-            # 経度（-π to π）と緯度（-π/2 to π/2）に変換（ベクトル化）
             lon = 2 * np.pi * (x_coords / w) - np.pi
             lat = np.pi * (y_coords / h) - np.pi / 2
 
-            # 3D単位ベクトルに変換（球面座標から直交座標）
             rays = np.column_stack([
                 np.cos(lat) * np.cos(lon),
                 np.cos(lat) * np.sin(lon),
                 np.sin(lat)
             ])
         else:
-            # 通常の画像の場合
-            # 正規化座標（-1 to 1）
             nx = 2 * (x_coords / w) - 1
             ny = 2 * (y_coords / h) - 1
 
-            # Plücker座標の概念を簡略化して使用
             rays = np.column_stack([nx, ny, np.ones_like(nx)])
             norms = np.linalg.norm(rays, axis=1, keepdims=True) + 1e-6
             rays = rays / norms
@@ -453,49 +649,76 @@ class GeometricEvaluator:
         eigenvalues = np.linalg.eigvals(covariance)
         eigenvalues = np.real(eigenvalues)
 
-        # 分散スコア（固有値のバランス）
-        # 3つの固有値が等しいほど分散が高い
         max_eig = np.max(eigenvalues)
         if max_eig < 1e-6:
             return 0.0
 
         normalized_eigs = eigenvalues / max_eig
-
-        # 均等性指標（1に近いほど均等）
         dispersion_score = np.min(normalized_eigs)
 
         return float(np.clip(dispersion_score, 0.0, 1.0))
 
     def evaluate(self, frame1: np.ndarray, frame2: np.ndarray,
-                min_matches: int = 30,
-                gric_threshold: float = 0.8) -> Dict[str, float]:
+                frame1_idx: Optional[int] = None,
+                frame2_idx: Optional[int] = None,
+                min_matches: int = None,
+                gric_threshold: float = None) -> Dict[str, float]:
         """
         フレーム間の幾何学的性質を総合評価
+
+        GRICスコア計算でカスタム例外が発生した場合、
+        呼び出し元（KeyframeSelector）で適切にハンドリングされる。
 
         Parameters:
         -----------
         frame1, frame2 : np.ndarray
             比較するフレーム
-        min_matches : int
-            評価に必要な最小マッチ数
-        gric_threshold : float
-            GRIC閾値
+        frame1_idx, frame2_idx : int, optional
+            フレームインデックス
+        min_matches : int, optional
+            (後方互換用、GRICConfigの値が優先)
+        gric_threshold : float, optional
+            (後方互換用、GRICConfigの値が優先)
 
         Returns:
         --------
         dict
             評価スコア辞書：
-            - 'gric': GRICスコア
+            - 'gric': GRICベースの視差スコア (0-1)
             - 'feature_distribution_1': フレーム1の特徴点分布
             - 'feature_distribution_2': フレーム2の特徴点分布
             - 'feature_match_count': マッチ数
             - 'ray_dispersion': 光線分散スコア
+
+        Raises:
+        -------
+        GeometricDegeneracyError
+            視差不十分（回転のみ/平面シーン）
+        EstimationFailureError
+            行列推定失敗
+        InsufficientFeaturesError
+            特徴点マッチ不足
         """
-        gric_score = self.compute_gric_score(frame1, frame2)
-        dist1 = self.compute_feature_distribution(frame1)
-        dist2 = self.compute_feature_distribution(frame2)
-        match_count = self.compute_feature_match_count(frame1, frame2)
-        ray_disp = self.compute_ray_dispersion(frame1)
+        # GRIC スコア計算（例外が発生し得る）
+        gric_score = self.compute_gric_score(
+            frame1, frame2,
+            frame1_idx=frame1_idx,
+            frame2_idx=frame2_idx
+        )
+
+        # 特徴点分布（例外は発生しない）
+        dist1 = self.compute_feature_distribution(frame1, frame_idx=frame1_idx)
+        dist2 = self.compute_feature_distribution(frame2, frame_idx=frame2_idx)
+
+        # マッチ数
+        match_count = self.compute_feature_match_count(
+            frame1, frame2,
+            frame1_idx=frame1_idx,
+            frame2_idx=frame2_idx
+        )
+
+        # 光線分散
+        ray_disp = self.compute_ray_dispersion(frame1, frame_idx=frame1_idx)
 
         return {
             'gric': gric_score,

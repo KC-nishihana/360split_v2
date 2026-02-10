@@ -21,6 +21,7 @@ from gui.video_player import VideoPlayerWidget
 from gui.timeline_widget import TimelineWidget
 from gui.keyframe_panel import KeyframePanel
 from gui.settings_dialog import SettingsDialog
+from config import KeyframeConfig
 
 logger = logging.getLogger('360split')
 
@@ -815,7 +816,9 @@ class MainWindow(QMainWindow):
         """
         GUI設定をKeyframeSelector用の設定辞書に変換
 
-        SettingsDialogの小文字キーをKeyframeSelectorの大文字キーにマッピングする。
+        KeyframeConfig.from_dict() を使用してGUI設定を構造化し、
+        to_selector_dict() でKeyframeSelector互換の辞書に変換。
+        さらにGRIC/360°関連のパラメータも追加する。
 
         Returns:
         --------
@@ -824,16 +827,26 @@ class MainWindow(QMainWindow):
         """
         gui_settings = self._load_gui_settings()
 
-        selector_config = {
-            'WEIGHT_SHARPNESS': gui_settings.get('weight_sharpness', 0.30),
-            'WEIGHT_EXPOSURE': gui_settings.get('weight_exposure', 0.15),
-            'WEIGHT_GEOMETRIC': gui_settings.get('weight_geometric', 0.30),
-            'WEIGHT_CONTENT': gui_settings.get('weight_content', 0.25),
-            'SSIM_CHANGE_THRESHOLD': gui_settings.get('ssim_threshold', 0.85),
-            'MIN_KEYFRAME_INTERVAL': gui_settings.get('min_keyframe_interval', 5),
-            'MAX_KEYFRAME_INTERVAL': gui_settings.get('max_keyframe_interval', 60),
-            'SOFTMAX_BETA': gui_settings.get('softmax_beta', 5.0),
-        }
+        # KeyframeConfig経由で構造化変換
+        kf_config = KeyframeConfig.from_dict(gui_settings)
+        selector_config = kf_config.to_selector_dict()
+
+        # GRIC関連パラメータを追加（KeyframeSelectorが直接参照）
+        selector_config['GRIC_LAMBDA1'] = kf_config.gric.lambda1
+        selector_config['GRIC_LAMBDA2'] = kf_config.gric.lambda2
+        selector_config['GRIC_SIGMA'] = kf_config.gric.sigma
+        selector_config['RANSAC_THRESHOLD'] = kf_config.gric.ransac_threshold
+        selector_config['MIN_INLIER_RATIO'] = kf_config.gric.min_inlier_ratio
+        selector_config['GRIC_DEGENERACY_THRESHOLD'] = kf_config.gric.degeneracy_threshold
+
+        # 360°ポーラーマスク設定
+        selector_config['ENABLE_POLAR_MASK'] = kf_config.equirect360.enable_polar_mask
+        selector_config['MASK_POLAR_RATIO'] = kf_config.equirect360.mask_polar_ratio
+
+        # 正規化係数
+        selector_config['SHARPNESS_NORM_FACTOR'] = kf_config.normalization.SHARPNESS_NORM_FACTOR
+        selector_config['OPTICAL_FLOW_NORM_FACTOR'] = kf_config.normalization.OPTICAL_FLOW_NORM_FACTOR
+        selector_config['FEATURE_MATCH_NORM_FACTOR'] = kf_config.normalization.FEATURE_MATCH_NORM_FACTOR
 
         logger.info(
             f"分析設定: 重み[S={selector_config['WEIGHT_SHARPNESS']:.2f}, "
@@ -841,7 +854,10 @@ class MainWindow(QMainWindow):
             f"G={selector_config['WEIGHT_GEOMETRIC']:.2f}, "
             f"C={selector_config['WEIGHT_CONTENT']:.2f}], "
             f"SSIM閾値={selector_config['SSIM_CHANGE_THRESHOLD']:.2f}, "
-            f"間隔={selector_config['MIN_KEYFRAME_INTERVAL']}-{selector_config['MAX_KEYFRAME_INTERVAL']}"
+            f"間隔={selector_config['MIN_KEYFRAME_INTERVAL']}-{selector_config['MAX_KEYFRAME_INTERVAL']}, "
+            f"GRIC[λ1={kf_config.gric.lambda1}, λ2={kf_config.gric.lambda2}, "
+            f"σ={kf_config.gric.sigma}], "
+            f"ポーラーマスク={'ON' if kf_config.equirect360.enable_polar_mask else 'OFF'}"
         )
 
         return selector_config

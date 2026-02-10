@@ -4,6 +4,7 @@ PySide6を使用したメインアプリケーションウィンドウ
 """
 
 import sys
+import json
 import logging
 from pathlib import Path
 from typing import Optional
@@ -56,7 +57,7 @@ class AnalysisWorker(QThread):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, video_path: str):
+    def __init__(self, video_path: str, config: dict = None):
         """
         ワーカーの初期化
 
@@ -64,9 +65,12 @@ class AnalysisWorker(QThread):
         -----------
         video_path : str
             分析対象のビデオファイルパス
+        config : dict, optional
+            KeyframeSelectorに渡す設定辞書
         """
         super().__init__()
         self.video_path = video_path
+        self.config = config
         self._is_running = True
 
     def run(self):
@@ -86,8 +90,8 @@ class AnalysisWorker(QThread):
             loader.load(self.video_path)
             meta = loader.get_metadata()
 
-            # KeyframeSelectorで2段階パイプライン実行
-            selector = KeyframeSelector()
+            # KeyframeSelectorで2段階パイプライン実行（GUI設定を反映）
+            selector = KeyframeSelector(config=self.config)
 
             def progress_callback(current, total, message=""):
                 if not self._is_running:
@@ -589,6 +593,9 @@ class MainWindow(QMainWindow):
             # タイムラインを初期化
             self.timeline.set_duration(metadata.frame_count, metadata.fps)
 
+            # キーフレームパネルにビデオパスを設定（サムネイル読み込み用）
+            self.keyframe_panel.set_video_path(file_path)
+
             # キーフレームパネルをクリア
             self.keyframe_panel.clear()
 
@@ -624,8 +631,11 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # GUI設定をKeyframeSelector用に変換して渡す
+        selector_config = self._build_selector_config()
+
         # 分析ワーカーの作成（最適化版: KeyframeSelectorの2段階パイプライン使用）
-        self.analysis_worker = AnalysisWorker(self.video_path)
+        self.analysis_worker = AnalysisWorker(self.video_path, config=selector_config)
         self.analysis_worker.progress.connect(self._on_analysis_progress)
         self.analysis_worker.keyframes_found.connect(self._on_keyframes_found)
         self.analysis_worker.quality_data.connect(self._on_quality_data_received)
@@ -652,7 +662,7 @@ class MainWindow(QMainWindow):
         """
         選択されたキーフレームを指定ディレクトリにエクスポート
 
-        PNG形式で保存。設定で形式を変更可能。
+        設定ダイアログで指定された出力形式、JPEG品質、ファイル命名規則を使用。
         """
         if not self.video_path:
             QMessageBox.warning(
@@ -671,10 +681,28 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # エクスポート先ディレクトリの選択
+        # GUI設定を読み込む
+        gui_settings = self._load_gui_settings()
+        output_format = gui_settings.get('output_image_format', 'png').lower()
+        jpeg_quality = gui_settings.get('output_jpeg_quality', 95)
+        naming_prefix = gui_settings.get('naming_prefix', 'keyframe')
+        default_dir = gui_settings.get('output_directory', str(Path.home() / "360split_output"))
+
+        # 拡張子のマッピング（設定値 → ファイル拡張子）
+        format_ext_map = {
+            'png': 'png',
+            'jpeg': 'jpg',
+            'jpg': 'jpg',
+            'tiff': 'tiff',
+            'tif': 'tiff',
+        }
+        file_ext = format_ext_map.get(output_format, 'png')
+
+        # エクスポート先ディレクトリの選択（設定のデフォルトディレクトリを初期パスにする）
         export_dir = QFileDialog.getExistingDirectory(
             self,
-            "エクスポート先ディレクトリを選択"
+            "エクスポート先ディレクトリを選択",
+            default_dir
         )
 
         if not export_dir:
@@ -682,22 +710,32 @@ class MainWindow(QMainWindow):
 
         try:
             import cv2
-            from pathlib import Path
 
             export_path = Path(export_dir)
-            export_path.mkdir(exist_ok=True)
+            export_path.mkdir(parents=True, exist_ok=True)
 
             # ビデオから各キーフレームを抽出
             cap = cv2.VideoCapture(self.video_path)
             exported_count = 0
 
-            for frame_idx in keyframes:
+            for frame_idx in sorted(keyframes):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
 
                 if ret:
-                    output_file = export_path / f"keyframe_{frame_idx:05d}.png"
-                    cv2.imwrite(str(output_file), frame)
+                    # 設定に基づくファイル名生成
+                    output_file = export_path / f"{naming_prefix}_{frame_idx:06d}.{file_ext}"
+
+                    # 形式に応じた保存パラメータ
+                    if file_ext == 'jpg':
+                        cv2.imwrite(str(output_file), frame,
+                                    [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+                    elif file_ext == 'tiff':
+                        cv2.imwrite(str(output_file), frame)
+                    else:  # png
+                        cv2.imwrite(str(output_file), frame,
+                                    [cv2.IMWRITE_PNG_COMPRESSION, 3])
+
                     exported_count += 1
 
             cap.release()
@@ -708,10 +746,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "完了",
-                f"{exported_count} 個のキーフレームをエクスポートしました"
+                f"{exported_count} 個のキーフレームを {file_ext.upper()} 形式でエクスポートしました\n"
+                f"出力先: {export_dir}"
             )
 
-            logger.info(f"キーフレームをエクスポート: {exported_count}個 -> {export_dir}")
+            logger.info(
+                f"キーフレームをエクスポート: {exported_count}個 -> {export_dir} "
+                f"(形式: {file_ext}, プレフィックス: {naming_prefix})"
+            )
 
         except Exception as e:
             logger.exception("エクスポートエラー")
@@ -732,6 +774,77 @@ class MainWindow(QMainWindow):
         """
         self.status_label.showMessage(message)
         logger.info(f"ステータス: {message}")
+
+    def _load_gui_settings(self) -> dict:
+        """
+        GUI設定ファイル (~/.360split/settings.json) を読み込む
+
+        Returns:
+        --------
+        dict
+            設定辞書。ファイルが存在しない場合はデフォルト値
+        """
+        settings_file = Path.home() / ".360split" / "settings.json"
+        default_settings = {
+            'weight_sharpness': 0.30,
+            'weight_exposure': 0.15,
+            'weight_geometric': 0.30,
+            'weight_content': 0.25,
+            'ssim_threshold': 0.85,
+            'min_keyframe_interval': 5,
+            'max_keyframe_interval': 60,
+            'softmax_beta': 5.0,
+            'output_image_format': 'png',
+            'output_jpeg_quality': 95,
+            'output_directory': str(Path.home() / "360split_output"),
+            'naming_prefix': 'keyframe',
+        }
+
+        try:
+            if settings_file.exists():
+                with open(settings_file, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    default_settings.update(loaded)
+                logger.info(f"GUI設定を読み込みました: {settings_file}")
+        except Exception as e:
+            logger.warning(f"GUI設定読み込みエラー: {e} (デフォルト値を使用)")
+
+        return default_settings
+
+    def _build_selector_config(self) -> dict:
+        """
+        GUI設定をKeyframeSelector用の設定辞書に変換
+
+        SettingsDialogの小文字キーをKeyframeSelectorの大文字キーにマッピングする。
+
+        Returns:
+        --------
+        dict
+            KeyframeSelectorのconfigに渡す設定辞書
+        """
+        gui_settings = self._load_gui_settings()
+
+        selector_config = {
+            'WEIGHT_SHARPNESS': gui_settings.get('weight_sharpness', 0.30),
+            'WEIGHT_EXPOSURE': gui_settings.get('weight_exposure', 0.15),
+            'WEIGHT_GEOMETRIC': gui_settings.get('weight_geometric', 0.30),
+            'WEIGHT_CONTENT': gui_settings.get('weight_content', 0.25),
+            'SSIM_CHANGE_THRESHOLD': gui_settings.get('ssim_threshold', 0.85),
+            'MIN_KEYFRAME_INTERVAL': gui_settings.get('min_keyframe_interval', 5),
+            'MAX_KEYFRAME_INTERVAL': gui_settings.get('max_keyframe_interval', 60),
+            'SOFTMAX_BETA': gui_settings.get('softmax_beta', 5.0),
+        }
+
+        logger.info(
+            f"分析設定: 重み[S={selector_config['WEIGHT_SHARPNESS']:.2f}, "
+            f"E={selector_config['WEIGHT_EXPOSURE']:.2f}, "
+            f"G={selector_config['WEIGHT_GEOMETRIC']:.2f}, "
+            f"C={selector_config['WEIGHT_CONTENT']:.2f}], "
+            f"SSIM閾値={selector_config['SSIM_CHANGE_THRESHOLD']:.2f}, "
+            f"間隔={selector_config['MIN_KEYFRAME_INTERVAL']}-{selector_config['MAX_KEYFRAME_INTERVAL']}"
+        )
+
+        return selector_config
 
     def _open_settings(self):
         """

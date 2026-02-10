@@ -1,240 +1,140 @@
 """
-メインウィンドウ - 360Split GUI
-PySide6を使用したメインアプリケーションウィンドウ
+メインウィンドウ - 360Split v2 GUI
+全ウィジェットを統合するメインアプリケーションウィンドウ。
+
+レイアウト:
+  中央: VideoPlayerWidget
+  下部: TimelineWidget (pyqtgraph スコアグラフ)
+  右側ドック: SettingsPanel + KeyframeListWidget (タブ切り替え)
+
+機能:
+  - ドラッグ＆ドロップでの動画読み込み
+  - メニューバー: ファイル(F), 表示(V)
+  - Stage 1 / Stage 2 分離解析
+  - Live Preview (パラメータ変更 → 判定再実行)
 """
 
-import sys
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
-    QFileDialog, QMenuBar, QToolBar, QStatusBar, QMessageBox,
-    QProgressDialog
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QDockWidget, QTabWidget,
+    QFileDialog, QMenuBar, QToolBar, QStatusBar,
+    QMessageBox, QProgressBar, QLabel
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QTimer
-from PySide6.QtGui import QIcon, QKeySequence, QAction
+from PySide6.QtCore import Qt, QSize, QUrl
+from PySide6.QtGui import QKeySequence, QAction, QDragEnterEvent, QDropEvent
 
 from gui.video_player import VideoPlayerWidget
 from gui.timeline_widget import TimelineWidget
-from gui.keyframe_panel import KeyframePanel
-from gui.settings_dialog import SettingsDialog
-from config import KeyframeConfig
+from gui.settings_panel import SettingsPanel
+from gui.keyframe_list import KeyframeListWidget
+from gui.workers import Stage1Worker, Stage2Worker, FullAnalysisWorker, ExportWorker, FrameScoreData
+
+from config import KeyframeConfig, NormalizationConfig
 
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class AnalysisWorker(QThread):
-    """
-    キーフレーム分析用ワーカースレッド（最適化版）
-
-    KeyframeSelectorの2段階パイプラインを利用してバックグラウンドで
-    キーフレーム選択分析を実行し、進捗状況をシグナルで通知する。
-
-    最適化:
-    - KeyframeSelectorの2段階パイプラインを活用
-    - Stage 1で60-70%のフレームを高速フィルタ
-    - Stage 2は候補フレームのみ精密評価
-
-    Signals:
-    --------
-    progress : Signal(int)
-        分析進捗率（0-100）
-    keyframes_found : Signal(list, list)
-        検出されたキーフレーム情報（フレーム番号リスト、スコアリスト）
-    quality_data : Signal(list)
-        全フレームの品質スコアリスト
-    finished : Signal()
-        分析完了シグナル
-    error : Signal(str)
-        エラーメッセージ
-    """
-
-    progress = Signal(int)
-    keyframes_found = Signal(list, list)
-    quality_data = Signal(list)
-    finished = Signal()
-    error = Signal(str)
-
-    def __init__(self, video_path: str, config: dict = None):
-        """
-        ワーカーの初期化
-
-        Parameters:
-        -----------
-        video_path : str
-            分析対象のビデオファイルパス
-        config : dict, optional
-            KeyframeSelectorに渡す設定辞書
-        """
-        super().__init__()
-        self.video_path = video_path
-        self.config = config
-        self._is_running = True
-
-    def run(self):
-        """
-        バックグラウンド分析を実行（最適化版KeyframeSelector使用）
-        """
-        try:
-            from core.video_loader import VideoLoader
-            from core.keyframe_selector import KeyframeSelector
-            from core.accelerator import get_accelerator
-
-            accel = get_accelerator()
-            logger.info(f"分析開始 - デバイス: {accel.device_name}")
-
-            # ビデオ読み込み
-            loader = VideoLoader()
-            loader.load(self.video_path)
-            meta = loader.get_metadata()
-
-            # KeyframeSelectorで2段階パイプライン実行（GUI設定を反映）
-            selector = KeyframeSelector(config=self.config)
-
-            def progress_callback(current, total, message=""):
-                if not self._is_running:
-                    return
-                pct = int(current / total * 100) if total > 0 else 0
-                self.progress.emit(pct)
-
-            keyframes = selector.select_keyframes(
-                loader,
-                progress_callback=progress_callback
-            )
-
-            if not self._is_running:
-                loader.close()
-                return
-
-            # 結果を分離
-            keyframe_frames = [kf.frame_index for kf in keyframes]
-            keyframe_scores = [kf.combined_score for kf in keyframes]
-
-            # 品質スコアデータ（タイムライン表示用）
-            # Stage 1のスコアがあればそれを使用
-            quality_scores = getattr(selector, '_stage1_scores', [])
-            if not quality_scores:
-                quality_scores = [0.0] * meta.frame_count
-                for kf in keyframes:
-                    if 0 <= kf.frame_index < len(quality_scores):
-                        quality_scores[kf.frame_index] = kf.combined_score
-
-            loader.close()
-
-            # 結果を送信
-            self.quality_data.emit(quality_scores)
-            self.keyframes_found.emit(keyframe_frames, keyframe_scores)
-            self.finished.emit()
-
-        except Exception as e:
-            logger.exception("分析エラー")
-            self.error.emit(f"分析エラー: {str(e)}")
-
-    def stop(self):
-        """分析を停止"""
-        self._is_running = False
-
-
 class MainWindow(QMainWindow):
     """
-    メインアプリケーションウィンドウ
+    360Split v2 メインウィンドウ
 
-    360Split の主要UIコンポーネントを統合し、
-    ビデオプレーヤー、タイムライン、キーフレームパネルを
-    管理するメインウィンドウ。
-
-    Features:
-    ---------
-    - ダークテーマUIデザイン
-    - メニューバー（ファイル、編集、処理、表示、ヘルプ）
-    - ツールバー（主要機能へのアクセス）
-    - ビデオプレーヤーウィジェット
-    - カスタムタイムラインウィジェット
-    - キーフレームパネル
-    - ステータスバー
-    - バックグラウンド分析スレッド
+    全ウィジェットのライフサイクルとシグナル接続を管理。
     """
 
     def __init__(self):
-        """
-        メインウィンドウの初期化
-        """
         super().__init__()
-        self.setWindowTitle("360Split - キーフレーム抽出ツール")
-        self.setGeometry(100, 100, 1600, 900)
+        self.setWindowTitle("360Split v2 — キーフレーム抽出ツール")
+        self.setGeometry(80, 60, 1600, 950)
+        self.setAcceptDrops(True)
 
-        # ロジックモジュール
+        # 状態
         self.video_path: Optional[str] = None
-        self.current_video_metadata = None
-        self.analysis_worker: Optional[AnalysisWorker] = None
+        self._stage1_scores: List[FrameScoreData] = []
+        self._stage1_worker: Optional[Stage1Worker] = None
+        self._stage2_worker: Optional[Stage2Worker] = None
+        self._full_worker: Optional[FullAnalysisWorker] = None
+        self._export_worker: Optional[ExportWorker] = None
 
-        # UI要素の初期化
         self._setup_ui()
         self._setup_menu()
         self._setup_toolbar()
-        self._setup_stylesheet()
+        self._setup_dock()
         self._setup_connections()
+        self._apply_stylesheet()
 
-        # ステータス表示用
-        self.statusBar().showMessage("準備完了")
+        self.statusBar().showMessage("準備完了 — 動画ファイルをドラッグ＆ドロップで読み込めます")
 
-        logger.info("メインウィンドウの初期化完了")
+    # ==================================================================
+    # UI レイアウト
+    # ==================================================================
 
     def _setup_ui(self):
-        """
-        UIレイアウトの構築
-        """
-        # 中央ウィジェット
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
+        """中央ウィジェット: ビデオ + タイムライン"""
+        central = QWidget()
+        self.setCentralWidget(central)
 
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # メイン分割レイアウト（ビデオ＋キーフレーム）
-        main_splitter = QSplitter(Qt.Horizontal)
-
-        # 左側：ビデオプレーヤー
+        # ビデオプレーヤー
         self.video_player = VideoPlayerWidget()
-        main_splitter.addWidget(self.video_player)
+        layout.addWidget(self.video_player, stretch=1)
 
-        # 右側：キーフレームパネル
-        self.keyframe_panel = KeyframePanel()
-        main_splitter.addWidget(self.keyframe_panel)
-
-        # 初期分割比率
-        main_splitter.setSizes([1100, 500])
-
-        main_layout.addWidget(main_splitter, stretch=1)
-
-        # 下部：タイムラインウィジェット
+        # タイムライン
         self.timeline = TimelineWidget()
-        main_layout.addWidget(self.timeline, stretch=0)
+        layout.addWidget(self.timeline, stretch=0)
 
-        # ステータスバーの設定
-        self.status_label = self.statusBar()
+        # ステータスバーにプログレスバーを追加
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setFixedWidth(250)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setVisible(False)
+        self.statusBar().addPermanentWidget(self._progress_bar)
+
+        self._progress_label = QLabel("")
+        self.statusBar().addPermanentWidget(self._progress_label)
+
+    def _setup_dock(self):
+        """右側ドック: 設定パネル + キーフレーム一覧 (タブ切り替え)"""
+        dock = QDockWidget("パネル", self)
+        dock.setMinimumWidth(300)
+        dock.setFeatures(
+            QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable
+        )
+
+        tab_widget = QTabWidget()
+
+        # タブ 1: 設定パネル
+        self.settings_panel = SettingsPanel()
+        tab_widget.addTab(self.settings_panel, "⚙ 設定")
+
+        # タブ 2: キーフレーム一覧
+        self.keyframe_list = KeyframeListWidget()
+        tab_widget.addTab(self.keyframe_list, "📋 キーフレーム")
+
+        dock.setWidget(tab_widget)
+        self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
     def _setup_menu(self):
-        """
-        メニューバーの構築
-        """
         menubar = self.menuBar()
 
-        # === ファイル(File) メニュー ===
-        file_menu = menubar.addMenu("ファイル(File)")
+        # ファイル(F)
+        file_menu = menubar.addMenu("ファイル(&F)")
 
-        open_action = QAction("ビデオを開く(&O)", self)
+        open_action = QAction("開く(&O)...", self)
         open_action.setShortcut(QKeySequence.Open)
         open_action.triggered.connect(self.open_video)
         file_menu.addAction(open_action)
 
         file_menu.addSeparator()
 
-        export_action = QAction("キーフレームをエクスポート(&E)", self)
+        export_action = QAction("キーフレームをエクスポート(&E)...", self)
         export_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
         export_action.triggered.connect(self.export_keyframes)
         file_menu.addAction(export_action)
@@ -246,734 +146,427 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-        # === 編集(Edit) メニュー ===
-        edit_menu = menubar.addMenu("編集(Edit)")
+        # 表示(V)
+        view_menu = menubar.addMenu("表示(&V)")
 
-        undo_action = QAction("元に戻す(&U)", self)
-        undo_action.setShortcut(QKeySequence.Undo)
-        edit_menu.addAction(undo_action)
-
-        redo_action = QAction("やり直す(&R)", self)
-        redo_action.setShortcut(QKeySequence.Redo)
-        edit_menu.addAction(redo_action)
-
-        edit_menu.addSeparator()
-
-        select_all_action = QAction("すべて選択(&A)", self)
-        select_all_action.setShortcut(QKeySequence.SelectAll)
-        select_all_action.triggered.connect(self.keyframe_panel.select_all)
-        edit_menu.addAction(select_all_action)
-
-        deselect_all_action = QAction("選択解除(&D)", self)
-        deselect_all_action.triggered.connect(self.keyframe_panel.deselect_all)
-        edit_menu.addAction(deselect_all_action)
-
-        edit_menu.addSeparator()
-
-        settings_action = QAction("設定(&S)...", self)
-        settings_action.setShortcut(QKeySequence.Preferences)
-        settings_action.triggered.connect(self._open_settings)
-        edit_menu.addAction(settings_action)
-
-        # === 処理(Processing) メニュー ===
-        process_menu = menubar.addMenu("処理(Processing)")
-
-        analyze_action = QAction("キーフレーム分析を実行(&R)", self)
-        analyze_action.setShortcut(QKeySequence("Ctrl+R"))
-        analyze_action.triggered.connect(self.run_keyframe_selection)
-        process_menu.addAction(analyze_action)
-
-        process_menu.addSeparator()
-
-        # === 表示(View) メニュー ===
-        view_menu = menubar.addMenu("表示(View)")
-
-        grid_action = QAction("グリッドオーバーレイを表示(&G)", self)
+        grid_action = QAction("グリッドオーバーレイ(&G)", self)
         grid_action.setCheckable(True)
-        grid_action.setChecked(False)
         grid_action.triggered.connect(
             lambda checked: self.video_player.set_grid_overlay(checked)
         )
         view_menu.addAction(grid_action)
 
-        # === ヘルプ(Help) メニュー ===
-        help_menu = menubar.addMenu("ヘルプ(Help)")
+        # 解析(A)
+        analysis_menu = menubar.addMenu("解析(&A)")
 
-        about_action = QAction("360Split について(&A)", self)
-        about_action.triggered.connect(self._show_about)
-        help_menu.addAction(about_action)
+        stage1_action = QAction("簡易解析 (Stage 1)(&1)", self)
+        stage1_action.setShortcut(QKeySequence("Ctrl+1"))
+        stage1_action.triggered.connect(self._run_stage1)
+        analysis_menu.addAction(stage1_action)
+
+        stage2_action = QAction("詳細解析 (Stage 2)(&2)", self)
+        stage2_action.setShortcut(QKeySequence("Ctrl+2"))
+        stage2_action.triggered.connect(self._run_stage2)
+        analysis_menu.addAction(stage2_action)
+
+        analysis_menu.addSeparator()
+
+        full_action = QAction("フル解析 (Stage 1+2)(&R)", self)
+        full_action.setShortcut(QKeySequence("Ctrl+R"))
+        full_action.triggered.connect(self._run_full_analysis)
+        analysis_menu.addAction(full_action)
 
     def _setup_toolbar(self):
-        """
-        ツールバーの構築
-        """
-        toolbar = self.addToolBar("メインツールバー")
-        toolbar.setIconSize(QSize(24, 24))
+        tb = self.addToolBar("メイン")
+        tb.setIconSize(QSize(20, 20))
 
-        # ビデオを開く
-        open_action = QAction("ビデオを開く", self)
-        open_action.triggered.connect(self.open_video)
-        toolbar.addAction(open_action)
-
-        toolbar.addSeparator()
-
-        # 分析実行
-        run_action = QAction("分析を実行", self)
-        run_action.triggered.connect(self.run_keyframe_selection)
-        toolbar.addAction(run_action)
-
-        toolbar.addSeparator()
-
-        # エクスポート
-        export_action = QAction("キーフレームをエクスポート", self)
-        export_action.triggered.connect(self.export_keyframes)
-        toolbar.addAction(export_action)
-
-        toolbar.addSeparator()
-
-        # 設定
-        settings_action = QAction("設定", self)
-        settings_action.triggered.connect(self._open_settings)
-        toolbar.addAction(settings_action)
-
-    def _setup_stylesheet(self):
-        """
-        ダークテーマスタイルシートの適用
-        """
-        dark_stylesheet = """
-        QMainWindow {
-            background-color: #1e1e1e;
-            color: #ffffff;
-        }
-
-        QMenuBar {
-            background-color: #2d2d2d;
-            color: #ffffff;
-            border-bottom: 1px solid #3d3d3d;
-        }
-
-        QMenuBar::item:selected {
-            background-color: #3d3d3d;
-        }
-
-        QMenu {
-            background-color: #2d2d2d;
-            color: #ffffff;
-            border: 1px solid #3d3d3d;
-        }
-
-        QMenu::item:selected {
-            background-color: #404080;
-        }
-
-        QToolBar {
-            background-color: #2d2d2d;
-            border-bottom: 1px solid #3d3d3d;
-            spacing: 5px;
-            padding: 5px;
-        }
-
-        QToolBar::separator {
-            background-color: #3d3d3d;
-            width: 1px;
-            margin: 5px 0;
-        }
-
-        QStatusBar {
-            background-color: #2d2d2d;
-            color: #ffffff;
-            border-top: 1px solid #3d3d3d;
-        }
-
-        QLabel {
-            color: #ffffff;
-        }
-
-        QLineEdit {
-            background-color: #3d3d3d;
-            color: #ffffff;
-            border: 1px solid #404040;
-            border-radius: 3px;
-            padding: 5px;
-        }
-
-        QLineEdit:focus {
-            border: 1px solid #5080d0;
-        }
-
-        QPushButton {
-            background-color: #404080;
-            color: #ffffff;
-            border: 1px solid #5080d0;
-            border-radius: 3px;
-            padding: 5px 15px;
-            font-weight: bold;
-        }
-
-        QPushButton:hover {
-            background-color: #5080d0;
-        }
-
-        QPushButton:pressed {
-            background-color: #3d6ead;
-        }
-
-        QScrollBar:vertical {
-            background-color: #2d2d2d;
-            width: 12px;
-            border: none;
-        }
-
-        QScrollBar::handle:vertical {
-            background-color: #505050;
-            border-radius: 6px;
-            min-height: 20px;
-        }
-
-        QScrollBar::handle:vertical:hover {
-            background-color: #606060;
-        }
-
-        QScrollBar:horizontal {
-            background-color: #2d2d2d;
-            height: 12px;
-            border: none;
-        }
-
-        QScrollBar::handle:horizontal {
-            background-color: #505050;
-            border-radius: 6px;
-            min-width: 20px;
-        }
-
-        QScrollBar::handle:horizontal:hover {
-            background-color: #606060;
-        }
-
-        QComboBox {
-            background-color: #3d3d3d;
-            color: #ffffff;
-            border: 1px solid #404040;
-            border-radius: 3px;
-            padding: 5px;
-        }
-
-        QComboBox:focus {
-            border: 1px solid #5080d0;
-        }
-
-        QComboBox::drop-down {
-            border: none;
-            width: 20px;
-        }
-
-        QSlider::groove:horizontal {
-            background-color: #3d3d3d;
-            height: 6px;
-            border-radius: 3px;
-        }
-
-        QSlider::handle:horizontal {
-            background-color: #5080d0;
-            border: 1px solid #6090e0;
-            width: 14px;
-            margin: -4px 0;
-            border-radius: 7px;
-        }
-
-        QSlider::handle:horizontal:hover {
-            background-color: #6090e0;
-        }
-
-        QTabBar::tab {
-            background-color: #3d3d3d;
-            color: #ffffff;
-            padding: 8px 20px;
-            border: none;
-        }
-
-        QTabBar::tab:selected {
-            background-color: #505080;
-            border-bottom: 2px solid #5080d0;
-        }
-
-        QTabWidget::pane {
-            border: 1px solid #3d3d3d;
-        }
-
-        QDialog {
-            background-color: #1e1e1e;
-            color: #ffffff;
-        }
-
-        QProgressDialog {
-            background-color: #2d2d2d;
-        }
-
-        QProgressBar {
-            background-color: #3d3d3d;
-            color: #ffffff;
-            border: 1px solid #404040;
-            border-radius: 3px;
-            text-align: center;
-        }
-
-        QProgressBar::chunk {
-            background-color: #5080d0;
-        }
-
-        QCheckBox {
-            color: #ffffff;
-            spacing: 5px;
-        }
-
-        QCheckBox::indicator {
-            width: 18px;
-            height: 18px;
-        }
-
-        QCheckBox::indicator:unchecked {
-            background-color: #3d3d3d;
-            border: 1px solid #505050;
-        }
-
-        QCheckBox::indicator:checked {
-            background-color: #5080d0;
-            border: 1px solid #5080d0;
-        }
-
-        QSpinBox, QDoubleSpinBox {
-            background-color: #3d3d3d;
-            color: #ffffff;
-            border: 1px solid #404040;
-            border-radius: 3px;
-            padding: 5px;
-        }
-        """
-        self.setStyleSheet(dark_stylesheet)
+        tb.addAction("📂 開く", self.open_video)
+        tb.addSeparator()
+        tb.addAction("⚡ 簡易解析", self._run_stage1)
+        tb.addAction("🔬 詳細解析", self._run_stage2)
+        tb.addAction("🚀 フル解析", self._run_full_analysis)
+        tb.addSeparator()
+        tb.addAction("💾 エクスポート", self.export_keyframes)
 
     def _setup_connections(self):
-        """
-        UIコンポーネント間のシグナル/スロット接続
-        """
-        # ビデオプレーヤーのシグナル
-        self.video_player.frame_changed.connect(self._on_frame_changed)
-        self.video_player.playback_speed_changed.connect(self._on_speed_changed)
+        """全シグナル/スロットを接続"""
+        # ビデオプレーヤー → タイムライン同期
+        self.video_player.frame_changed.connect(self.timeline.set_position)
+        self.video_player.keyframe_marked.connect(self._on_manual_mark)
 
-        # キーフレームパネルのシグナル
-        self.keyframe_panel.keyframe_selected.connect(self._on_keyframe_selected)
-        self.keyframe_panel.keyframe_deleted.connect(self._on_keyframe_deleted)
+        # タイムライン → ビデオプレーヤー同期
+        self.timeline.positionChanged.connect(self.video_player.seek_to_frame)
+        self.timeline.keyframeClicked.connect(self.video_player.seek_to_frame)
 
-        # タイムラインのシグナル
-        self.timeline.positionChanged.connect(self._on_timeline_position_changed)
-        self.timeline.keyframeClicked.connect(self._on_timeline_keyframe_clicked)
+        # キーフレーム一覧 → ビデオプレーヤー
+        self.keyframe_list.keyframe_selected.connect(self.video_player.seek_to_frame)
+        self.keyframe_list.keyframe_deleted.connect(self.timeline.remove_keyframe)
+
+        # 設定パネル → Live Preview
+        self.settings_panel.setting_changed.connect(self._on_live_preview)
+        self.settings_panel.run_stage2_requested.connect(self._run_stage2)
+
+    # ==================================================================
+    # ドラッグ＆ドロップ
+    # ==================================================================
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile().lower()
+                if path.endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+                    event.acceptProposedAction()
+                    return
+
+    def dropEvent(self, event: QDropEvent):
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+                self._load_video(path)
+                return
+
+    # ==================================================================
+    # ビデオ読み込み
+    # ==================================================================
 
     def open_video(self):
-        """
-        ビデオファイルを開くダイアログを表示し、ビデオを読み込む
-
-        サポート形式: mp4, mov, avi, mkv
-        """
-        file_filter = "ビデオファイル (*.mp4 *.mov *.avi *.mkv);;すべてのファイル (*)"
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "ビデオファイルを開く",
-            "",
-            file_filter
+        path, _ = QFileDialog.getOpenFileName(
+            self, "ビデオファイルを開く", "",
+            "ビデオ (*.mp4 *.mov *.avi *.mkv *.webm);;すべて (*)"
         )
+        if path:
+            self._load_video(path)
 
-        if not file_path:
-            return
-
+    def _load_video(self, path: str):
         try:
-            # ビデオを読み込む
-            self.video_path = file_path
-            metadata = self.video_player.load_video(file_path)
-            self.current_video_metadata = metadata
-
-            # タイムラインを初期化
+            self.video_path = path
+            metadata = self.video_player.load_video(path)
             self.timeline.set_duration(metadata.frame_count, metadata.fps)
+            self.keyframe_list.set_video_path(path)
+            self.keyframe_list.clear()
+            self._stage1_scores.clear()
 
-            # キーフレームパネルにビデオパスを設定（サムネイル読み込み用）
-            self.keyframe_panel.set_video_path(file_path)
-
-            # キーフレームパネルをクリア
-            self.keyframe_panel.clear()
-
-            # ステータス更新
-            self.update_status(
-                f"ビデオ読み込み完了: {Path(file_path).name} "
-                f"({metadata.width}x{metadata.height}, {metadata.fps:.1f}fps, "
-                f"{metadata.frame_count}フレーム)"
+            self.statusBar().showMessage(
+                f"読み込み完了: {Path(path).name}  "
+                f"({metadata.width}×{metadata.height}, "
+                f"{metadata.fps:.1f}fps, {metadata.frame_count}フレーム)"
             )
-
-            logger.info(f"ビデオ読み込み: {file_path}")
-
         except Exception as e:
-            logger.exception(f"ビデオ読み込みエラー: {file_path}")
-            QMessageBox.critical(
-                self,
-                "エラー",
-                f"ビデオファイルの読み込みに失敗しました:\n{str(e)}"
-            )
+            logger.exception(f"ビデオ読み込みエラー: {path}")
+            QMessageBox.critical(self, "エラー", f"読み込み失敗:\n{e}")
 
-    def run_keyframe_selection(self):
-        """
-        キーフレーム選択分析をバックグラウンドスレッドで実行
+    # ==================================================================
+    # Stage 1: 簡易解析
+    # ==================================================================
 
-        分析中はプログレスダイアログを表示し、
-        完了後にタイムラインとキーフレームパネルを更新する。
-        """
+    def _run_stage1(self):
         if not self.video_path:
-            QMessageBox.warning(
-                self,
-                "警告",
-                "ビデオファイルを先に開いてください"
-            )
+            QMessageBox.warning(self, "警告", "ビデオを先に開いてください")
             return
 
-        # GUI設定をKeyframeSelector用に変換して渡す
-        selector_config = self._build_selector_config()
+        self._stop_workers()
+        self._stage1_scores.clear()
 
-        # 分析ワーカーの作成（最適化版: KeyframeSelectorの2段階パイプライン使用）
-        self.analysis_worker = AnalysisWorker(self.video_path, config=selector_config)
-        self.analysis_worker.progress.connect(self._on_analysis_progress)
-        self.analysis_worker.keyframes_found.connect(self._on_keyframes_found)
-        self.analysis_worker.quality_data.connect(self._on_quality_data_received)
-        self.analysis_worker.finished.connect(self._on_analysis_finished)
-        self.analysis_worker.error.connect(self._on_analysis_error)
+        config = self.settings_panel.get_selector_dict()
+        self._stage1_worker = Stage1Worker(self.video_path, config=config)
+        self._stage1_worker.progress.connect(self._on_progress)
+        self._stage1_worker.frame_scores.connect(self._on_stage1_batch)
+        self._stage1_worker.finished_scores.connect(self._on_stage1_finished)
+        self._stage1_worker.error.connect(self._on_error)
 
-        # プログレスダイアログ
-        self.progress_dialog = QProgressDialog(
-            "キーフレーム分析を実行中...",
-            "キャンセル",
-            0,
-            100,
-            self
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setValue(0)
+        self.statusBar().showMessage("Stage 1: 品質スキャン中...")
+        self._stage1_worker.start()
+
+    def _on_stage1_batch(self, batch: list):
+        """Stage 1 バッチ結果をプログレッシブにグラフ追加"""
+        self._stage1_scores.extend(batch)
+        norm_factor = 1000.0  # NormalizationConfig.SHARPNESS_NORM_FACTOR
+        indices = [s.frame_index for s in batch]
+        sharpness = [min(s.sharpness / norm_factor, 1.0) for s in batch]
+        self.timeline.append_score_batch(indices, sharpness)
+
+    def _on_stage1_finished(self, all_scores: list):
+        """Stage 1 完了"""
+        self._stage1_scores = all_scores
+        self._progress_bar.setVisible(False)
+
+        # 全データでグラフを更新
+        norm_factor = 1000.0
+        indices = [s.frame_index for s in all_scores]
+        sharpness = [min(s.sharpness / norm_factor, 1.0) for s in all_scores]
+        self.timeline.set_score_data(indices, sharpness)
+
+        self.statusBar().showMessage(
+            f"Stage 1 完了: {len(all_scores)} フレームをスキャン。"
+            "「詳細解析」で GRIC/SSIM を計算できます。"
         )
-        self.progress_dialog.setWindowModality(Qt.WindowModal)
-        self.progress_dialog.setStyleSheet(self.styleSheet())
-        self.progress_dialog.canceled.connect(self.analysis_worker.stop)
 
-        # ワーカーを開始
-        self.analysis_worker.start()
-        self.update_status("キーフレーム分析を実行中...")
+    # ==================================================================
+    # Stage 2: 詳細解析
+    # ==================================================================
+
+    def _run_stage2(self):
+        if not self.video_path:
+            QMessageBox.warning(self, "警告", "ビデオを先に開いてください")
+            return
+
+        self._stop_workers()
+
+        config = self.settings_panel.get_selector_dict()
+        self._stage2_worker = Stage2Worker(
+            self.video_path, self._stage1_scores, config=config
+        )
+        self._stage2_worker.progress.connect(self._on_progress)
+        self._stage2_worker.keyframes_found.connect(self._on_keyframes_found)
+        self._stage2_worker.frame_scores_updated.connect(self._on_scores_updated)
+        self._stage2_worker.finished.connect(self._on_stage2_finished)
+        self._stage2_worker.error.connect(self._on_error)
+
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setValue(0)
+        self.statusBar().showMessage("Stage 2: 精密評価中...")
+        self._stage2_worker.start()
+
+    def _on_scores_updated(self, updated: list):
+        """Stage 2 でGRIC/SSIM付きスコア更新"""
+        self._stage1_scores = updated
+        norm_factor = 1000.0
+        indices = [s.frame_index for s in updated]
+        sharpness = [min(s.sharpness / norm_factor, 1.0) for s in updated]
+        gric = [s.gric for s in updated]
+        ssim_change = [1.0 - s.ssim for s in updated]
+
+        # GRICデータがあるか確認
+        has_gric = any(g > 0 for g in gric)
+        has_ssim = any(sc > 0 for sc in ssim_change)
+
+        self.timeline.set_score_data(
+            indices, sharpness,
+            gric=gric if has_gric else None,
+            ssim_change=ssim_change if has_ssim else None
+        )
+
+    def _on_stage2_finished(self):
+        self._progress_bar.setVisible(False)
+        n = len(self.keyframe_list.keyframe_frames)
+        self.statusBar().showMessage(f"Stage 2 完了: {n} キーフレーム検出")
+
+    # ==================================================================
+    # フル解析 (Stage 1 + 2)
+    # ==================================================================
+
+    def _run_full_analysis(self):
+        if not self.video_path:
+            QMessageBox.warning(self, "警告", "ビデオを先に開いてください")
+            return
+
+        self._stop_workers()
+        self._stage1_scores.clear()
+
+        config = self.settings_panel.get_selector_dict()
+        self._full_worker = FullAnalysisWorker(self.video_path, config=config)
+        self._full_worker.progress.connect(self._on_progress)
+        self._full_worker.stage1_batch.connect(self._on_stage1_batch)
+        self._full_worker.stage1_finished.connect(self._on_stage1_finished)
+        self._full_worker.keyframes_found.connect(self._on_keyframes_found)
+        self._full_worker.finished.connect(self._on_full_finished)
+        self._full_worker.error.connect(self._on_error)
+
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setValue(0)
+        self.statusBar().showMessage("フル解析開始 (Stage 1 + 2)...")
+        self._full_worker.start()
+
+    def _on_full_finished(self):
+        self._progress_bar.setVisible(False)
+        n = len(self.keyframe_list.keyframe_frames)
+        self.statusBar().showMessage(f"解析完了: {n} キーフレーム検出")
+        QMessageBox.information(self, "完了", f"解析完了: {n} キーフレームを検出しました")
+
+    # ==================================================================
+    # 共通コールバック
+    # ==================================================================
+
+    def _on_progress(self, current: int, total: int, message: str = ""):
+        pct = int(current / max(total, 1) * 100)
+        self._progress_bar.setValue(pct)
+        self._progress_label.setText(message)
+
+    def _on_keyframes_found(self, keyframes):
+        """キーフレーム検出結果を全ウィジェットに反映"""
+        frames = [kf.frame_index for kf in keyframes]
+        scores = [kf.combined_score for kf in keyframes]
+
+        self.timeline.set_keyframes(frames, scores)
+        self.keyframe_list.set_keyframes(frames, scores)
+        self.video_player.set_keyframe_indices(frames)
+
+    def _on_error(self, msg: str):
+        self._progress_bar.setVisible(False)
+        self.statusBar().showMessage(f"エラー: {msg}")
+        QMessageBox.critical(self, "エラー", msg)
+
+    def _on_manual_mark(self, frame_idx: int):
+        """手動キーフレームマーク"""
+        if frame_idx not in self.keyframe_list.keyframe_frames:
+            self.keyframe_list.keyframe_frames.append(frame_idx)
+            self.keyframe_list.keyframe_scores.append(0.5)
+            self.keyframe_list._load_thumbnails()
+            self.keyframe_list._update_display()
+            self.timeline.set_keyframes(
+                self.keyframe_list.keyframe_frames,
+                self.keyframe_list.keyframe_scores
+            )
+            self.video_player.set_keyframe_indices(self.keyframe_list.keyframe_frames)
+
+    # ==================================================================
+    # Live Preview
+    # ==================================================================
+
+    def _on_live_preview(self, config_dict: dict):
+        """
+        設定パネルのパラメータ変更時に呼ばれる。
+        再解析は走らせず、既存の _stage1_scores を使って
+        閾値ベースのフィルタリングのみ再実行する。
+        """
+        if not self._stage1_scores:
+            return
+
+        lap_th = config_dict.get('LAPLACIAN_THRESHOLD', 100.0)
+        blur_th = config_dict.get('MOTION_BLUR_THRESHOLD', 0.3)
+        min_interval = config_dict.get('MIN_KEYFRAME_INTERVAL', 5)
+
+        # 簡易フィルタリング
+        candidates = []
+        last_kf = -min_interval
+        for s in self._stage1_scores:
+            if s.sharpness >= lap_th and s.motion_blur <= blur_th:
+                if s.frame_index - last_kf >= min_interval:
+                    candidates.append(s.frame_index)
+                    last_kf = s.frame_index
+
+        # マーカーだけ更新（スコアは仮に0.5）
+        scores = [0.5] * len(candidates)
+        self.timeline.set_keyframes(candidates, scores)
+        self.video_player.set_keyframe_indices(candidates)
+
+        self.statusBar().showMessage(
+            f"Live Preview: {len(candidates)} フレームが閾値を通過"
+        )
+
+    # ==================================================================
+    # エクスポート
+    # ==================================================================
 
     def export_keyframes(self):
-        """
-        選択されたキーフレームを指定ディレクトリにエクスポート
-
-        設定ダイアログで指定された出力形式、JPEG品質、ファイル命名規則を使用。
-        """
         if not self.video_path:
-            QMessageBox.warning(
-                self,
-                "警告",
-                "ビデオファイルを先に開いてください"
-            )
+            QMessageBox.warning(self, "警告", "ビデオを先に開いてください")
             return
 
-        keyframes = self.keyframe_panel.get_selected_keyframes()
-        if not keyframes:
-            QMessageBox.warning(
-                self,
-                "警告",
-                "エクスポートするキーフレームを選択してください"
-            )
+        selected = self.keyframe_list.get_selected_keyframes()
+        if not selected:
+            # 全キーフレームを対象にする
+            selected = list(self.keyframe_list.keyframe_frames)
+        if not selected:
+            QMessageBox.warning(self, "警告", "エクスポートするキーフレームがありません")
             return
 
-        # GUI設定を読み込む
-        gui_settings = self._load_gui_settings()
-        output_format = gui_settings.get('output_image_format', 'png').lower()
-        jpeg_quality = gui_settings.get('output_jpeg_quality', 95)
-        naming_prefix = gui_settings.get('naming_prefix', 'keyframe')
-        default_dir = gui_settings.get('output_directory', str(Path.home() / "360split_output"))
-
-        # 拡張子のマッピング（設定値 → ファイル拡張子）
-        format_ext_map = {
-            'png': 'png',
-            'jpeg': 'jpg',
-            'jpg': 'jpg',
-            'tiff': 'tiff',
-            'tif': 'tiff',
-        }
-        file_ext = format_ext_map.get(output_format, 'png')
-
-        # エクスポート先ディレクトリの選択（設定のデフォルトディレクトリを初期パスにする）
         export_dir = QFileDialog.getExistingDirectory(
-            self,
-            "エクスポート先ディレクトリを選択",
-            default_dir
+            self, "エクスポート先を選択",
+            str(Path.home() / "360split_output")
         )
-
         if not export_dir:
             return
 
-        try:
-            import cv2
-
-            export_path = Path(export_dir)
-            export_path.mkdir(parents=True, exist_ok=True)
-
-            # ビデオから各キーフレームを抽出
-            cap = cv2.VideoCapture(self.video_path)
-            exported_count = 0
-
-            for frame_idx in sorted(keyframes):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-
-                if ret:
-                    # 設定に基づくファイル名生成
-                    output_file = export_path / f"{naming_prefix}_{frame_idx:06d}.{file_ext}"
-
-                    # 形式に応じた保存パラメータ
-                    if file_ext == 'jpg':
-                        cv2.imwrite(str(output_file), frame,
-                                    [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
-                    elif file_ext == 'tiff':
-                        cv2.imwrite(str(output_file), frame)
-                    else:  # png
-                        cv2.imwrite(str(output_file), frame,
-                                    [cv2.IMWRITE_PNG_COMPRESSION, 3])
-
-                    exported_count += 1
-
-            cap.release()
-
-            self.update_status(
-                f"キーフレーム {exported_count} 個をエクスポートしました: {export_dir}"
-            )
-            QMessageBox.information(
-                self,
-                "完了",
-                f"{exported_count} 個のキーフレームを {file_ext.upper()} 形式でエクスポートしました\n"
-                f"出力先: {export_dir}"
-            )
-
-            logger.info(
-                f"キーフレームをエクスポート: {exported_count}個 -> {export_dir} "
-                f"(形式: {file_ext}, プレフィックス: {naming_prefix})"
-            )
-
-        except Exception as e:
-            logger.exception("エクスポートエラー")
-            QMessageBox.critical(
-                self,
-                "エラー",
-                f"エクスポート中にエラーが発生しました:\n{str(e)}"
-            )
-
-    def update_status(self, message: str):
-        """
-        ステータスバーを更新
-
-        Parameters:
-        -----------
-        message : str
-            表示するメッセージ
-        """
-        self.status_label.showMessage(message)
-        logger.info(f"ステータス: {message}")
-
-    def _load_gui_settings(self) -> dict:
-        """
-        GUI設定ファイル (~/.360split/settings.json) を読み込む
-
-        Returns:
-        --------
-        dict
-            設定辞書。ファイルが存在しない場合はデフォルト値
-        """
-        settings_file = Path.home() / ".360split" / "settings.json"
-        default_settings = {
-            'weight_sharpness': 0.30,
-            'weight_exposure': 0.15,
-            'weight_geometric': 0.30,
-            'weight_content': 0.25,
-            'ssim_threshold': 0.85,
-            'min_keyframe_interval': 5,
-            'max_keyframe_interval': 60,
-            'softmax_beta': 5.0,
-            'output_image_format': 'png',
-            'output_jpeg_quality': 95,
-            'output_directory': str(Path.home() / "360split_output"),
-            'naming_prefix': 'keyframe',
-        }
-
-        try:
-            if settings_file.exists():
-                with open(settings_file, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
-                    default_settings.update(loaded)
-                logger.info(f"GUI設定を読み込みました: {settings_file}")
-        except Exception as e:
-            logger.warning(f"GUI設定読み込みエラー: {e} (デフォルト値を使用)")
-
-        return default_settings
-
-    def _build_selector_config(self) -> dict:
-        """
-        GUI設定をKeyframeSelector用の設定辞書に変換
-
-        KeyframeConfig.from_dict() を使用してGUI設定を構造化し、
-        to_selector_dict() でKeyframeSelector互換の辞書に変換。
-        さらにGRIC/360°関連のパラメータも追加する。
-
-        Returns:
-        --------
-        dict
-            KeyframeSelectorのconfigに渡す設定辞書
-        """
-        gui_settings = self._load_gui_settings()
-
-        # KeyframeConfig経由で構造化変換
-        kf_config = KeyframeConfig.from_dict(gui_settings)
-        selector_config = kf_config.to_selector_dict()
-
-        # GRIC関連パラメータを追加（KeyframeSelectorが直接参照）
-        selector_config['GRIC_LAMBDA1'] = kf_config.gric.lambda1
-        selector_config['GRIC_LAMBDA2'] = kf_config.gric.lambda2
-        selector_config['GRIC_SIGMA'] = kf_config.gric.sigma
-        selector_config['RANSAC_THRESHOLD'] = kf_config.gric.ransac_threshold
-        selector_config['MIN_INLIER_RATIO'] = kf_config.gric.min_inlier_ratio
-        selector_config['GRIC_DEGENERACY_THRESHOLD'] = kf_config.gric.degeneracy_threshold
-
-        # 360°ポーラーマスク設定
-        selector_config['ENABLE_POLAR_MASK'] = kf_config.equirect360.enable_polar_mask
-        selector_config['MASK_POLAR_RATIO'] = kf_config.equirect360.mask_polar_ratio
-
-        # 正規化係数
-        selector_config['SHARPNESS_NORM_FACTOR'] = kf_config.normalization.SHARPNESS_NORM_FACTOR
-        selector_config['OPTICAL_FLOW_NORM_FACTOR'] = kf_config.normalization.OPTICAL_FLOW_NORM_FACTOR
-        selector_config['FEATURE_MATCH_NORM_FACTOR'] = kf_config.normalization.FEATURE_MATCH_NORM_FACTOR
-
-        logger.info(
-            f"分析設定: 重み[S={selector_config['WEIGHT_SHARPNESS']:.2f}, "
-            f"E={selector_config['WEIGHT_EXPOSURE']:.2f}, "
-            f"G={selector_config['WEIGHT_GEOMETRIC']:.2f}, "
-            f"C={selector_config['WEIGHT_CONTENT']:.2f}], "
-            f"SSIM閾値={selector_config['SSIM_CHANGE_THRESHOLD']:.2f}, "
-            f"間隔={selector_config['MIN_KEYFRAME_INTERVAL']}-{selector_config['MAX_KEYFRAME_INTERVAL']}, "
-            f"GRIC[λ1={kf_config.gric.lambda1}, λ2={kf_config.gric.lambda2}, "
-            f"σ={kf_config.gric.sigma}], "
-            f"ポーラーマスク={'ON' if kf_config.equirect360.enable_polar_mask else 'OFF'}"
+        self._export_worker = ExportWorker(
+            self.video_path, selected, export_dir
         )
+        self._export_worker.progress.connect(self._on_progress)
+        self._export_worker.finished.connect(self._on_export_finished)
+        self._export_worker.error.connect(self._on_error)
 
-        return selector_config
+        self._progress_bar.setVisible(True)
+        self.statusBar().showMessage("エクスポート中...")
+        self._export_worker.start()
 
-    def _open_settings(self):
-        """
-        設定ダイアログを開く
-        """
-        settings_dialog = SettingsDialog(self)
-        settings_dialog.exec()
+    def _on_export_finished(self, count: int):
+        self._progress_bar.setVisible(False)
+        self.statusBar().showMessage(f"エクスポート完了: {count} ファイル")
+        QMessageBox.information(self, "完了", f"{count} 個のキーフレームをエクスポートしました")
 
-    def _show_about(self):
-        """
-        アプリケーション情報ダイアログを表示
-        """
-        QMessageBox.information(
-            self,
-            "360Split について",
-            "360Split v1.0\n\n"
-            "360度動画キーフレーム抽出ツール\n"
-            "photogrammetry/3GS再構成用\n\n"
-            "© 2024 360Split Project"
-        )
+    # ==================================================================
+    # ワーカー管理
+    # ==================================================================
 
-    # === シグナルハンドラー ===
-
-    def _on_frame_changed(self, frame_idx: int):
-        """
-        ビデオプレーヤーのフレーム変更時のコールバック
-        """
-        self.timeline.set_position(frame_idx)
-
-    def _on_speed_changed(self, speed: float):
-        """
-        再生速度変更時のコールバック
-        """
-        self.update_status(f"再生速度: {speed}x")
-
-    def _on_keyframe_selected(self, frame_idx: int):
-        """
-        キーフレームパネルで選択されたキーフレームのコールバック
-        """
-        self.video_player.seek_to_frame(frame_idx)
-
-    def _on_keyframe_deleted(self, frame_idx: int):
-        """
-        キーフレームが削除されたときのコールバック
-        """
-        self.timeline.remove_keyframe(frame_idx)
-
-    def _on_timeline_position_changed(self, frame_idx: int):
-        """
-        タイムラインで位置が変更されたときのコールバック
-        """
-        self.video_player.seek_to_frame(frame_idx)
-
-    def _on_timeline_keyframe_clicked(self, frame_idx: int):
-        """
-        タイムラインでキーフレームがクリックされたときのコールバック
-        """
-        self.video_player.seek_to_frame(frame_idx)
-
-    def _on_analysis_progress(self, progress: int):
-        """
-        分析進捗時のコールバック
-        """
-        if hasattr(self, 'progress_dialog'):
-            self.progress_dialog.setValue(progress)
-
-    def _on_keyframes_found(self, frames: list, scores: list):
-        """
-        キーフレームが検出されたときのコールバック
-        """
-        self.timeline.set_keyframes(frames, scores)
-        self.keyframe_panel.set_keyframes(frames, scores)
-
-    def _on_quality_data_received(self, quality_scores: list):
-        """
-        品質スコアデータ受信時のコールバック
-        """
-        self.timeline.set_quality_data(quality_scores)
-
-    def _on_analysis_finished(self):
-        """
-        分析完了時のコールバック
-        """
-        if hasattr(self, 'progress_dialog'):
-            self.progress_dialog.close()
-
-        self.update_status("キーフレーム分析が完了しました")
-        QMessageBox.information(
-            self,
-            "完了",
-            "キーフレーム分析が完了しました"
-        )
-
-    def _on_analysis_error(self, error_msg: str):
-        """
-        分析エラー時のコールバック
-        """
-        if hasattr(self, 'progress_dialog'):
-            self.progress_dialog.close()
-
-        self.update_status(f"エラー: {error_msg}")
-        QMessageBox.critical(
-            self,
-            "エラー",
-            f"分析中にエラーが発生しました:\n{error_msg}"
-        )
+    def _stop_workers(self):
+        for w in [self._stage1_worker, self._stage2_worker, self._full_worker, self._export_worker]:
+            if w and w.isRunning():
+                w.stop()
+                w.wait(3000)
 
     def closeEvent(self, event):
-        """
-        アプリケーション終了時の処理
-        """
-        if self.analysis_worker and self.analysis_worker.isRunning():
-            self.analysis_worker.stop()
-            self.analysis_worker.wait()
-
+        self._stop_workers()
+        self.settings_panel.save_settings()
         super().closeEvent(event)
+
+    # ==================================================================
+    # スタイルシート
+    # ==================================================================
+
+    def _apply_stylesheet(self):
+        self.setStyleSheet("""
+        QMainWindow { background-color: #1e1e1e; color: #ffffff; }
+
+        QMenuBar { background-color: #2d2d2d; color: #fff; border-bottom: 1px solid #3d3d3d; }
+        QMenuBar::item:selected { background-color: #3d3d3d; }
+        QMenu { background-color: #2d2d2d; color: #fff; border: 1px solid #3d3d3d; }
+        QMenu::item:selected { background-color: #404080; }
+
+        QToolBar { background-color: #2d2d2d; border-bottom: 1px solid #3d3d3d; spacing: 4px; padding: 4px; }
+
+        QStatusBar { background: #2d2d2d; color: #fff; border-top: 1px solid #3d3d3d; }
+
+        QDockWidget { color: #fff; }
+        QDockWidget::title { background: #2d2d2d; padding: 6px; }
+
+        QTabBar::tab { background: #3d3d3d; color: #fff; padding: 8px 16px; border: none; }
+        QTabBar::tab:selected { background: #505080; border-bottom: 2px solid #5080d0; }
+        QTabWidget::pane { border: 1px solid #3d3d3d; }
+
+        QLabel { color: #fff; }
+
+        QPushButton {
+            background-color: #404080; color: #fff;
+            border: 1px solid #5080d0; border-radius: 3px;
+            padding: 4px 12px; font-weight: bold;
+        }
+        QPushButton:hover { background-color: #5080d0; }
+        QPushButton:pressed { background-color: #3d6ead; }
+
+        QSlider::groove:horizontal { background: #3d3d3d; height: 6px; border-radius: 3px; }
+        QSlider::handle:horizontal {
+            background: #5080d0; border: 1px solid #6090e0;
+            width: 14px; margin: -4px 0; border-radius: 7px;
+        }
+
+        QComboBox { background: #3d3d3d; color: #fff; border: 1px solid #404040; border-radius: 3px; padding: 4px; }
+        QSpinBox, QDoubleSpinBox { background: #3d3d3d; color: #fff; border: 1px solid #404040; border-radius: 3px; padding: 4px; }
+
+        QCheckBox { color: #fff; spacing: 5px; }
+        QCheckBox::indicator { width: 16px; height: 16px; }
+        QCheckBox::indicator:unchecked { background: #3d3d3d; border: 1px solid #505050; }
+        QCheckBox::indicator:checked { background: #5080d0; border: 1px solid #5080d0; }
+
+        QScrollBar:vertical { background: #2d2d2d; width: 10px; }
+        QScrollBar::handle:vertical { background: #505050; border-radius: 5px; min-height: 20px; }
+        QScrollBar:horizontal { background: #2d2d2d; height: 10px; }
+        QScrollBar::handle:horizontal { background: #505050; border-radius: 5px; min-width: 20px; }
+
+        QProgressBar { background: #3d3d3d; color: #fff; border: 1px solid #404040; border-radius: 3px; text-align: center; }
+        QProgressBar::chunk { background: #5080d0; }
+
+        QGroupBox { color: #ddd; border: 1px solid #3d3d3d; border-radius: 4px; margin-top: 8px; padding-top: 16px; }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+        """)

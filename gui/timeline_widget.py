@@ -1,14 +1,26 @@
 """
-タイムラインウィジェット - 360Split GUI
-キーフレームマーカー、品質スコア可視化、タイムライン操作
+タイムラインウィジェット - 360Split v2 GUI
+pyqtgraph ベースのスコアグラフ + 現在位置 + キーフレームマーカー
+
+表示内容:
+  - X軸: フレーム番号 / 時間
+  - Y軸: 正規化スコア (0.0 - 1.0)
+  - 折れ線: Sharpness(青), GRIC(赤), SSIM変化(緑)
+  - マーカー: キーフレーム位置に縦線
+  - 操作: クリック/ドラッグでシーク
 """
 
 from typing import List, Optional
 import numpy as np
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QMenu
-from PySide6.QtCore import Qt, QRect, QSize, Signal, QPoint
-from PySide6.QtGui import QPainter, QColor, QPen, QFont, QBrush, QAction
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox
+from PySide6.QtCore import Qt, Signal
+
+try:
+    import pyqtgraph as pg
+    HAS_PYQTGRAPH = True
+except ImportError:
+    HAS_PYQTGRAPH = False
 
 from utils.logger import get_logger
 logger = get_logger(__name__)
@@ -16,419 +28,349 @@ logger = get_logger(__name__)
 
 class TimelineWidget(QWidget):
     """
-    カスタムタイムラインウィジェット
+    pyqtgraph ベースのタイムラインウィジェット
 
-    ビデオの全長を表示し、キーフレーム位置をマーカーで表示、
-    各フレームの品質スコアを波形で可視化。
-    クリック操作でシーク、右クリックメニューでキーフレーム管理。
+    3種のスコアを折れ線グラフで重ね描き、
+    キーフレーム位置に縦線マーカーを表示。
+    クリック/ドラッグでビデオプレーヤーと同期シーク。
 
-    Signals:
-    --------
+    Signals
+    -------
     positionChanged : Signal(int)
-        位置変更時シグナル（フレームインデックス）
+        ユーザー操作によるフレーム位置変更
     keyframeClicked : Signal(int)
-        キーフレームがクリックされたときのシグナル
+        キーフレームマーカーのクリック
     keyframeRemoved : Signal(int)
-        キーフレームが削除されたときのシグナル
+        キーフレーム削除
     """
 
     positionChanged = Signal(int)
     keyframeClicked = Signal(int)
     keyframeRemoved = Signal(int)
 
-    def __init__(self):
-        """
-        タイムラインウィジェットの初期化
-        """
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
-        # タイムライン設定
-        self.total_frames = 0
-        self.fps = 30.0
-        self.current_position = 0
-        self.pixels_per_frame = 1.0
+        # データ
+        self.total_frames: int = 0
+        self.fps: float = 30.0
+        self.current_position: int = 0
+
+        # スコアデータ
+        self._sharpness_data: np.ndarray = np.array([])
+        self._gric_data: np.ndarray = np.array([])
+        self._ssim_data: np.ndarray = np.array([])
+        self._frame_indices: np.ndarray = np.array([])
 
         # キーフレーム
         self.keyframe_frames: List[int] = []
         self.keyframe_scores: List[float] = []
 
-        # 品質スコアデータ
-        self.quality_data: List[float] = []
+        self.setMinimumHeight(180)
+        self.setMaximumHeight(250)
 
-        # マウスホバー情報
-        self.hovered_frame = -1
+        self._plot_widget = None
+        self._setup_ui()
 
-        # UI設定
-        self.setMinimumHeight(100)
-        self.setMaximumHeight(120)
-        self.setStyleSheet("background-color: #1e1e1e; border: 1px solid #3d3d3d;")
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        # --- 凡例チェックボックス ---
+        legend_layout = QHBoxLayout()
+        legend_layout.setSpacing(10)
+
+        legend_label = QLabel("スコア表示:")
+        legend_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        legend_layout.addWidget(legend_label)
+
+        self._cb_sharpness = QCheckBox("Sharpness")
+        self._cb_sharpness.setChecked(True)
+        self._cb_sharpness.setStyleSheet("color: #4488ff;")
+        self._cb_sharpness.toggled.connect(self._update_visibility)
+        legend_layout.addWidget(self._cb_sharpness)
+
+        self._cb_gric = QCheckBox("GRIC")
+        self._cb_gric.setChecked(True)
+        self._cb_gric.setStyleSheet("color: #ff4444;")
+        self._cb_gric.toggled.connect(self._update_visibility)
+        legend_layout.addWidget(self._cb_gric)
+
+        self._cb_ssim = QCheckBox("SSIM変化")
+        self._cb_ssim.setChecked(True)
+        self._cb_ssim.setStyleSheet("color: #44cc44;")
+        self._cb_ssim.toggled.connect(self._update_visibility)
+        legend_layout.addWidget(self._cb_ssim)
+
+        legend_layout.addStretch()
+
+        self._info_label = QLabel("")
+        self._info_label.setStyleSheet("color: #888; font-size: 11px;")
+        legend_layout.addWidget(self._info_label)
+
+        layout.addLayout(legend_layout)
+
+        # --- pyqtgraph プロット ---
+        if HAS_PYQTGRAPH:
+            self._setup_pyqtgraph(layout)
+        else:
+            self._setup_fallback(layout)
+
+    # ======================================================================
+    # pyqtgraph セットアップ
+    # ======================================================================
+
+    def _setup_pyqtgraph(self, parent_layout: QVBoxLayout):
+        """pyqtgraph の PlotWidget を構築"""
+        pg.setConfigOptions(antialias=True, background='#1a1a2e', foreground='#cccccc')
+
+        self._plot_widget = pg.PlotWidget()
+        self._plot_widget.setMouseEnabled(x=False, y=False)
+        self._plot_widget.showGrid(x=True, y=True, alpha=0.15)
+        self._plot_widget.setYRange(0, 1.05, padding=0)
+        self._plot_widget.setLabel('left', '正規化スコア')
+        self._plot_widget.setLabel('bottom', 'フレーム')
+        self._plot_widget.getViewBox().setLimits(yMin=-0.05, yMax=1.1)
+
+        # 折れ線プロットアイテム
+        self._curve_sharpness = self._plot_widget.plot(
+            [], [], pen=pg.mkPen('#4488ff', width=1.5), name='Sharpness'
+        )
+        self._curve_gric = self._plot_widget.plot(
+            [], [], pen=pg.mkPen('#ff4444', width=1.5), name='GRIC'
+        )
+        self._curve_ssim = self._plot_widget.plot(
+            [], [], pen=pg.mkPen('#44cc44', width=1.5), name='SSIM変化'
+        )
+
+        # 現在位置の縦線
+        self._position_line = pg.InfiniteLine(
+            pos=0, angle=90,
+            pen=pg.mkPen('#ffdd00', width=2, style=Qt.SolidLine),
+            movable=False
+        )
+        self._plot_widget.addItem(self._position_line)
+
+        # キーフレームマーカー用リスト
+        self._kf_lines: List[pg.InfiniteLine] = []
+
+        # マウスイベント接続
+        self._plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
+        self._plot_widget.scene().sigMouseMoved.connect(self._on_plot_mouse_moved)
+
+        parent_layout.addWidget(self._plot_widget)
+
+    def _setup_fallback(self, parent_layout: QVBoxLayout):
+        """pyqtgraph 無し時のフォールバック"""
+        fallback = QLabel(
+            "pyqtgraph が未インストールです。\n"
+            "pip install pyqtgraph でインストールしてください。"
+        )
+        fallback.setAlignment(Qt.AlignCenter)
+        fallback.setStyleSheet("color: #ff8800; background: #1e1e1e; padding: 20px;")
+        parent_layout.addWidget(fallback)
+
+    # ======================================================================
+    # 公開API
+    # ======================================================================
 
     def set_duration(self, frame_count: int, fps: float):
-        """
-        タイムライン範囲を設定
-
-        Parameters:
-        -----------
-        frame_count : int
-            総フレーム数
-        fps : float
-            フレームレート
-        """
+        """タイムライン範囲を設定"""
         self.total_frames = frame_count
         self.fps = fps
-        self._calculate_scale()
+        if self._plot_widget and HAS_PYQTGRAPH:
+            self._plot_widget.setXRange(0, frame_count, padding=0.01)
 
     def set_position(self, frame_idx: int):
-        """
-        現在位置を設定
-
-        Parameters:
-        -----------
-        frame_idx : int
-            フレームインデックス
-        """
-        if 0 <= frame_idx < self.total_frames:
+        """現在位置を設定（ビデオプレーヤーから呼ばれる）"""
+        if 0 <= frame_idx <= self.total_frames:
             self.current_position = frame_idx
-            self.update()
+            if self._plot_widget and HAS_PYQTGRAPH:
+                self._position_line.setValue(frame_idx)
+            self._update_info_label(frame_idx)
 
     def set_keyframes(self, frames: List[int], scores: List[float]):
-        """
-        キーフレーム情報を設定
+        """キーフレーム情報を設定"""
+        self.keyframe_frames = list(frames)
+        self.keyframe_scores = list(scores)
+        self._draw_keyframe_markers()
 
-        Parameters:
-        -----------
-        frames : List[int]
-            キーフレームのフレームインデックスリスト
-        scores : List[float]
-            対応するスコアリスト（0-1）
+    def set_score_data(self, frame_indices: List[int],
+                       sharpness: List[float],
+                       gric: Optional[List[float]] = None,
+                       ssim_change: Optional[List[float]] = None):
         """
-        self.keyframe_frames = frames
-        self.keyframe_scores = scores
-        self.update()
+        スコアデータを設定してプロットを更新
+
+        Parameters
+        ----------
+        frame_indices : list[int]
+        sharpness : list[float]  正規化済み 0-1
+        gric : list[float] or None
+        ssim_change : list[float] or None  (1-SSIM)
+        """
+        n = len(frame_indices)
+        self._frame_indices = np.array(frame_indices, dtype=np.float64)
+        self._sharpness_data = np.clip(np.array(sharpness[:n], dtype=np.float64), 0, 1)
+
+        if gric is not None and len(gric) == n:
+            self._gric_data = np.clip(np.array(gric, dtype=np.float64), 0, 1)
+        else:
+            self._gric_data = np.array([])
+
+        if ssim_change is not None and len(ssim_change) == n:
+            self._ssim_data = np.clip(np.array(ssim_change, dtype=np.float64), 0, 1)
+        else:
+            self._ssim_data = np.array([])
+
+        self._redraw_curves()
+
+    def append_score_batch(self, frame_indices: List[int],
+                           sharpness: List[float]):
+        """Stage 1 のプログレッシブ結果を追記"""
+        fi = np.array(frame_indices, dtype=np.float64)
+        sh = np.clip(np.array(sharpness, dtype=np.float64), 0, 1)
+
+        if len(self._frame_indices) == 0:
+            self._frame_indices = fi
+            self._sharpness_data = sh
+        else:
+            self._frame_indices = np.concatenate([self._frame_indices, fi])
+            self._sharpness_data = np.concatenate([self._sharpness_data, sh])
+
+        self._redraw_curves()
 
     def set_quality_data(self, scores: List[float]):
-        """
-        品質スコアデータを設定
-
-        Parameters:
-        -----------
-        scores : List[float]
-            各フレームの品質スコアリスト（0-1）
-        """
-        self.quality_data = scores
-        self.update()
+        """旧APIとの互換: 品質スコアデータを設定"""
+        if not scores:
+            return
+        n = len(scores)
+        self._frame_indices = np.arange(0, n, dtype=np.float64)
+        self._sharpness_data = np.clip(np.array(scores, dtype=np.float64), 0, 1)
+        self._redraw_curves()
 
     def remove_keyframe(self, frame_idx: int):
-        """
-        指定フレームのキーフレームマークを削除
-
-        Parameters:
-        -----------
-        frame_idx : int
-            フレームインデックス
-        """
+        """キーフレームを削除"""
         if frame_idx in self.keyframe_frames:
             idx = self.keyframe_frames.index(frame_idx)
             self.keyframe_frames.pop(idx)
-            self.keyframe_scores.pop(idx)
-            self.update()
+            if idx < len(self.keyframe_scores):
+                self.keyframe_scores.pop(idx)
+            self._draw_keyframe_markers()
             self.keyframeRemoved.emit(frame_idx)
 
-    def _calculate_scale(self):
-        """
-        フレームからピクセルへの変換スケールを計算
-        """
-        widget_width = self.width() - 20  # 左右マージン
-        if self.total_frames > 0:
-            self.pixels_per_frame = widget_width / self.total_frames
-        else:
-            self.pixels_per_frame = 1.0
+    # ======================================================================
+    # 内部描画
+    # ======================================================================
 
-    def paintEvent(self, event):
-        """
-        タイムラインのペイント処理
-        """
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        # 背景
-        painter.fillRect(self.rect(), QColor("#1e1e1e"))
-
-        if self.total_frames == 0:
-            painter.drawText(self.rect(), Qt.AlignCenter, "ビデオを読み込んでください")
+    def _redraw_curves(self):
+        """折れ線グラフを更新"""
+        if not HAS_PYQTGRAPH or self._plot_widget is None:
+            return
+        if len(self._frame_indices) == 0:
             return
 
-        # タイムラインエリア
-        margin = 10
-        timeline_y = 40
-        timeline_height = 30
-        timeline_rect = QRect(margin, timeline_y, self.width() - 2 * margin, timeline_height)
+        # ダウンサンプリング（表示パフォーマンス）
+        max_points = 2000
+        step = max(1, len(self._frame_indices) // max_points)
 
-        # === 品質スコアの波形を描画 ===
-        if self.quality_data:
-            self._draw_quality_waveform(painter, timeline_rect)
+        fi = self._frame_indices[::step]
+        sh = self._sharpness_data[::step] if len(self._sharpness_data) > 0 else np.array([])
 
-        # === タイムラインバーを描画 ===
-        self._draw_timeline_bar(painter, timeline_rect)
+        if len(sh) == len(fi):
+            self._curve_sharpness.setData(fi, sh)
 
-        # === キーフレームマーカーを描画 ===
-        self._draw_keyframe_markers(painter, timeline_rect)
+        if len(self._gric_data) > 0:
+            gd = self._gric_data[::step]
+            if len(gd) == len(fi):
+                self._curve_gric.setData(fi, gd)
 
-        # === 現在位置インジケータを描画 ===
-        self._draw_position_indicator(painter, timeline_rect)
+        if len(self._ssim_data) > 0:
+            sd = self._ssim_data[::step]
+            if len(sd) == len(fi):
+                self._curve_ssim.setData(fi, sd)
 
-        # === 時刻ラベルを描画 ===
-        self._draw_time_labels(painter, timeline_rect)
-
-    def _draw_quality_waveform(self, painter: QPainter, timeline_rect: QRect):
-        """
-        品質スコアの波形を描画
-
-        Parameters:
-        -----------
-        painter : QPainter
-            ペインタオブジェクト
-        timeline_rect : QRect
-            タイムラインの描画領域
-        """
-        if not self.quality_data or len(self.quality_data) == 0:
+    def _draw_keyframe_markers(self):
+        """キーフレーム位置の縦線を描画"""
+        if not HAS_PYQTGRAPH or self._plot_widget is None:
             return
 
-        painter.setOpacity(0.5)
-        painter.setPen(QPen(QColor("#6090e0"), 1))
-        painter.setBrush(QBrush(QColor("#5080d0")))
+        # 既存マーカーを削除
+        for line in self._kf_lines:
+            self._plot_widget.removeItem(line)
+        self._kf_lines.clear()
 
-        # ポイントを計算
-        points = []
-        data_len = len(self.quality_data)
-        step = max(1, data_len // (timeline_rect.width() // 2))
+        # 新しいマーカーを追加
+        for i, frame_idx in enumerate(self.keyframe_frames):
+            score = self.keyframe_scores[i] if i < len(self.keyframe_scores) else 0.5
 
-        for i in range(0, data_len, step):
-            score = self.quality_data[i]
-            x = timeline_rect.left() + (i / self.total_frames) * timeline_rect.width()
-            y = timeline_rect.bottom() - score * timeline_rect.height()
-            points.append((int(x), int(y)))
-
-        # 波形をポリラインで描画
-        if len(points) > 1:
-            for i in range(len(points) - 1):
-                x1, y1 = points[i]
-                x2, y2 = points[i + 1]
-                painter.drawLine(x1, y1, x2, y2)
-
-        painter.setOpacity(1.0)
-
-    def _draw_timeline_bar(self, painter: QPainter, timeline_rect: QRect):
-        """
-        タイムラインバーを描画
-
-        Parameters:
-        -----------
-        painter : QPainter
-            ペインタオブジェクト
-        timeline_rect : QRect
-            タイムラインの描画領域
-        """
-        # 背景バー
-        painter.fillRect(timeline_rect, QColor("#3d3d3d"))
-
-        # 枠線
-        painter.setPen(QPen(QColor("#505050"), 1))
-        painter.drawRect(timeline_rect)
-
-        # 目盛り
-        painter.setPen(QPen(QColor("#505050"), 1))
-        font = QFont()
-        font.setPointSize(8)
-        painter.setFont(font)
-
-        # 10フレームごとに目盛りを描画
-        tick_interval = max(1, self.total_frames // 20)
-        for frame in range(0, self.total_frames, tick_interval):
-            x = timeline_rect.left() + (frame / self.total_frames) * timeline_rect.width()
-            painter.drawLine(int(x), timeline_rect.bottom(), int(x), timeline_rect.bottom() + 3)
-
-            # 時刻を表示（60フレームごと）
-            if frame % (tick_interval * 2) == 0:
-                time_sec = frame / self.fps if self.fps > 0 else 0
-                time_str = f"{int(time_sec // 60):02d}:{int(time_sec % 60):02d}"
-                painter.setPen(QPen(QColor("#808080"), 1))
-                painter.drawText(int(x) - 15, timeline_rect.bottom() + 15, 30, 15, Qt.AlignCenter, time_str)
-
-    def _draw_keyframe_markers(self, painter: QPainter, timeline_rect: QRect):
-        """
-        キーフレームマーカーを描画
-
-        Parameters:
-        -----------
-        painter : QPainter
-            ペインタオブジェクト
-        timeline_rect : QRect
-            タイムラインの描画領域
-        """
-        for frame_idx, score in zip(self.keyframe_frames, self.keyframe_scores):
-            # マーカー位置
-            x = timeline_rect.left() + (frame_idx / self.total_frames) * timeline_rect.width()
-
-            # スコアに基づいて色分け（高スコア=緑、中=黄、低=赤）
             if score >= 0.75:
-                color = QColor("#2aff2a")  # 緑
+                color = '#44ff44'
             elif score >= 0.5:
-                color = QColor("#ffff00")  # 黄
+                color = '#ffff00'
             else:
-                color = QColor("#ff4444")  # 赤
+                color = '#ff4444'
 
-            # マーカー三角形を描画
-            painter.setBrush(QBrush(color))
-            painter.setPen(QPen(color, 1))
+            line = pg.InfiniteLine(
+                pos=frame_idx, angle=90,
+                pen=pg.mkPen(color, width=1, style=Qt.DashLine),
+                movable=False
+            )
+            self._plot_widget.addItem(line)
+            self._kf_lines.append(line)
 
-            marker_width = 10
-            marker_height = 15
-            points = [
-                QPoint(int(x), timeline_rect.top() - marker_height),
-                QPoint(int(x - marker_width // 2), timeline_rect.top()),
-                QPoint(int(x + marker_width // 2), timeline_rect.top()),
-            ]
-            painter.drawPolygon(points)
+    def _update_visibility(self):
+        """チェックボックスに基づくカーブの表示/非表示"""
+        if not HAS_PYQTGRAPH or self._plot_widget is None:
+            return
+        self._curve_sharpness.setVisible(self._cb_sharpness.isChecked())
+        self._curve_gric.setVisible(self._cb_gric.isChecked())
+        self._curve_ssim.setVisible(self._cb_ssim.isChecked())
 
-    def _draw_position_indicator(self, painter: QPainter, timeline_rect: QRect):
-        """
-        現在位置インジケータを描画
+    def _update_info_label(self, frame_idx: int):
+        """情報ラベルを更新"""
+        if self.fps > 0:
+            sec = frame_idx / self.fps
+            minutes = int(sec // 60)
+            secs = sec % 60
+            self._info_label.setText(
+                f"Frame {frame_idx}  |  {minutes:02d}:{secs:05.2f}"
+            )
 
-        Parameters:
-        -----------
-        painter : QPainter
-            ペインタオブジェクト
-        timeline_rect : QRect
-            タイムラインの描画領域
-        """
-        x = timeline_rect.left() + (self.current_position / self.total_frames) * timeline_rect.width()
+    # ======================================================================
+    # マウスイベント
+    # ======================================================================
 
-        # 垂直線
-        painter.setPen(QPen(QColor("#ffff00"), 2))
-        painter.drawLine(int(x), timeline_rect.top(), int(x), timeline_rect.bottom())
+    def _on_plot_clicked(self, event):
+        """プロットエリアのクリック→シーク"""
+        if not HAS_PYQTGRAPH or self._plot_widget is None:
+            return
+        try:
+            pos = event.scenePos()
+            mouse_point = self._plot_widget.getViewBox().mapSceneToView(pos)
+            frame_idx = int(round(mouse_point.x()))
+            frame_idx = max(0, min(frame_idx, self.total_frames - 1))
 
-        # 上部マーカー
-        painter.setBrush(QBrush(QColor("#ffff00")))
-        painter.drawEllipse(int(x) - 4, timeline_rect.top() - 12, 8, 8)
+            # キーフレーム近傍チェック（±3フレーム）
+            for kf_idx in self.keyframe_frames:
+                if abs(frame_idx - kf_idx) <= 3:
+                    self.keyframeClicked.emit(kf_idx)
+                    return
 
-    def _draw_time_labels(self, painter: QPainter, timeline_rect: QRect):
-        """
-        時刻ラベルを描画
-
-        Parameters:
-        -----------
-        painter : QPainter
-            ペインタオブジェクト
-        timeline_rect : QRect
-            タイムラインの描画領域
-        """
-        painter.setPen(QPen(QColor("#a0a0a0"), 1))
-        font = QFont()
-        font.setPointSize(9)
-        painter.setFont(font)
-
-        # 開始時刻
-        painter.drawText(5, 20, 50, 15, Qt.AlignLeft, "00:00")
-
-        # 終了時刻
-        end_sec = self.total_frames / self.fps if self.fps > 0 else 0
-        end_str = f"{int(end_sec // 60):02d}:{int(end_sec % 60):02d}"
-        painter.drawText(self.width() - 55, 20, 50, 15, Qt.AlignRight, end_str)
-
-        # 現在時刻
-        current_sec = self.current_position / self.fps if self.fps > 0 else 0
-        current_str = f"{int(current_sec // 60):02d}:{int(current_sec % 60):02d}"
-        painter.drawText(self.width() // 2 - 25, 20, 50, 15, Qt.AlignCenter, current_str)
-
-    def mousePressEvent(self, event):
-        """
-        マウスプレスイベント処理
-        """
-        if event.button() == Qt.LeftButton:
-            # 左クリック：位置変更
-            frame_idx = self._pixel_to_frame(int(event.position().x()))
             self.set_position(frame_idx)
             self.positionChanged.emit(frame_idx)
+        except Exception:
+            pass
 
-        elif event.button() == Qt.RightButton:
-            # 右クリック：コンテキストメニュー
-            frame_idx = self._pixel_to_frame(int(event.position().x()))
-            self._show_context_menu(frame_idx, event.globalPosition().toPoint())
-
-    def mouseMoveEvent(self, event):
-        """
-        マウスムーブイベント処理
-        """
-        frame_idx = self._pixel_to_frame(int(event.position().x()))
-        self.hovered_frame = frame_idx
-        self.update()
-
-    def _pixel_to_frame(self, pixel_x: int) -> int:
-        """
-        ピクセル座標をフレームインデックスに変換
-
-        Parameters:
-        -----------
-        pixel_x : int
-            ピクセルX座標
-
-        Returns:
-        --------
-        int
-            フレームインデックス
-        """
-        margin = 10
-        timeline_width = self.width() - 2 * margin
-        relative_x = max(0, min(pixel_x - margin, timeline_width))
-        frame_idx = int((relative_x / timeline_width) * self.total_frames)
-        return min(frame_idx, self.total_frames - 1)
-
-    def _show_context_menu(self, frame_idx: int, global_pos: QPoint):
-        """
-        コンテキストメニューを表示
-
-        Parameters:
-        -----------
-        frame_idx : int
-            フレームインデックス
-        global_pos : QPoint
-            グローバル座標
-        """
-        menu = QMenu(self)
-        menu.setStyleSheet(self.styleSheet())
-
-        # キーフレームが存在するかチェック
-        is_keyframe = frame_idx in self.keyframe_frames
-
-        if is_keyframe:
-            remove_action = QAction("このフレームからキーフレームを削除", self)
-            remove_action.triggered.connect(lambda: self.remove_keyframe(frame_idx))
-            menu.addAction(remove_action)
-
-        else:
-            add_action = QAction("このフレームをキーフレームに追加", self)
-            add_action.triggered.connect(lambda: self._add_keyframe(frame_idx))
-            menu.addAction(add_action)
-
-        menu.exec(global_pos)  # In PySide6, exec() is used instead of exec_()
-
-    def _add_keyframe(self, frame_idx: int):
-        """
-        キーフレームを追加
-
-        Parameters:
-        -----------
-        frame_idx : int
-            フレームインデックス
-        """
-        if frame_idx not in self.keyframe_frames:
-            # スコアがない場合は0.5を使用
-            score = self.quality_data[frame_idx] if 0 <= frame_idx < len(self.quality_data) else 0.5
-            self.keyframe_frames.append(frame_idx)
-            self.keyframe_scores.append(score)
-            self.keyframe_frames.sort()
-            idx = self.keyframe_frames.index(frame_idx)
-            self.keyframe_scores = [self.keyframe_scores[i] for i in sorted(range(len(self.keyframe_frames)),
-                                                                               key=lambda k: self.keyframe_frames[k])]
-            self.update()
+    def _on_plot_mouse_moved(self, pos):
+        """マウス移動時のホバー情報"""
+        if not HAS_PYQTGRAPH or self._plot_widget is None:
+            return
+        try:
+            mouse_point = self._plot_widget.getViewBox().mapSceneToView(pos)
+            frame_idx = int(round(mouse_point.x()))
+            if 0 <= frame_idx < self.total_frames:
+                self._update_info_label(frame_idx)
+        except Exception:
+            pass

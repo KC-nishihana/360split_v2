@@ -5,6 +5,7 @@ numpy>=1.24.0
 scipy>=1.11.0
 scikit-image>=0.21.0
 Pillow>=10.0.0
+pyqtgraph>=0.13.0
 
 # === GPU高速化（オプショナル） ===
 # Apple Silicon (MPS): pip install torch torchvision

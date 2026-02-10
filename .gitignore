@@ -1,17 +1,38 @@
-# Python
+# Pythonで生成されるバイトコード / キャッシュ
 __pycache__/
 *.py[cod]
-*.egg-info/
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# 仮想環境
+venv/
+.venv/
+ENV/
+env/
+
+# 一時ファイルや環境ファイル
+*.log
+*.tmp
+*.swp
+.env
+
+# ビルド／配布用ディレクトリ
 dist/
 build/
+*.egg-info/
 
-# Logs
-logs/
-
-# IDE
-.vscode/
+# エディタやIDEの設定
 .idea/
+.vscode/
 
-# OS
+# OS特有の不要ファイル
 .DS_Store
 Thumbs.db
+
+# アプリケーションが出力する成果物
+keyframes/
+cubemap/
+output/
+
+# その他、プロジェクト固有の一時ディレクトリがあれば追加

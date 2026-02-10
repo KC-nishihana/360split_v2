@@ -5,7 +5,6 @@ PySide6を使用したメインアプリケーションウィンドウ
 
 import sys
 import json
-import logging
 from pathlib import Path
 from typing import Optional
 
@@ -23,7 +22,8 @@ from gui.keyframe_panel import KeyframePanel
 from gui.settings_dialog import SettingsDialog
 from config import KeyframeConfig
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class AnalysisWorker(QThread):

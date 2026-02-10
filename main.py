@@ -22,9 +22,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from utils.logger import setup_logger
+from utils.logger import setup_logger, get_logger, set_log_level
 
-logger = setup_logger(__name__)
+# アプリケーション起動時にルートロガーを初期化
+setup_logger()
+logger = get_logger(__name__)
 
 
 def parse_arguments():
@@ -223,17 +225,21 @@ def run_cli(args):
     # キーフレーム選択
     selector = KeyframeSelector(config)
 
+    _last_logged_pct = -1
+
     def progress_callback(current, total, message=""):
+        nonlocal _last_logged_pct
         pct = int(current / total * 100) if total > 0 else 0
-        bar = "█" * (pct // 2) + "░" * (50 - pct // 2)
-        print(f"\r  [{bar}] {pct}% {message}", end="", flush=True)
+        # 10% 刻みでログ出力（大量出力を防止）
+        if pct >= _last_logged_pct + 10 or pct == 100:
+            _last_logged_pct = pct
+            logger.info(f"進捗: {pct}% {message}")
 
     logger.info("キーフレーム解析を開始...")
     keyframes = selector.select_keyframes(
         loader,
         progress_callback=progress_callback
     )
-    print()  # 改行
 
     if not keyframes:
         logger.warning("キーフレームが検出されませんでした。閾値の調整を検討してください。")
@@ -373,7 +379,7 @@ def main():
     # ログレベル設定
     if args.verbose:
         import logging
-        logging.getLogger().setLevel(logging.DEBUG)
+        set_log_level(logging.DEBUG)
 
     if args.cli:
         run_cli(args)

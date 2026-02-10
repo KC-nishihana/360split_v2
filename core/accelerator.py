@@ -10,7 +10,6 @@ Apple Silicon (Metal/MPS) と Windows (CUDA) の両環境で
 """
 
 import platform
-import logging
 import os
 from enum import Enum
 from typing import Optional
@@ -19,7 +18,8 @@ from functools import lru_cache
 import cv2
 import numpy as np
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class AccelBackend(Enum):

@@ -9,7 +9,6 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Callable
-import logging
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
@@ -25,7 +24,8 @@ from .exceptions import (
 )
 from config import GRICConfig, Equirect360Config, NormalizationConfig
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 @dataclass

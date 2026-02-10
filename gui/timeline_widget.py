@@ -3,7 +3,6 @@
 キーフレームマーカー、品質スコア可視化、タイムライン操作
 """
 
-import logging
 from typing import List, Optional
 import numpy as np
 
@@ -11,7 +10,8 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QMenu
 from PySide6.QtCore import Qt, QRect, QSize, Signal, QPoint
 from PySide6.QtGui import QPainter, QColor, QPen, QFont, QBrush, QAction
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class TimelineWidget(QWidget):

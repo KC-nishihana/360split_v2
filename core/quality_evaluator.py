@@ -7,11 +7,11 @@ GPU加速、数値安定性、メモリ効率化を実装。
 import cv2
 import numpy as np
 from typing import Dict, Optional
-import logging
 
 from core.accelerator import get_accelerator
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class QualityEvaluator:

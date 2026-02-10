@@ -7,7 +7,6 @@ cv2.remap() + UV キャッシング + GPU加速対応
 import numpy as np
 import cv2
 from typing import Dict, Tuple, List, Optional
-import logging
 
 try:
     from ..core.accelerator import get_accelerator
@@ -15,7 +14,8 @@ try:
 except (ImportError, ValueError):
     HAS_ACCELERATOR = False
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class EquirectangularProcessor:

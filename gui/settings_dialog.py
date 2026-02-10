@@ -3,7 +3,6 @@
 キーフレーム選択、360度処理、マスク、出力設定
 """
 
-import logging
 import json
 from pathlib import Path
 from typing import Optional
@@ -15,7 +14,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QSettings
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class SettingsDialog(QDialog):

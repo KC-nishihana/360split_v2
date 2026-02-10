@@ -13,7 +13,6 @@ import cv2
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from collections import OrderedDict
-import logging
 
 from core.accelerator import get_accelerator
 from core.exceptions import (
@@ -23,7 +22,8 @@ from core.exceptions import (
 )
 from config import GRICConfig, Equirect360Config
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class FeatureCache:

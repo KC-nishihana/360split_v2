@@ -12,11 +12,11 @@ SSIM計算、光学フロー、カメラ動き推定
 import cv2
 import numpy as np
 from typing import Dict, List, Optional
-import logging
 
 from core.accelerator import get_accelerator
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class AdaptiveSelector:

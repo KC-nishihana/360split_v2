@@ -10,14 +10,14 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 from collections import OrderedDict
-import logging
 import threading
 import queue
 import platform
 
 from core.accelerator import get_accelerator
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 @dataclass

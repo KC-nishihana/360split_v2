@@ -3,7 +3,6 @@
 再生コントロール、フレーム表示、グリッドオーバーレイ機能
 """
 
-import logging
 from typing import Optional
 import cv2
 import numpy as np
@@ -15,7 +14,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect
 from PySide6.QtGui import QPixmap, QImage, QIcon, QFont
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class VideoPlayerWidget(QWidget):

@@ -3,7 +3,6 @@
 キーフレームサムネイル表示、選択、管理、詳細情報ダイアログ
 """
 
-import logging
 from typing import List, Optional, Tuple
 import cv2
 import numpy as np
@@ -16,7 +15,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize, QTimer, Signal, QPoint
 from PySide6.QtGui import QPixmap, QImage, QFont, QColor, QIcon, QAction
 
-logger = logging.getLogger('360split')
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 
 class KeyframeDetailDialog(QDialog):

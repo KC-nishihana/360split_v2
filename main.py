@@ -237,7 +237,7 @@ def run_cli(args):
 
     if not keyframes:
         logger.warning("キーフレームが検出されませんでした。閾値の調整を検討してください。")
-        loader.release()
+        loader.close()
         sys.exit(0)
 
     logger.info(f"検出キーフレーム数: {len(keyframes)}")
@@ -325,7 +325,7 @@ def run_cli(args):
     logger.info(f"出力先: {output_dir}")
     logger.info(f"メタデータ: {metadata_path}")
 
-    loader.release()
+    loader.close()
 
 
 def run_gui():

@@ -101,7 +101,7 @@ class AnalysisWorker(QThread):
             )
 
             if not self._is_running:
-                loader.release()
+                loader.close()
                 return
 
             # 結果を分離
@@ -117,7 +117,7 @@ class AnalysisWorker(QThread):
                     if 0 <= kf.frame_index < len(quality_scores):
                         quality_scores[kf.frame_index] = kf.combined_score
 
-            loader.release()
+            loader.close()
 
             # 結果を送信
             self.quality_data.emit(quality_scores)

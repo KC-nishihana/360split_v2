@@ -120,6 +120,33 @@ class KeyframeSelector:
             f"thread_count={self.accelerator.num_threads}"
         )
 
+    def _open_independent_capture(self, video_path) -> cv2.VideoCapture:
+        """
+        分析用に独立したcv2.VideoCaptureを開く
+
+        VideoLoaderのキャプチャとは別のインスタンスを使用して、
+        FFmpegのスレッド安全性問題を回避する。
+
+        Parameters:
+        -----------
+        video_path : Path
+            ビデオファイルパス
+
+        Returns:
+        --------
+        cv2.VideoCapture
+            独立したキャプチャオブジェクト
+
+        Raises:
+        -------
+        RuntimeError
+            ビデオファイルが開けない場合
+        """
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"分析用ビデオキャプチャを開けません: {video_path}")
+        return cap
+
     def select_keyframes(self, video_loader: VideoLoader,
                         progress_callback: Optional[Callable[[int, int], None]] = None
                         ) -> List[KeyframeInfo]:
@@ -137,6 +164,9 @@ class KeyframeSelector:
           - Stage 1通過フレームのみ処理
           - NMS適用
 
+        注意：FFmpegのスレッド安全性問題を回避するため、
+        分析処理ではVideoLoaderとは独立したcv2.VideoCaptureを使用する。
+
         Parameters:
         -----------
         video_loader : VideoLoader
@@ -153,13 +183,18 @@ class KeyframeSelector:
         if metadata is None:
             raise RuntimeError("ビデオが読み込まれていません")
 
+        # ビデオパスを取得（独立キャプチャ用）
+        video_path = video_loader._video_path
+        if video_path is None:
+            raise RuntimeError("ビデオパスが取得できません")
+
         total_frames = metadata.frame_count
         logger.info(f"キーフレーム選択開始: {total_frames}フレーム")
 
         # ===== Stage 1: 高速フィルタリング =====
         logger.info("Stage 1: 高速品質フィルタリング開始")
         stage1_candidates = self._stage1_fast_filter(
-            video_loader, metadata, progress_callback
+            video_path, metadata, progress_callback
         )
         logger.info(
             f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
@@ -173,7 +208,7 @@ class KeyframeSelector:
         # ===== Stage 2: 精密評価 =====
         logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
         stage2_candidates = self._stage2_precise_evaluation(
-            video_loader, metadata, stage1_candidates, progress_callback
+            video_path, metadata, stage1_candidates, progress_callback
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
 
@@ -187,18 +222,22 @@ class KeyframeSelector:
 
         return keyframes
 
-    def _stage1_fast_filter(self, video_loader: VideoLoader, metadata: VideoMetadata,
+    def _stage1_fast_filter(self, video_path, metadata: VideoMetadata,
                            progress_callback: Optional[Callable[[int, int], None]]) -> List[Dict]:
         """
         Stage 1: 高速品質フィルタリング（全フレーム）
 
         品質スコアのみで閾値以下のフレームを除外。
-        マルチスレッド処理で高速化。
+        独立したcv2.VideoCaptureでシングルスレッド読み込み、
+        品質計算のみマルチスレッドで並列化。
+
+        FFmpegのスレッド安全性問題を回避するため、
+        VideoLoaderとは独立したキャプチャを使用する。
 
         Parameters:
         -----------
-        video_loader : VideoLoader
-            ビデオローダー
+        video_path : Path
+            ビデオファイルパス
         metadata : VideoMetadata
             ビデオメタデータ
         progress_callback : callable, optional
@@ -218,54 +257,69 @@ class KeyframeSelector:
 
         candidates = []
 
-        # バッチ処理
-        num_batches = (len(frame_indices) + batch_size - 1) // batch_size
+        # 独立したVideoCaptureを開く（FFmpegスレッド安全性対策）
+        cap = self._open_independent_capture(video_path)
+        try:
+            # バッチ処理
+            num_batches = (len(frame_indices) + batch_size - 1) // batch_size
+            last_read_idx = -1
 
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min((batch_idx + 1) * batch_size, len(frame_indices))
-            batch_indices = frame_indices[start_idx:end_idx]
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(frame_indices))
+                batch_indices = frame_indices[start_idx:end_idx]
 
-            # バッチ内のフレームを読み込む
-            frames = []
-            valid_indices = []
-            for frame_idx in batch_indices:
-                frame = video_loader.get_frame(frame_idx)
-                if frame is not None:
-                    frames.append(frame)
-                    valid_indices.append(frame_idx)
+                # バッチ内のフレームをシングルスレッドで順次読み込む
+                frames = []
+                valid_indices = []
+                for frame_idx in batch_indices:
+                    # シーケンシャル読み込みの場合はシーク不要
+                    if frame_idx != last_read_idx + 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
 
-            if not frames:
-                continue
+                    ret, frame = cap.read()
+                    last_read_idx = frame_idx
 
-            # マルチスレッドで品質スコアを計算
-            with ThreadPoolExecutor(max_workers=self.accelerator.thread_count) as executor:
-                quality_list = list(executor.map(
-                    self._compute_quality_score,
-                    frames
-                ))
+                    if ret and frame is not None:
+                        frames.append(frame)
+                        valid_indices.append(frame_idx)
 
-            # フィルタリング
-            for frame_idx, quality_scores in zip(valid_indices, quality_list):
-                # 品質基準をチェック
-                if quality_scores['sharpness'] >= self.config['LAPLACIAN_THRESHOLD'] and \
-                   quality_scores['motion_blur'] <= self.config['MOTION_BLUR_THRESHOLD']:
-                    candidates.append({
-                        'frame_idx': frame_idx,
-                        'quality_scores': quality_scores
-                    })
-                    logger.debug(
-                        f"Stage1通過 Frame {frame_idx}: "
-                        f"sharpness={quality_scores['sharpness']:.1f}"
-                    )
+                if not frames:
+                    continue
 
-            # 進捗コールバック
-            if progress_callback:
-                progress_callback(end_idx, len(frame_indices))
+                # マルチスレッドで品質スコアを計算（CPU処理のみ並列化）
+                num_workers = min(self.accelerator.num_threads, len(frames))
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    quality_list = list(executor.map(
+                        self._compute_quality_score,
+                        frames
+                    ))
+
+                # フィルタリング
+                for frame_idx, quality_scores in zip(valid_indices, quality_list):
+                    # 品質基準をチェック
+                    if quality_scores['sharpness'] >= self.config['LAPLACIAN_THRESHOLD'] and \
+                       quality_scores['motion_blur'] <= self.config['MOTION_BLUR_THRESHOLD']:
+                        candidates.append({
+                            'frame_idx': frame_idx,
+                            'quality_scores': quality_scores
+                        })
+                        logger.debug(
+                            f"Stage1通過 Frame {frame_idx}: "
+                            f"sharpness={quality_scores['sharpness']:.1f}"
+                        )
+
+                # 進捗コールバック
+                if progress_callback:
+                    progress_callback(end_idx, len(frame_indices))
+
+        finally:
+            cap.release()
+            logger.debug("Stage 1: 独立キャプチャを解放")
 
         return candidates
 
-    def _stage2_precise_evaluation(self, video_loader: VideoLoader, metadata: VideoMetadata,
+    def _stage2_precise_evaluation(self, video_path, metadata: VideoMetadata,
                                    stage1_candidates: List[Dict],
                                    progress_callback: Optional[Callable[[int, int], None]]
                                    ) -> List[KeyframeInfo]:
@@ -273,11 +327,12 @@ class KeyframeSelector:
         Stage 2: 精密評価（候補フレームのみ）
 
         幾何学的・適応的評価を適用。最小間隔制約も適用。
+        独立したcv2.VideoCaptureを使用してFFmpegスレッド安全性を確保。
 
         Parameters:
         -----------
-        video_loader : VideoLoader
-            ビデオローダー
+        video_path : Path
+            ビデオファイルパス
         metadata : VideoMetadata
             ビデオメタデータ
         stage1_candidates : list
@@ -297,78 +352,86 @@ class KeyframeSelector:
         # フレームウィンドウ（カメラ加速度計算用）
         frame_window = deque(maxlen=5)
 
-        for idx, candidate_info in enumerate(stage1_candidates):
-            frame_idx = candidate_info['frame_idx']
-            quality_scores = candidate_info['quality_scores']
+        # 独立したVideoCaptureを開く（FFmpegスレッド安全性対策）
+        cap = self._open_independent_capture(video_path)
+        try:
+            for idx, candidate_info in enumerate(stage1_candidates):
+                frame_idx = candidate_info['frame_idx']
+                quality_scores = candidate_info['quality_scores']
 
-            if progress_callback:
-                progress_callback(idx, len(stage1_candidates))
+                if progress_callback:
+                    progress_callback(idx, len(stage1_candidates))
 
-            # 最小間隔制約をチェック
-            if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
-                continue
-
-            # フレームを読み込む
-            current_frame = video_loader.get_frame(frame_idx)
-            if current_frame is None:
-                continue
-
-            # フレームウィンドウを更新
-            frame_window.append(current_frame)
-
-            # 幾何学的・適応的スコアを計算
-            geometric_scores = {}
-            adaptive_scores = {}
-
-            if last_keyframe is not None:
-                # 前キーフレームとの比較
-                geometric_scores = self.geometric_evaluator.evaluate(
-                    last_keyframe, current_frame,
-                    min_matches=self.config['MIN_FEATURE_MATCHES'],
-                    gric_threshold=self.config['GRIC_RATIO_THRESHOLD']
-                )
-
-                # 適応的スコア計算
-                adaptive_scores = self.adaptive_selector.evaluate(
-                    last_keyframe, current_frame,
-                    frames_window=list(frame_window)
-                )
-
-                # SSIM変化が小さすぎる場合はスキップ
-                ssim = adaptive_scores.get('ssim', 1.0)
-                if ssim > self.config['SSIM_CHANGE_THRESHOLD']:
-                    logger.debug(f"フレーム {frame_idx}: 変化不足 (SSIM: {ssim:.3f})")
+                # 最小間隔制約をチェック
+                if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
                     continue
 
-            else:
-                # 最初のキーフレーム
-                logger.debug(f"最初のキーフレーム: {frame_idx}")
+                # 独立キャプチャからフレームを読み込む
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, current_frame = cap.read()
+                if not ret or current_frame is None:
+                    continue
 
-            # 統合スコアを計算
-            combined_score = self._compute_combined_score(
-                quality_scores, geometric_scores, adaptive_scores
-            )
+                # フレームウィンドウを更新
+                frame_window.append(current_frame)
 
-            # キーフレーム候補を作成（サムネイルはまだ生成しない）
-            candidate = KeyframeInfo(
-                frame_index=frame_idx,
-                timestamp=frame_idx / metadata.fps,
-                quality_scores=quality_scores,
-                geometric_scores=geometric_scores,
-                adaptive_scores=adaptive_scores,
-                combined_score=combined_score,
-                thumbnail=None  # 遅延生成
-            )
+                # 幾何学的・適応的スコアを計算
+                geometric_scores = {}
+                adaptive_scores = {}
 
-            candidates.append(candidate)
-            last_keyframe_idx = frame_idx
-            last_keyframe = current_frame
+                if last_keyframe is not None:
+                    # 前キーフレームとの比較
+                    geometric_scores = self.geometric_evaluator.evaluate(
+                        last_keyframe, current_frame,
+                        min_matches=self.config['MIN_FEATURE_MATCHES'],
+                        gric_threshold=self.config['GRIC_RATIO_THRESHOLD']
+                    )
 
-            logger.debug(
-                f"候補フレーム {frame_idx}: "
-                f"品質={combined_score:.3f}, "
-                f"SSIM={adaptive_scores.get('ssim', 0):.3f}"
-            )
+                    # 適応的スコア計算
+                    adaptive_scores = self.adaptive_selector.evaluate(
+                        last_keyframe, current_frame,
+                        frames_window=list(frame_window)
+                    )
+
+                    # SSIM変化が小さすぎる場合はスキップ
+                    ssim = adaptive_scores.get('ssim', 1.0)
+                    if ssim > self.config['SSIM_CHANGE_THRESHOLD']:
+                        logger.debug(f"フレーム {frame_idx}: 変化不足 (SSIM: {ssim:.3f})")
+                        continue
+
+                else:
+                    # 最初のキーフレーム
+                    logger.debug(f"最初のキーフレーム: {frame_idx}")
+
+                # 統合スコアを計算
+                combined_score = self._compute_combined_score(
+                    quality_scores, geometric_scores, adaptive_scores
+                )
+
+                # キーフレーム候補を作成（サムネイルはまだ生成しない）
+                candidate = KeyframeInfo(
+                    frame_index=frame_idx,
+                    timestamp=frame_idx / metadata.fps,
+                    quality_scores=quality_scores,
+                    geometric_scores=geometric_scores,
+                    adaptive_scores=adaptive_scores,
+                    combined_score=combined_score,
+                    thumbnail=None  # 遅延生成
+                )
+
+                candidates.append(candidate)
+                last_keyframe_idx = frame_idx
+                last_keyframe = current_frame
+
+                logger.debug(
+                    f"候補フレーム {frame_idx}: "
+                    f"品質={combined_score:.3f}, "
+                    f"SSIM={adaptive_scores.get('ssim', 0):.3f}"
+                )
+
+        finally:
+            cap.release()
+            logger.debug("Stage 2: 独立キャプチャを解放")
 
         return candidates
 

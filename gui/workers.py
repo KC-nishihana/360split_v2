@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from PySide6.QtCore import QThread, Signal, QObject
 
 from utils.logger import get_logger
+from utils.image_io import write_image
 logger = get_logger(__name__)
 
 
@@ -584,13 +585,13 @@ class ExportWorker(QThread):
                     filepath = output_path / filename
 
                     if ext == 'jpg':
-                        saved = cv2.imwrite(
-                            str(filepath),
+                        saved = write_image(
+                            filepath,
                             processed_frame,
                             [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
                         )
                     else:
-                        saved = cv2.imwrite(str(filepath), processed_frame)
+                        saved = write_image(filepath, processed_frame)
 
                     if not saved:
                         logger.warning(f"保存失敗（フレーム {frame_idx}）: {filepath}")
@@ -609,10 +610,15 @@ class ExportWorker(QThread):
                             for face_name, face_img in faces.items():
                                 face_path = cubemap_dir / f"{face_name}.{ext}"
                                 if ext == 'jpg':
-                                    cv2.imwrite(str(face_path), face_img,
-                                                [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                                    if not write_image(
+                                        face_path,
+                                        face_img,
+                                        [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+                                    ):
+                                        logger.warning(f"Cubemap保存失敗: {face_path}")
                                 else:
-                                    cv2.imwrite(str(face_path), face_img)
+                                    if not write_image(face_path, face_img):
+                                        logger.warning(f"Cubemap保存失敗: {face_path}")
                             logger.debug(f"Cubemap 出力: {cubemap_dir}")
                         except Exception as e:
                             logger.warning(f"Cubemap 出力エラー（フレーム {frame_idx}）: {e}")
@@ -633,10 +639,15 @@ class ExportWorker(QThread):
                                     name = f"y{yaw:+.0f}_p{pitch:+.0f}.{ext}"
                                     persp_path = persp_dir / name
                                     if ext == 'jpg':
-                                        cv2.imwrite(str(persp_path), persp_img,
-                                                    [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                                        if not write_image(
+                                            persp_path,
+                                            persp_img,
+                                            [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+                                        ):
+                                            logger.warning(f"Perspective保存失敗: {persp_path}")
                                     else:
-                                        cv2.imwrite(str(persp_path), persp_img)
+                                        if not write_image(persp_path, persp_img):
+                                            logger.warning(f"Perspective保存失敗: {persp_path}")
                             logger.debug(f"Perspective 出力: {persp_dir}")
                         except Exception as e:
                             logger.warning(f"Perspective 出力エラー（フレーム {frame_idx}）: {e}")

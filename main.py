@@ -17,12 +17,14 @@ import os
 import argparse
 import json
 from pathlib import Path
+import cv2
 
 # プロジェクトルートをパスに追加
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.logger import setup_logger, get_logger, set_log_level
+from utils.image_io import write_image
 
 # アプリケーション起動時にルートロガーを初期化
 setup_logger()
@@ -327,14 +329,17 @@ def run_cli(args):
         filename = f"keyframe_{kf.frame_index:06d}.{fmt}"
         filepath = output_dir / filename
 
-        import cv2
         if fmt == "jpg":
-            cv2.imwrite(str(filepath), frame,
-                       [cv2.IMWRITE_JPEG_QUALITY, config["output_jpeg_quality"]])
-        elif fmt == "tiff":
-            cv2.imwrite(str(filepath), frame)
+            saved = write_image(
+                filepath,
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, config["output_jpeg_quality"]]
+            )
         else:
-            cv2.imwrite(str(filepath), frame)
+            saved = write_image(filepath, frame)
+        if not saved:
+            logger.warning(f"保存失敗（フレーム {kf.frame_index}）: {filepath}")
+            continue
 
         # Cubemap出力
         if args.cubemap and equirect_processor:
@@ -343,7 +348,8 @@ def run_cli(args):
             faces = equirect_processor.to_cubemap(frame, config["cubemap_face_size"])
             for face_name, face_img in faces.items():
                 face_path = cubemap_dir / f"{face_name}.{fmt}"
-                cv2.imwrite(str(face_path), face_img)
+                if not write_image(face_path, face_img):
+                    logger.warning(f"Cubemap保存失敗: {face_path}")
 
         # スコア情報の表示
         logger.info(f"  [{i+1}/{len(keyframes)}] Frame {kf.frame_index:6d} | "

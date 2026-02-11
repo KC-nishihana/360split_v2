@@ -25,6 +25,7 @@ from .exceptions import (
 from config import GRICConfig, Equirect360Config, NormalizationConfig
 
 from utils.logger import get_logger
+from utils.image_io import write_image
 logger = get_logger(__name__)
 
 
@@ -891,10 +892,17 @@ class KeyframeSelector:
 
             # 保存
             if format.lower() in ['jpg', 'jpeg']:
-                cv2.imwrite(str(filepath), frame,
-                           [cv2.IMWRITE_JPEG_QUALITY, 95])
+                saved = write_image(
+                    filepath,
+                    frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95]
+                )
             else:  # png
-                cv2.imwrite(str(filepath), frame)
+                saved = write_image(filepath, frame)
+
+            if not saved:
+                logger.warning(f"キーフレーム保存失敗: {filepath}")
+                continue
 
             exported[kf.frame_index] = filepath
             logger.info(f"キーフレーム保存: {filepath}")

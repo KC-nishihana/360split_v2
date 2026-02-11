@@ -9,6 +9,7 @@ SettingsPanel は QWidget として右ドックに配置される（QDialog で�
 """
 
 import json
+import copy
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -291,7 +292,9 @@ class SettingsPanel(QWidget):
 
     def get_config(self) -> KeyframeConfig:
         """現在のパネル値から KeyframeConfig を構築して返す"""
-        c = KeyframeConfig()
+        # ダイアログ等で読み込んだ「非表示項目」も保持するため、
+        # 既存configをベースに可視項目のみ上書きする。
+        c = copy.deepcopy(self._config)
         c.weights.alpha = self._w_sharpness.value()
         c.weights.beta = self._w_geometric.value()
         c.weights.gamma = self._w_content.value()
@@ -455,6 +458,12 @@ class SettingsPanel(QWidget):
             # GRIC
             self._gric_ratio.setValue(params.get('gric_degeneracy_threshold', 0.85))
             self._ransac_th.setValue(params.get('ransac_threshold', 3.0))
+            self._config.gric.lambda1 = params.get('gric_lambda1', self._config.gric.lambda1)
+            self._config.gric.lambda2 = params.get('gric_lambda2', self._config.gric.lambda2)
+            self._config.gric.sigma = params.get('gric_sigma', self._config.gric.sigma)
+            self._config.selection.softmax_beta = params.get(
+                'softmax_beta', self._config.selection.softmax_beta
+            )
 
             # 360度設定
             self._use_mask.setChecked(params.get('enable_polar_mask', True))
@@ -479,11 +488,13 @@ class SettingsPanel(QWidget):
         再解析は走らせず、setting_changed シグナルを発行して
         メインウィンドウに判定再実行を委譲する。
         """
-        self.setting_changed.emit(self.get_selector_dict())
+        self._config = self.get_config()
+        self.setting_changed.emit(self._config.to_selector_dict())
 
     def _reset_defaults(self):
         """デフォルト値にリセット"""
         d = KeyframeConfig()
+        self._config = copy.deepcopy(d)
         self._w_sharpness.setValue(d.weights.alpha)
         self._w_geometric.setValue(d.weights.beta)
         self._w_content.setValue(d.weights.gamma)

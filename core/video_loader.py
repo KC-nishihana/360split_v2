@@ -7,12 +7,13 @@ OpenCVを使用したビデオフレーム抽出とメタデータ管理。
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, List, Dict
 from dataclasses import dataclass
 from collections import OrderedDict
 import threading
 import queue
 import platform
+import time
 
 from core.accelerator import get_accelerator
 
@@ -135,20 +136,21 @@ class FramePrefetcher:
     シーク操作を最小化して読み込み性能を向上させる。
     """
 
-    def __init__(self, cap: cv2.VideoCapture, frame_count: int, prefetch_size: int = 10):
+    def __init__(self, video_path: str, frame_count: int, prefetch_size: int = 10):
         """
         初期化
 
         Parameters:
         -----------
-        cap : cv2.VideoCapture
-            ビデオキャプチャオブジェクト
+        video_path : str
+            ビデオファイルパス
         frame_count : int
             総フレーム数
         prefetch_size : int
             先読みキューサイズ
         """
-        self._cap = cap
+        self._video_path = video_path
+        self._cap: Optional[cv2.VideoCapture] = None
         self._frame_count = frame_count
         self._queue: queue.Queue = queue.Queue(maxsize=prefetch_size)
         self._current_idx = 0
@@ -161,6 +163,13 @@ class FramePrefetcher:
         プリフェッチスレッドを開始
         """
         if self._thread is not None:
+            return
+        if self._frame_count <= 0:
+            return
+        self._cap = cv2.VideoCapture(self._video_path)
+        if self._cap is None or not self._cap.isOpened():
+            logger.warning(f"プリフェッチ用キャプチャを開けません: {self._video_path}")
+            self._cap = None
             return
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._prefetch_worker, daemon=True)
@@ -175,6 +184,9 @@ class FramePrefetcher:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
         # キューをクリア
         try:
             while True:
@@ -217,12 +229,28 @@ class FramePrefetcher:
         np.ndarray or None
             キューから取得したフレーム（期待フレームと一致した場合）
         """
+        if timeout <= 0:
+            timeout = 0.001
+
+        skipped = []
+        deadline = time.monotonic() + timeout
         try:
-            idx, frame = self._queue.get(timeout=timeout)
-            if idx == frame_idx:
-                return frame
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                idx, frame = self._queue.get(timeout=remaining)
+                if idx == frame_idx:
+                    return frame
+                skipped.append((idx, frame))
         except queue.Empty:
             pass
+        finally:
+            for item in skipped:
+                try:
+                    self._queue.put_nowait(item)
+                except queue.Full:
+                    break
         return None
 
     def _prefetch_worker(self) -> None:
@@ -231,6 +259,8 @@ class FramePrefetcher:
         """
         while not self._stop_event.is_set():
             try:
+                if self._cap is None:
+                    break
                 with self._lock:
                     idx = self._current_idx
                     self._current_idx += 1
@@ -239,7 +269,8 @@ class FramePrefetcher:
                     self._stop_event.set()
                     break
 
-                # フレーム読み込み（可能な限りシークを避ける）
+                # プリフェッチ専用キャプチャで読み込み（メインキャプチャと競合させない）
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ret, frame = self._cap.read()
                 if ret and frame is not None:
                     try:
@@ -357,7 +388,7 @@ class VideoLoader:
         # プリフェッチャーを初期化
         if self._prefetcher is not None:
             self._prefetcher.stop()
-        self._prefetcher = FramePrefetcher(self._cap, frame_count, prefetch_size=10)
+        self._prefetcher = FramePrefetcher(str(path), frame_count, prefetch_size=10)
         self._prefetcher.start()
 
         logger.info(

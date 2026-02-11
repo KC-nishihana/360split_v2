@@ -14,8 +14,8 @@ ExportWorker:
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import List
+from dataclasses import dataclass
 
 from PySide6.QtCore import QThread, Signal, QObject
 
@@ -80,6 +80,7 @@ class Stage1Worker(QThread):
         self._is_running = False
 
     def run(self):
+        cap = None
         try:
             from core.quality_evaluator import QualityEvaluator
 
@@ -136,8 +137,6 @@ class Stage1Worker(QThread):
             if batch:
                 self.frame_scores.emit(list(batch))
 
-            cap.release()
-
             if self._is_running:
                 self.progress.emit(len(frame_indices), len(frame_indices),
                                    "Stage 1 完了")
@@ -146,6 +145,9 @@ class Stage1Worker(QThread):
         except Exception as e:
             logger.exception("Stage 1 ワーカーエラー")
             self.error.emit(f"Stage 1 エラー: {e}")
+        finally:
+            if cap is not None:
+                cap.release()
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +196,6 @@ class Stage2Worker(QThread):
 
             loader = VideoLoader()
             loader.load(self.video_path)
-            metadata = loader.get_metadata()
 
             selector = KeyframeSelector(config=self.config)
 
@@ -583,10 +584,17 @@ class ExportWorker(QThread):
                     filepath = output_path / filename
 
                     if ext == 'jpg':
-                        cv2.imwrite(str(filepath), processed_frame,
-                                    [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                        saved = cv2.imwrite(
+                            str(filepath),
+                            processed_frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+                        )
                     else:
-                        cv2.imwrite(str(filepath), processed_frame)
+                        saved = cv2.imwrite(str(filepath), processed_frame)
+
+                    if not saved:
+                        logger.warning(f"保存失敗（フレーム {frame_idx}）: {filepath}")
+                        continue
 
                     exported += 1
 

@@ -394,50 +394,85 @@ class ExportDialog(QDialog):
             logger.warning(f"エクスポート設定保存失敗: {e}")
 
     def _load_last_settings(self):
-        path = Path.home() / ".360split" / "export_settings.json"
-        if not path.exists():
-            return
+        # 1) グローバル設定（settings_dialog の保存先）をベースに適用
+        # 2) 直近エクスポート設定があれば上書き
+        settings_dir = Path.home() / ".360split"
+        global_path = settings_dir / "settings.json"
+        export_path = settings_dir / "export_settings.json"
+
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                s = json.load(f)
+            if global_path.exists():
+                with open(global_path, 'r', encoding='utf-8') as f:
+                    g = json.load(f)
 
-            self.dir_edit.setText(s.get("output_dir", self.dir_edit.text()))
-            idx = self.format_combo.findText(s.get("output_format", "png"))
-            if idx >= 0:
-                self.format_combo.setCurrentIndex(idx)
-            self.jpeg_quality_spin.setValue(s.get("jpeg_quality", 95))
-            self.prefix_edit.setText(s.get("prefix", "keyframe"))
+                projection_mode = str(g.get("projection_mode", "Equirectangular"))
+                enable_cubemap = projection_mode == "Cubemap"
+                enable_perspective = projection_mode == "Perspective"
 
-            # Cubemap
-            self.cubemap_group.setChecked(s.get("enable_cubemap", False))
-            self.cubemap_face_spin.setValue(s.get("cubemap_face_size", 1024))
+                global_export_defaults = {
+                    "output_dir": g.get("output_directory", self.dir_edit.text()),
+                    "output_format": g.get("output_image_format", "png"),
+                    "jpeg_quality": g.get("output_jpeg_quality", 95),
+                    "prefix": g.get("naming_prefix", "keyframe"),
+                    "enable_equirect": True,
+                    "equirect_width": g.get("equirect_width", 4096),
+                    "equirect_height": g.get("equirect_height", 2048),
+                    "enable_polar_mask": g.get("enable_polar_mask", False),
+                    "mask_polar_ratio": g.get("mask_polar_ratio", 0.10),
+                    "enable_nadir_mask": g.get("enable_nadir_mask", False),
+                    "nadir_mask_radius": g.get("nadir_mask_radius", 100),
+                    "enable_equipment_detection": g.get("enable_equipment_detection", False),
+                    "mask_dilation_size": g.get("mask_dilation_size", 15),
+                    "enable_cubemap": enable_cubemap,
+                    "enable_perspective": enable_perspective,
+                    "perspective_fov": g.get("perspective_fov", 90.0),
+                }
+                self._apply_settings_dict(global_export_defaults)
 
-            # Perspective
-            self.persp_group.setChecked(s.get("enable_perspective", False))
-            self.persp_fov_spin.setValue(s.get("perspective_fov", 90.0))
-            yaw_list = s.get("perspective_yaw_list", [0.0, 90.0, 180.0, -90.0])
-            pitch_list = s.get("perspective_pitch_list", [0.0])
-            self.persp_yaw_edit.setText(", ".join(str(y) for y in yaw_list))
-            self.persp_pitch_edit.setText(", ".join(str(p) for p in pitch_list))
-            sz = s.get("perspective_size", [1024, 1024])
-            if isinstance(sz, list) and len(sz) >= 1:
-                self.persp_size_spin.setValue(sz[0])
-
-            # Equirect
-            self.equirect_group.setChecked(s.get("enable_equirect", False))
-            self.equirect_w_spin.setValue(s.get("equirect_width", 4096))
-            self.equirect_h_spin.setValue(s.get("equirect_height", 2048))
-
-            # マスク
-            self.polar_group.setChecked(s.get("enable_polar_mask", False))
-            self.polar_ratio_spin.setValue(s.get("mask_polar_ratio", 0.10))
-            self.nadir_group.setChecked(s.get("enable_nadir_mask", False))
-            self.nadir_radius_spin.setValue(s.get("nadir_mask_radius", 100))
-            self.equip_group.setChecked(s.get("enable_equipment_detection", False))
-            self.equip_dilation_spin.setValue(s.get("mask_dilation_size", 15))
+            if export_path.exists():
+                with open(export_path, 'r', encoding='utf-8') as f:
+                    s = json.load(f)
+                self._apply_settings_dict(s)
 
         except Exception as e:
             logger.warning(f"エクスポート設定読み込み失敗: {e}")
+
+    def _apply_settings_dict(self, s: Dict[str, Any]):
+        """保存済み辞書を UI に反映する共通処理"""
+        self.dir_edit.setText(s.get("output_dir", self.dir_edit.text()))
+        idx = self.format_combo.findText(str(s.get("output_format", "png")).lower())
+        if idx >= 0:
+            self.format_combo.setCurrentIndex(idx)
+        self.jpeg_quality_spin.setValue(int(s.get("jpeg_quality", 95)))
+        self.prefix_edit.setText(s.get("prefix", "keyframe"))
+
+        # Cubemap
+        self.cubemap_group.setChecked(bool(s.get("enable_cubemap", False)))
+        self.cubemap_face_spin.setValue(int(s.get("cubemap_face_size", 1024)))
+
+        # Perspective
+        self.persp_group.setChecked(bool(s.get("enable_perspective", False)))
+        self.persp_fov_spin.setValue(float(s.get("perspective_fov", 90.0)))
+        yaw_list = s.get("perspective_yaw_list", [0.0, 90.0, 180.0, -90.0])
+        pitch_list = s.get("perspective_pitch_list", [0.0])
+        self.persp_yaw_edit.setText(", ".join(str(y) for y in yaw_list))
+        self.persp_pitch_edit.setText(", ".join(str(p) for p in pitch_list))
+        sz = s.get("perspective_size", [1024, 1024])
+        if isinstance(sz, (list, tuple)) and len(sz) >= 1:
+            self.persp_size_spin.setValue(int(sz[0]))
+
+        # Equirect
+        self.equirect_group.setChecked(bool(s.get("enable_equirect", False)))
+        self.equirect_w_spin.setValue(int(s.get("equirect_width", 4096)))
+        self.equirect_h_spin.setValue(int(s.get("equirect_height", 2048)))
+
+        # マスク
+        self.polar_group.setChecked(bool(s.get("enable_polar_mask", False)))
+        self.polar_ratio_spin.setValue(float(s.get("mask_polar_ratio", 0.10)))
+        self.nadir_group.setChecked(bool(s.get("enable_nadir_mask", False)))
+        self.nadir_radius_spin.setValue(int(s.get("nadir_mask_radius", 100)))
+        self.equip_group.setChecked(bool(s.get("enable_equipment_detection", False)))
+        self.equip_dilation_spin.setValue(int(s.get("mask_dilation_size", 15)))
 
     # ------------------------------------------------------------------
     # ユーティリティ

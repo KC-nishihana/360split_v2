@@ -143,7 +143,10 @@ class KeyframeSelector:
             sigma=self.config.get('GRIC_SIGMA', 1.0),
             ransac_threshold=self.config.get('RANSAC_THRESHOLD', 3.0),
             min_inlier_ratio=self.config.get('MIN_INLIER_RATIO', 0.3),
-            degeneracy_threshold=self.config.get('GRIC_DEGENERACY_THRESHOLD', 0.85),
+            degeneracy_threshold=self.config.get(
+                'GRIC_DEGENERACY_THRESHOLD',
+                self.config.get('GRIC_RATIO_THRESHOLD', 0.85)
+            ),
             min_matches=self.config.get('MIN_FEATURE_MATCHES', 30),
         )
 
@@ -356,7 +359,7 @@ class KeyframeSelector:
         )
         logger.info(
             f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
-            f"({100*len(stage1_candidates)/total_frames:.1f}%)"
+            f"({100*len(stage1_candidates)/max(total_frames, 1):.1f}%)"
         )
 
         if not stage1_candidates:
@@ -717,10 +720,6 @@ class KeyframeSelector:
             1.0
         )
         exposure = quality_scores.get('exposure', 0.5)
-        motion_blur = 1.0 - quality_scores.get('motion_blur', 0)
-        softmax_depth = quality_scores.get('softmax_depth', 0.5)
-
-        quality_score = (sharpness + exposure + motion_blur + softmax_depth) / 4.0
 
         # 幾何学的スコアを正規化
         if geometric_scores:

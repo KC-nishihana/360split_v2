@@ -37,10 +37,17 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用例:
-  python main.py                           GUIモードで起動
-  python main.py --cli input.mp4           CLIモードで解析
-  python main.py --cli input.mp4 -o out/   出力先指定
+  python main.py                                  GUIモードで起動
+  python main.py --cli input.mp4                  CLIモードで解析
+  python main.py --cli input.mp4 -o out/          出力先指定
+  python main.py --cli input.mp4 --preset indoor  屋内プリセット使用
+  python main.py --cli input.mp4 --preset outdoor 屋外高品質プリセット
   python main.py --cli input.mp4 --config settings.json  設定ファイル指定
+
+プリセット:
+  outdoor : 屋外・晴天用（高品質重視、厳格な品質基準）
+  indoor  : 屋内・暗所用（追跡維持重視、特徴点不足に対応）
+  mixed   : 混合環境用（適応型、露出変化に対応）
         """
     )
 
@@ -64,6 +71,14 @@ def parse_arguments():
         type=str,
         default=None,
         help="設定ファイルパス（JSON形式）"
+    )
+
+    parser.add_argument(
+        "--preset",
+        type=str,
+        choices=["outdoor", "indoor", "mixed"],
+        default=None,
+        help="環境プリセット: outdoor（屋外・高品質）、indoor（屋内・追跡重視）、mixed（混合・適応型）"
     )
 
     parser.add_argument(
@@ -126,9 +141,26 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def load_config(config_path: str = None) -> dict:
-    """設定をロードする。設定ファイルが指定されていればそれを読み込み、なければデフォルト値を使用。"""
+def load_config(config_path: str = None, preset_id: str = None) -> dict:
+    """
+    設定をロードする。
+
+    プリセット → 設定ファイル → デフォルト の優先順位でマージします。
+
+    Parameters:
+    -----------
+    config_path : str, optional
+        設定ファイルパス（JSON形式）
+    preset_id : str, optional
+        プリセットID（'outdoor', 'indoor', 'mixed'）
+
+    Returns:
+    --------
+    dict
+        マージされた設定辞書
+    """
     import config as default_config
+    from core.config_loader import ConfigManager
 
     settings = {
         "laplacian_threshold": default_config.LAPLACIAN_THRESHOLD,
@@ -137,8 +169,10 @@ def load_config(config_path: str = None) -> dict:
         "motion_blur_threshold": default_config.MOTION_BLUR_THRESHOLD,
         "softmax_beta": default_config.SOFTMAX_BETA,
         "gric_ratio_threshold": default_config.GRIC_RATIO_THRESHOLD,
+        "gric_degeneracy_threshold": default_config.GRIC_RATIO_THRESHOLD,
         "min_feature_matches": default_config.MIN_FEATURE_MATCHES,
         "ssim_change_threshold": default_config.SSIM_CHANGE_THRESHOLD,
+        "ssim_threshold": default_config.SSIM_CHANGE_THRESHOLD,
         "min_keyframe_interval": default_config.MIN_KEYFRAME_INTERVAL,
         "max_keyframe_interval": default_config.MAX_KEYFRAME_INTERVAL,
         "momentum_boost_factor": default_config.MOMENTUM_BOOST_FACTOR,
@@ -155,6 +189,20 @@ def load_config(config_path: str = None) -> dict:
         "output_jpeg_quality": default_config.OUTPUT_JPEG_QUALITY,
     }
 
+    # プリセット適用
+    if preset_id:
+        try:
+            config_manager = ConfigManager()
+            preset_config = config_manager.load_preset(preset_id, settings)
+            settings = preset_config
+            logger.info(f"プリセット '{preset_id}' を適用しました")
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            logger.info("デフォルト設定を使用します")
+        except Exception as e:
+            logger.warning(f"プリセット読み込みエラー: {e} （デフォルト設定を使用）")
+
+    # 設定ファイル適用（プリセットの上から更に上書き）
     if config_path and Path(config_path).exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -162,7 +210,7 @@ def load_config(config_path: str = None) -> dict:
             settings.update(user_config)
             logger.info(f"設定ファイルを読み込みました: {config_path}")
         except Exception as e:
-            logger.warning(f"設定ファイルの読み込みに失敗: {e} （デフォルト設定を使用）")
+            logger.warning(f"設定ファイルの読み込みに失敗: {e}")
 
     return settings
 
@@ -179,14 +227,15 @@ def run_cli(args):
         logger.error(f"動画ファイルが見つかりません: {video_path}")
         sys.exit(1)
 
-    # 設定ロード
-    config = load_config(args.config)
+    # 設定ロード（プリセット → 設定ファイル → CLI引数の順で優先）
+    config = load_config(args.config, args.preset)
 
-    # コマンドライン引数で設定をオーバーライド
+    # コマンドライン引数で設定をオーバーライド（最優先）
     if args.min_interval is not None:
         config["min_keyframe_interval"] = args.min_interval
     if args.ssim_threshold is not None:
         config["ssim_change_threshold"] = args.ssim_threshold
+        config["ssim_threshold"] = args.ssim_threshold
     if args.format:
         config["output_image_format"] = args.format
 

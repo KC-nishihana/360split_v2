@@ -1,0 +1,38 @@
+{
+    "name": "Mixed (Adaptive)",
+    "description": "屋外⇔屋内移動用。明暗差（ダイナミックレンジ）の激しい変化に対応し、移動速度の変化にも適応します。露出変化を検知して、白飛び/黒つぶれからの回復フレームを逃しません。",
+    "environment": "mixed",
+    "parameters": {
+        "laplacian_threshold": 120.0,
+        "motion_blur_threshold": 0.25,
+        "softmax_beta": 5.0,
+        "gric_degeneracy_threshold": 0.87,
+        "min_feature_matches": 25,
+        "ssim_threshold": 0.90,
+        "min_keyframe_interval": 5,
+        "max_keyframe_interval": 60,
+        "weight_sharpness": 0.25,
+        "weight_exposure": 0.40,
+        "weight_geometric": 0.25,
+        "weight_content": 0.10,
+        "enable_polar_mask": true,
+        "mask_polar_ratio": 0.12,
+        "gric_lambda1": 2.0,
+        "gric_lambda2": 4.0,
+        "gric_sigma": 1.2,
+        "ransac_threshold": 3.0,
+        "adaptive_thresholding": true,
+        "enable_rescue_mode": true,
+        "rescue_feature_threshold": 18,
+        "rescue_laplacian_factor": 0.7,
+        "force_keyframe_on_exposure_change": true,
+        "exposure_change_threshold": 0.3
+    },
+    "notes": [
+        "スコア履歴に基づく動的しきい値を有効化（adaptive_thresholding=true）",
+        "露出の急激な変化を検知（weight_exposure=0.4）",
+        "シーンの変化に敏感に反応（ssim_threshold=0.90）",
+        "狭い通路の移動に備えて間隔を詰める（min_keyframe_interval=5）",
+        "ドアを抜けた瞬間などの急激な画変わりに対応（force_keyframe_on_exposure_change）"
+    ]
+}

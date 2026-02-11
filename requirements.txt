@@ -1,16 +1,22 @@
-# === 必須 ===
-PySide6>=6.5.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-scipy>=1.11.0
-scikit-image>=0.21.0
-Pillow>=10.0.0
-pyqtgraph>=0.13.0
+# === 必須パッケージ ===
+PySide6>=6.5.0      # GUI フレームワーク
+opencv-python>=4.8.0  # 画像処理、特徴点検出、光学フロー
+numpy>=1.24.0       # 数値計算
+pyqtgraph>=0.13.0   # タイムラインスコアグラフ
 
 # === GPU高速化（オプショナル） ===
-# Apple Silicon (MPS): pip install torch torchvision
-# Windows CUDA:        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-# Windows CUDA OpenCV: pip install opencv-contrib-python  (CUDA対応ビルド)
+# accelerator.py がハードウェア（MPS/CUDA/CPU）を自動検出します。
+# GPUを使用する場合は以下をインストールしてください：
+#
+# Apple Silicon (MPS):
+#   pip install torch torchvision
+#
+# Windows/Linux CUDA:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# CUDA対応OpenCV（オプション）:
+#   pip uninstall opencv-python
+#   pip install opencv-contrib-python
 #
 # torch>=2.0.0
 # torchvision>=0.15.0

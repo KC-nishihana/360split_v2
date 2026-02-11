@@ -1,9 +1,11 @@
 # Pythonで生成されるバイトコード / キャッシュ
 __pycache__/
+*/__pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .mypy_cache/
+*.pyc
 
 # 仮想環境
 venv/
@@ -34,5 +36,6 @@ Thumbs.db
 keyframes/
 cubemap/
 output/
+logs/
 
 # その他、プロジェクト固有の一時ディレクトリがあれば追加

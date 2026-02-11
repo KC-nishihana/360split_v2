@@ -111,6 +111,31 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
 
+        # === 環境プリセット選択 ===
+        preset_group = QGroupBox("環境プリセット")
+        preset_layout = QGridLayout()
+
+        preset_layout.addWidget(QLabel("プリセット:"), 0, 0)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([
+            "Custom (手動設定)",
+            "Outdoor (屋外・高品質)",
+            "Indoor (屋内・追跡重視)",
+            "Mixed (混合・適応型)"
+        ])
+        self.preset_combo.setCurrentIndex(0)  # デフォルトはCustom
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        preset_layout.addWidget(self.preset_combo, 0, 1)
+
+        # プリセット説明ラベル
+        self.preset_description_label = QLabel("")
+        self.preset_description_label.setWordWrap(True)
+        self.preset_description_label.setStyleSheet("color: #666; font-size: 11px;")
+        preset_layout.addWidget(self.preset_description_label, 1, 0, 1, 2)
+
+        preset_group.setLayout(preset_layout)
+        layout.addWidget(preset_group)
+
         # === 品質スコア重み ===
         quality_group = QGroupBox("品質スコア重み")
         quality_layout = QGridLayout()
@@ -617,6 +642,112 @@ class SettingsDialog(QDialog):
         """
         self._save_settings()
         self.accept()
+
+    def _on_preset_changed(self, index: int):
+        """
+        プリセット選択変更時のコールバック
+
+        Parameters:
+        -----------
+        index : int
+            選択されたプリセットのインデックス
+        """
+        from core.config_loader import ConfigManager
+
+        preset_map = {
+            0: None,  # Custom
+            1: "outdoor",
+            2: "indoor",
+            3: "mixed"
+        }
+
+        preset_id = preset_map.get(index)
+
+        if preset_id is None:
+            # Customモード（プリセット非適用）
+            self.preset_description_label.setText(
+                "手動で設定をカスタマイズします。各パラメータを自由に調整できます。"
+            )
+            return
+
+        try:
+            # ConfigManagerでプリセットをロード
+            config_manager = ConfigManager()
+            preset_info = config_manager.get_preset_info(
+                f"{preset_id}_high_quality" if preset_id == "outdoor" else
+                f"{preset_id}_robust_tracking" if preset_id == "indoor" else
+                f"{preset_id}_adaptive"
+            )
+
+            if preset_info is None:
+                logger.warning(f"プリセット '{preset_id}' が見つかりません")
+                return
+
+            # 説明を表示
+            self.preset_description_label.setText(preset_info.description)
+
+            # UIの値を更新
+            params = preset_info.parameters
+
+            # 重み
+            self.sharpness_weight_slider.setValue(
+                int(params.get('weight_sharpness', 0.30) * 100)
+            )
+            self.exposure_weight_slider.setValue(
+                int(params.get('weight_exposure', 0.15) * 100)
+            )
+            self.geometric_weight_slider.setValue(
+                int(params.get('weight_geometric', 0.30) * 100)
+            )
+            self.content_weight_slider.setValue(
+                int(params.get('weight_content', 0.25) * 100)
+            )
+
+            # 適応的選択パラメータ
+            self.ssim_threshold.setValue(
+                params.get('ssim_threshold', 0.85)
+            )
+            self.min_keyframe_interval.setValue(
+                params.get('min_keyframe_interval', 5)
+            )
+            self.max_keyframe_interval.setValue(
+                params.get('max_keyframe_interval', 60)
+            )
+            self.softmax_beta.setValue(
+                params.get('softmax_beta', 5.0)
+            )
+
+            # GRICパラメータ
+            self.gric_lambda1.setValue(
+                params.get('gric_lambda1', 2.0)
+            )
+            self.gric_lambda2.setValue(
+                params.get('gric_lambda2', 4.0)
+            )
+            self.gric_sigma.setValue(
+                params.get('gric_sigma', 1.0)
+            )
+            self.gric_degeneracy_threshold.setValue(
+                params.get('gric_degeneracy_threshold', 0.85)
+            )
+
+            # 360度設定
+            self.enable_polar_mask.setChecked(
+                params.get('enable_polar_mask', True)
+            )
+            self.mask_polar_ratio.setValue(
+                params.get('mask_polar_ratio', 0.10)
+            )
+
+            logger.info(f"プリセット '{preset_id}' ({preset_info.name}) を適用しました")
+
+        except Exception as e:
+            logger.error(f"プリセット適用エラー: {e}")
+            QMessageBox.warning(
+                self,
+                "エラー",
+                f"プリセットの適用に失敗しました:\n{e}"
+            )
 
     def _on_reset(self):
         """

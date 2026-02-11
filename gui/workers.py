@@ -393,6 +393,8 @@ class ExportWorker(QThread):
     """
     キーフレーム画像のバッチエクスポート
 
+    360度処理（Equirectangular変換）とマスク処理に対応。
+
     Signals
     -------
     progress : Signal(int, int, str)
@@ -408,6 +410,17 @@ class ExportWorker(QThread):
     def __init__(self, video_path: str, frame_indices: List[int],
                  output_dir: str, format: str = 'png',
                  jpeg_quality: int = 95, prefix: str = 'keyframe',
+                 # 360度処理設定
+                 enable_equirect: bool = False,
+                 equirect_width: int = 4096,
+                 equirect_height: int = 2048,
+                 enable_polar_mask: bool = False,
+                 mask_polar_ratio: float = 0.10,
+                 # マスク処理設定
+                 enable_nadir_mask: bool = False,
+                 nadir_mask_radius: int = 100,
+                 enable_equipment_detection: bool = False,
+                 mask_dilation_size: int = 15,
                  parent: QObject = None):
         super().__init__(parent)
         self.video_path = video_path
@@ -416,6 +429,20 @@ class ExportWorker(QThread):
         self.format = format.lower()
         self.jpeg_quality = jpeg_quality
         self.prefix = prefix
+
+        # 360度処理設定
+        self.enable_equirect = enable_equirect
+        self.equirect_width = equirect_width
+        self.equirect_height = equirect_height
+        self.enable_polar_mask = enable_polar_mask
+        self.mask_polar_ratio = mask_polar_ratio
+
+        # マスク処理設定
+        self.enable_nadir_mask = enable_nadir_mask
+        self.nadir_mask_radius = nadir_mask_radius
+        self.enable_equipment_detection = enable_equipment_detection
+        self.mask_dilation_size = mask_dilation_size
+
         self._is_running = True
 
     def stop(self):
@@ -431,6 +458,29 @@ class ExportWorker(QThread):
                 self.error.emit(f"ビデオを開けません: {self.video_path}")
                 return
 
+            # 360度処理とマスク処理のプロセッサを初期化
+            equirect_processor = None
+            mask_processor = None
+
+            if self.enable_equirect:
+                try:
+                    from processing.equirectangular import EquirectangularProcessor
+                    equirect_processor = EquirectangularProcessor()
+                    logger.info("360度処理を有効化しました")
+                except ImportError as e:
+                    logger.warning(f"EquirectangularProcessor のインポートに失敗: {e}")
+                    self.enable_equirect = False
+
+            if self.enable_nadir_mask or self.enable_equipment_detection:
+                try:
+                    from processing.mask_processor import MaskProcessor
+                    mask_processor = MaskProcessor()
+                    logger.info("マスク処理を有効化しました")
+                except ImportError as e:
+                    logger.warning(f"MaskProcessor のインポートに失敗: {e}")
+                    self.enable_nadir_mask = False
+                    self.enable_equipment_detection = False
+
             total = len(self.frame_indices)
             exported = 0
 
@@ -442,15 +492,78 @@ class ExportWorker(QThread):
                 ret, frame = cap.read()
 
                 if ret and frame is not None:
+                    processed_frame = frame
+
+                    # 360度処理を適用
+                    if self.enable_equirect and equirect_processor:
+                        try:
+                            # Equirectangular変換（リサイズ + ポーラーマスク）
+                            if processed_frame.shape[1] != self.equirect_width or \
+                               processed_frame.shape[0] != self.equirect_height:
+                                processed_frame = cv2.resize(
+                                    processed_frame,
+                                    (self.equirect_width, self.equirect_height),
+                                    interpolation=cv2.INTER_LANCZOS4
+                                )
+
+                            # ポーラーマスク適用
+                            if self.enable_polar_mask:
+                                h, w = processed_frame.shape[:2]
+                                mask_h = int(h * self.mask_polar_ratio)
+                                # 天頂（上部）をマスク
+                                processed_frame[:mask_h, :] = 0
+                                # 天底（下部）をマスク
+                                processed_frame[-mask_h:, :] = 0
+
+                        except Exception as e:
+                            logger.warning(f"360度処理エラー（フレーム {frame_idx}）: {e}")
+
+                    # マスク処理を適用
+                    if mask_processor:
+                        try:
+                            # ナディアマスク
+                            if self.enable_nadir_mask:
+                                h, w = processed_frame.shape[:2]
+                                center_x, center_y = w // 2, h - 1
+                                mask = np.ones((h, w), dtype=np.uint8) * 255
+                                cv2.circle(mask, (center_x, center_y),
+                                         self.nadir_mask_radius, 0, -1)
+                                processed_frame = cv2.bitwise_and(
+                                    processed_frame, processed_frame, mask=mask
+                                )
+
+                            # 装備検出（簡易的な実装：下部の一定領域をマスク）
+                            if self.enable_equipment_detection:
+                                h, w = processed_frame.shape[:2]
+                                equipment_mask = np.ones((h, w), dtype=np.uint8) * 255
+                                equipment_h = int(h * 0.2)  # 下部20%
+                                equipment_mask[-equipment_h:, :] = 0
+                                # 膨張処理
+                                if self.mask_dilation_size > 0:
+                                    kernel = np.ones(
+                                        (self.mask_dilation_size, self.mask_dilation_size),
+                                        np.uint8
+                                    )
+                                    equipment_mask = cv2.erode(
+                                        equipment_mask, kernel, iterations=1
+                                    )
+                                processed_frame = cv2.bitwise_and(
+                                    processed_frame, processed_frame, mask=equipment_mask
+                                )
+
+                        except Exception as e:
+                            logger.warning(f"マスク処理エラー（フレーム {frame_idx}）: {e}")
+
+                    # ファイルを保存
                     ext = 'jpg' if self.format in ('jpg', 'jpeg') else self.format
                     filename = f"{self.prefix}_{frame_idx:06d}.{ext}"
                     filepath = output_path / filename
 
                     if ext == 'jpg':
-                        cv2.imwrite(str(filepath), frame,
+                        cv2.imwrite(str(filepath), processed_frame,
                                     [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
                     else:
-                        cv2.imwrite(str(filepath), frame)
+                        cv2.imwrite(str(filepath), processed_frame)
 
                     exported += 1
 

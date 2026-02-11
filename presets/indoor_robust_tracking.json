@@ -1,0 +1,35 @@
+{
+    "name": "Indoor (Robust Tracking)",
+    "description": "屋内・暗所用。ノイズを許容し、SfMの追跡維持を最優先します。特徴点が少なく暗い環境でも、トラッキングが切れないことを重視した設定です。",
+    "environment": "indoor",
+    "parameters": {
+        "laplacian_threshold": 50.0,
+        "motion_blur_threshold": 0.4,
+        "softmax_beta": 3.0,
+        "gric_degeneracy_threshold": 0.90,
+        "min_feature_matches": 20,
+        "ssim_threshold": 0.90,
+        "min_keyframe_interval": 3,
+        "max_keyframe_interval": 45,
+        "weight_sharpness": 0.10,
+        "weight_exposure": 0.10,
+        "weight_geometric": 0.60,
+        "weight_content": 0.20,
+        "enable_polar_mask": true,
+        "mask_polar_ratio": 0.15,
+        "gric_lambda1": 1.5,
+        "gric_lambda2": 3.0,
+        "gric_sigma": 1.5,
+        "ransac_threshold": 4.0,
+        "enable_rescue_mode": true,
+        "rescue_feature_threshold": 15,
+        "rescue_laplacian_factor": 0.5
+    },
+    "notes": [
+        "高感度ノイズやソフトフォーカスを許容（laplacian_threshold=50.0）",
+        "多少のブレよりもフレーム数を確保（motion_blur_threshold=0.4）",
+        "画質よりもGRICによる幾何学的な繋がりを重視（weight_geometric=0.6）",
+        "特徴点が少ない壁面などに対応（min_feature_matches=20）",
+        "レスキューモード有効化で追跡ロストを防止"
+    ]
+}

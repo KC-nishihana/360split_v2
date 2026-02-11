@@ -1,0 +1,31 @@
+{
+    "name": "Outdoor (High Quality)",
+    "description": "屋外・晴天用。3D Gaussian Splattingの学習データとして最高品質を目指します。光量が十分なため、非常に鮮明な画像のみを厳選してテクスチャ品質を最大化します。",
+    "environment": "outdoor",
+    "parameters": {
+        "laplacian_threshold": 300.0,
+        "motion_blur_threshold": 0.15,
+        "softmax_beta": 10.0,
+        "gric_degeneracy_threshold": 0.85,
+        "min_feature_matches": 30,
+        "ssim_threshold": 0.80,
+        "min_keyframe_interval": 10,
+        "max_keyframe_interval": 90,
+        "weight_sharpness": 0.40,
+        "weight_exposure": 0.10,
+        "weight_geometric": 0.35,
+        "weight_content": 0.15,
+        "enable_polar_mask": true,
+        "mask_polar_ratio": 0.10,
+        "gric_lambda1": 2.0,
+        "gric_lambda2": 4.0,
+        "gric_sigma": 1.0,
+        "ransac_threshold": 2.5
+    },
+    "notes": [
+        "遠景が多いため、min_keyframe_intervalを広げてデータ量を削減",
+        "鮮明度重視でlaplacian_thresholdを高く設定",
+        "わずかなブレも許容しない（motion_blur_threshold=0.15）",
+        "十分な視差がある場合のみ採用（gric_degeneracy_threshold=0.85）"
+    ]
+}

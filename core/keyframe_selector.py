@@ -49,6 +49,10 @@ class KeyframeInfo:
         統合スコア（0-1）
     thumbnail : Optional[np.ndarray]
         サムネイル画像（BGR形式）
+    is_rescue_mode : bool
+        レスキューモードで選択されたフレームか
+    is_force_inserted : bool
+        露出変化等で強制挿入されたフレームか
     """
     frame_index: int
     timestamp: float
@@ -57,6 +61,8 @@ class KeyframeInfo:
     adaptive_scores: Dict[str, float] = field(default_factory=dict)
     combined_score: float = 0.0
     thumbnail: Optional[np.ndarray] = None
+    is_rescue_mode: bool = False
+    is_force_inserted: bool = False
 
 
 class KeyframeSelector:
@@ -108,6 +114,15 @@ class KeyframeSelector:
             'THUMBNAIL_SIZE': (192, 108),
             'SAMPLE_INTERVAL': 1,
             'STAGE1_BATCH_SIZE': 32,
+            # レスキューモード設定
+            'ENABLE_RESCUE_MODE': False,
+            'RESCUE_FEATURE_THRESHOLD': 15,  # この値以下で特徴点不足と判定
+            'RESCUE_LAPLACIAN_FACTOR': 0.5,  # レスキュー時のLaplacian閾値倍率
+            'RESCUE_WINDOW_SIZE': 10,  # レスキューモード判定のウィンドウサイズ
+            # 混合環境での強制挿入設定
+            'FORCE_KEYFRAME_ON_EXPOSURE_CHANGE': False,
+            'EXPOSURE_CHANGE_THRESHOLD': 0.3,  # 露出変化の検知閾値
+            'ADAPTIVE_THRESHOLDING': False,  # 動的閾値調整
         }
 
         # 外部設定でオーバーライド
@@ -153,6 +168,12 @@ class KeyframeSelector:
             f"thread_count={self.accelerator.num_threads}"
         )
 
+        # レスキューモード関連の状態変数
+        self.is_rescue_mode = False
+        self.feature_count_history = deque(maxlen=self.config['RESCUE_WINDOW_SIZE'])
+        self.previous_brightness = None
+        self.rescue_mode_keyframes = []  # レスキューモードで選択されたキーフレーム
+
     def _open_independent_capture(self, video_path) -> cv2.VideoCapture:
         """
         分析用に独立したcv2.VideoCaptureを開く
@@ -179,6 +200,110 @@ class KeyframeSelector:
         if not cap.isOpened():
             raise RuntimeError(f"分析用ビデオキャプチャを開けません: {video_path}")
         return cap
+
+    def _check_rescue_mode(self, feature_count: int) -> bool:
+        """
+        レスキューモード判定
+
+        特徴点マッチング数の履歴から、レスキューモードに入るべきか判定します。
+
+        Parameters:
+        -----------
+        feature_count : int
+            現在のフレームの特徴点マッチング数
+
+        Returns:
+        --------
+        bool
+            レスキューモードに入るべきか
+        """
+        if not self.config.get('ENABLE_RESCUE_MODE', False):
+            return False
+
+        # 履歴に追加
+        self.feature_count_history.append(feature_count)
+
+        # ウィンドウが満たされるまではレスキューモードに入らない
+        if len(self.feature_count_history) < self.config['RESCUE_WINDOW_SIZE']:
+            return False
+
+        # ウィンドウ内の平均特徴点数が閾値以下かチェック
+        avg_features = np.mean(list(self.feature_count_history))
+        threshold = self.config['RESCUE_FEATURE_THRESHOLD']
+
+        should_rescue = avg_features < threshold
+
+        if should_rescue and not self.is_rescue_mode:
+            logger.warning(
+                f"レスキューモード発動: 平均特徴点数 {avg_features:.1f} < {threshold}"
+            )
+        elif not should_rescue and self.is_rescue_mode:
+            logger.info(
+                f"レスキューモード解除: 平均特徴点数 {avg_features:.1f} >= {threshold}"
+            )
+
+        return should_rescue
+
+    def _detect_exposure_change(self, frame: np.ndarray) -> bool:
+        """
+        露出の急激な変化を検知
+
+        フレームの平均輝度を計算し、前フレームとの変化が閾値を超えるか判定します。
+        ドアを抜けた瞬間などの急激な明暗変化を検知します。
+
+        Parameters:
+        -----------
+        frame : np.ndarray
+            現在のフレーム（BGR形式）
+
+        Returns:
+        --------
+        bool
+            急激な露出変化があったか
+        """
+        if not self.config.get('FORCE_KEYFRAME_ON_EXPOSURE_CHANGE', False):
+            return False
+
+        # グレースケール化して平均輝度を計算
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        current_brightness = np.mean(gray) / 255.0  # 0-1に正規化
+
+        if self.previous_brightness is None:
+            self.previous_brightness = current_brightness
+            return False
+
+        # 変化量を計算
+        brightness_change = abs(current_brightness - self.previous_brightness)
+        threshold = self.config['EXPOSURE_CHANGE_THRESHOLD']
+
+        is_significant_change = brightness_change > threshold
+
+        if is_significant_change:
+            logger.info(
+                f"急激な露出変化検知: {self.previous_brightness:.3f} → "
+                f"{current_brightness:.3f} (変化量: {brightness_change:.3f})"
+            )
+
+        self.previous_brightness = current_brightness
+        return is_significant_change
+
+    def _get_adjusted_laplacian_threshold(self) -> float:
+        """
+        レスキューモード時のLaplacian閾値を取得
+
+        Returns:
+        --------
+        float
+            調整されたLaplacian閾値
+        """
+        base_threshold = self.config['LAPLACIAN_THRESHOLD']
+
+        if self.is_rescue_mode:
+            factor = self.config['RESCUE_LAPLACIAN_FACTOR']
+            adjusted = base_threshold * factor
+            return adjusted
+
+        return base_threshold
 
     def select_keyframes(self, video_loader: VideoLoader,
                         progress_callback: Optional[Callable[[int, int], None]] = None
@@ -408,9 +533,13 @@ class KeyframeSelector:
                 # フレームウィンドウを更新
                 frame_window.append(current_frame)
 
+                # 露出変化を検知（混合環境モード）
+                exposure_changed = self._detect_exposure_change(current_frame)
+
                 # 幾何学的・適応的スコアを計算
                 geometric_scores = {}
                 adaptive_scores = {}
+                force_insert = False  # 強制挿入フラグ
 
                 if last_keyframe is not None:
                     # 前キーフレームとの幾何学的評価
@@ -436,11 +565,39 @@ class KeyframeSelector:
                         }
                         geometric_failed = True
                     except (EstimationFailureError, InsufficientFeaturesError) as e:
-                        # 推定失敗/特徴点不足 → このフレームをスキップ
+                        # 推定失敗/特徴点不足
                         logger.debug(
                             f"フレーム {frame_idx}: 幾何学的評価失敗 - {e}"
                         )
-                        continue
+
+                        # レスキューモード判定（特徴点数=0として記録）
+                        self.is_rescue_mode = self._check_rescue_mode(0)
+
+                        # レスキューモード中かつ最小間隔を超えている場合は強制採用を検討
+                        if self.is_rescue_mode and \
+                           frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
+                            logger.warning(
+                                f"レスキューモード: フレーム {frame_idx} を "
+                                f"特徴点不足にもかかわらず強制採用を検討"
+                            )
+                            # 極端に低いスコアでも採用
+                            geometric_scores = {
+                                'gric': 0.05,
+                                'feature_distribution_1': 0.0,
+                                'feature_distribution_2': 0.0,
+                                'feature_match_count': 0,
+                                'ray_dispersion': 0.0
+                            }
+                            geometric_failed = True
+                            force_insert = True
+                        else:
+                            continue
+
+                    # 特徴点マッチング数でレスキューモードを更新
+                    if not geometric_failed and 'feature_match_count' in geometric_scores:
+                        self.is_rescue_mode = self._check_rescue_mode(
+                            geometric_scores['feature_match_count']
+                        )
 
                     # 適応的スコア計算
                     adaptive_scores = self.adaptive_selector.evaluate(
@@ -448,11 +605,21 @@ class KeyframeSelector:
                         frames_window=list(frame_window)
                     )
 
-                    # SSIM変化が小さすぎる場合はスキップ
+                    # SSIM変化が小さすぎる場合はスキップ（ただし強制挿入や露出変化時は除く）
                     ssim = adaptive_scores.get('ssim', 1.0)
-                    if ssim > self.config['SSIM_CHANGE_THRESHOLD']:
+                    if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and \
+                       not force_insert and not exposure_changed:
                         logger.debug(f"フレーム {frame_idx}: 変化不足 (SSIM: {ssim:.3f})")
                         continue
+
+                    # 露出変化による強制挿入
+                    if exposure_changed and \
+                       frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
+                        force_insert = True
+                        logger.info(
+                            f"露出変化検知: フレーム {frame_idx} を強制挿入 "
+                            f"(MIN_KEYFRAME_INTERVAL無視)"
+                        )
 
                 else:
                     # 最初のキーフレーム
@@ -472,18 +639,28 @@ class KeyframeSelector:
                     geometric_scores=geometric_scores,
                     adaptive_scores=adaptive_scores,
                     combined_score=combined_score,
-                    thumbnail=None  # 遅延生成
+                    thumbnail=None,  # 遅延生成
+                    is_rescue_mode=self.is_rescue_mode,
+                    is_force_inserted=force_insert or exposure_changed
                 )
 
                 candidates.append(candidate)
+
+                # レスキューモードで選択されたフレームを記録
+                if self.is_rescue_mode:
+                    self.rescue_mode_keyframes.append(frame_idx)
+
                 last_keyframe_idx = frame_idx
                 last_keyframe = current_frame
 
-                logger.debug(
-                    f"候補フレーム {frame_idx}: "
-                    f"品質={combined_score:.3f}, "
-                    f"SSIM={adaptive_scores.get('ssim', 0):.3f}"
-                )
+                log_msg = f"候補フレーム {frame_idx}: 品質={combined_score:.3f}"
+                if adaptive_scores:
+                    log_msg += f", SSIM={adaptive_scores.get('ssim', 0):.3f}"
+                if self.is_rescue_mode:
+                    log_msg += " [RESCUE]"
+                if force_insert or exposure_changed:
+                    log_msg += " [FORCE]"
+                logger.debug(log_msg)
 
         finally:
             cap.release()

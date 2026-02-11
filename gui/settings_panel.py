@@ -131,6 +131,33 @@ class SettingsPanel(QWidget):
         layout = QVBoxLayout(container)
         layout.setSpacing(10)
 
+        # ---------- 環境プリセット ----------
+        grp_preset = QGroupBox("環境プリセット")
+        grp_preset.setStyleSheet(self._group_style())
+        pl = QVBoxLayout(grp_preset)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("プリセット:"))
+        self._preset_combo = QComboBox()
+        self._preset_combo.addItems([
+            "Custom (手動設定)",
+            "Outdoor (屋外・高品質)",
+            "Indoor (屋内・追跡重視)",
+            "Mixed (混合・適応型)"
+        ])
+        self._preset_combo.setCurrentIndex(0)
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        preset_row.addWidget(self._preset_combo, stretch=1)
+        pl.addLayout(preset_row)
+
+        # プリセット説明
+        self._preset_desc = QLabel("")
+        self._preset_desc.setWordWrap(True)
+        self._preset_desc.setStyleSheet("color: #999; font-size: 11px; padding: 4px;")
+        pl.addWidget(self._preset_desc)
+
+        layout.addWidget(grp_preset)
+
         # ---------- 品質スコア重み ----------
         grp_weights = QGroupBox("品質スコア重み (α+β+γ+δ=1)")
         grp_weights.setStyleSheet(self._group_style())
@@ -300,33 +327,147 @@ class SettingsPanel(QWidget):
                 logger.warning(f"設定読み込みエラー: {e}")
 
     def save_settings(self):
-        """現在のパネル値を ~/.360split/settings.json に保存"""
-        settings_dir = Path.home() / ".360split"
-        settings_dir.mkdir(exist_ok=True)
-        settings_file = settings_dir / "settings.json"
+        """
+        ライブプレビュー専用パネルのため、永続的な保存は行いません。
 
-        c = self.get_config()
-        d = {
-            'weight_sharpness': c.weights.alpha,
-            'weight_exposure': c.weights.delta,
-            'weight_geometric': c.weights.beta,
-            'weight_content': c.weights.gamma,
-            'laplacian_threshold': c.selection.laplacian_threshold,
-            'ssim_threshold': c.selection.ssim_change_threshold,
-            'motion_blur_threshold': c.selection.motion_blur_threshold,
-            'min_keyframe_interval': c.selection.min_keyframe_interval,
-            'max_keyframe_interval': c.selection.max_keyframe_interval,
-            'gric_degeneracy_threshold': c.gric.degeneracy_threshold,
-            'ransac_threshold': c.gric.ransac_threshold,
-            'enable_polar_mask': c.equirect360.enable_polar_mask,
-            'mask_polar_ratio': c.equirect360.mask_polar_ratio,
+        永続的な設定保存は settings_dialog (メニュー: 編集 → 設定...) から行ってください。
+        このパネルはリアルタイムプレビュー用の一時的なパラメータ調整に使用されます。
+
+        Note:
+        -----
+        このメソッドは後方互換性のために残されていますが、実際には保存を行いません。
+        settings_dialog で保存された設定は reload_from_file() で読み込まれます。
+        """
+        logger.info("settings_panel は永続的な保存を行いません。settings_dialog を使用してください。")
+
+    def reload_from_file(self):
+        """
+        settings_dialog で保存された設定を読み込んで UI を更新
+
+        settings_dialog (モーダルダイアログ) で設定が保存された後、
+        このメソッドを呼び出すことで settings_panel の UI を同期します。
+
+        Note:
+        -----
+        このメソッドは main_window から settings_dialog が閉じた後に呼び出されます。
+        """
+        # 設定ファイルから再読み込み
+        self._load_settings()
+
+        # UI ウィジェットを更新（シグナルをブロックして一括更新）
+        c = self._config
+
+        # プリセットコンボをCustomにリセット（設定ファイルはCustomとして扱う）
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.setCurrentIndex(0)  # Custom
+        self._preset_combo.blockSignals(False)
+        self._preset_desc.setText("手動で設定をカスタマイズします。各パラメータを自由に調整できます。")
+
+        # 重み
+        self._w_sharpness.setValue(c.weights.alpha)
+        self._w_geometric.setValue(c.weights.beta)
+        self._w_content.setValue(c.weights.gamma)
+        self._w_exposure.setValue(c.weights.delta)
+
+        # 選択パラメータ
+        self._laplacian_th.setValue(c.selection.laplacian_threshold)
+        self._ssim_th.setValue(c.selection.ssim_change_threshold)
+        self._motion_blur_th.setValue(c.selection.motion_blur_threshold)
+        self._min_interval.setValue(c.selection.min_keyframe_interval)
+        self._max_interval.setValue(c.selection.max_keyframe_interval)
+
+        # GRIC
+        self._gric_ratio.setValue(c.gric.degeneracy_threshold)
+        self._ransac_th.setValue(c.gric.ransac_threshold)
+
+        # 360度設定
+        self._use_mask.setChecked(c.equirect360.enable_polar_mask)
+        self._mask_ratio.setValue(c.equirect360.mask_polar_ratio)
+
+        logger.info("settings_dialog からの設定を読み込みました")
+
+        # Live Previewをトリガーして反映
+        self._on_live_change()
+
+    # ==================================================================
+    # プリセット管理
+    # ==================================================================
+
+    def _on_preset_changed(self, index: int):
+        """
+        プリセット選択変更時のコールバック
+
+        Parameters:
+        -----------
+        index : int
+            選択されたプリセットのインデックス
+        """
+        from core.config_loader import ConfigManager
+
+        preset_map = {
+            0: None,  # Custom
+            1: "outdoor",
+            2: "indoor",
+            3: "mixed"
         }
+
+        preset_id = preset_map.get(index)
+
+        if preset_id is None:
+            # Customモード
+            self._preset_desc.setText(
+                "手動で設定をカスタマイズします。各パラメータを自由に調整できます。"
+            )
+            return
+
         try:
-            with open(settings_file, 'w', encoding='utf-8') as f:
-                json.dump(d, f, indent=2, ensure_ascii=False)
-            logger.info(f"設定を保存: {settings_file}")
+            # ConfigManagerでプリセットをロード
+            config_manager = ConfigManager()
+            preset_info = config_manager.get_preset_info(
+                f"{preset_id}_high_quality" if preset_id == "outdoor" else
+                f"{preset_id}_robust_tracking" if preset_id == "indoor" else
+                f"{preset_id}_adaptive"
+            )
+
+            if preset_info is None:
+                logger.warning(f"プリセット '{preset_id}' が見つかりません")
+                return
+
+            # 説明を表示
+            self._preset_desc.setText(preset_info.description)
+
+            # UIの値を更新（シグナルをブロックして一気に更新）
+            params = preset_info.parameters
+
+            # 重み
+            self._w_sharpness.setValue(params.get('weight_sharpness', 0.30))
+            self._w_exposure.setValue(params.get('weight_exposure', 0.15))
+            self._w_geometric.setValue(params.get('weight_geometric', 0.30))
+            self._w_content.setValue(params.get('weight_content', 0.25))
+
+            # 選択パラメータ
+            self._laplacian_th.setValue(params.get('laplacian_threshold', 100.0))
+            self._ssim_th.setValue(params.get('ssim_threshold', 0.85))
+            self._motion_blur_th.setValue(params.get('motion_blur_threshold', 0.3))
+            self._min_interval.setValue(params.get('min_keyframe_interval', 5))
+            self._max_interval.setValue(params.get('max_keyframe_interval', 60))
+
+            # GRIC
+            self._gric_ratio.setValue(params.get('gric_degeneracy_threshold', 0.85))
+            self._ransac_th.setValue(params.get('ransac_threshold', 3.0))
+
+            # 360度設定
+            self._use_mask.setChecked(params.get('enable_polar_mask', True))
+            self._mask_ratio.setValue(params.get('mask_polar_ratio', 0.10))
+
+            logger.info(f"プリセット '{preset_id}' ({preset_info.name}) を適用しました")
+
+            # Live Previewをトリガー
+            self._on_live_change()
+
         except Exception as e:
-            logger.error(f"設定保存エラー: {e}")
+            logger.error(f"プリセット適用エラー: {e}")
+            self._preset_desc.setText(f"エラー: {e}")
 
     # ==================================================================
     # Live Preview

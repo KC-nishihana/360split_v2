@@ -53,14 +53,22 @@ pip install -r requirements.txt
 
 ### 4. GPU高速化（オプション）
 
-Apple Silicon (MPS) の場合:
+`core/accelerator.py` がハードウェア（MPS/CUDA/CPU）を自動検出します。GPUを使用する場合は以下をインストールしてください。
+
+**Apple Silicon (MPS) の場合:**
 ```bash
 pip install torch torchvision
 ```
 
-Windows (CUDA) の場合:
+**Windows/Linux (CUDA) の場合:**
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+**CUDA対応OpenCV（さらに高速化、オプション）:**
+```bash
+pip uninstall opencv-python
+pip install opencv-contrib-python
 ```
 
 
@@ -92,6 +100,11 @@ python main.py --cli input.mp4 --apply-mask
 # 設定ファイルを指定
 python main.py --cli input.mp4 --config settings.json
 
+# 環境プリセットを使用
+python main.py --cli input.mp4 --preset outdoor  # 屋外・高品質
+python main.py --cli input.mp4 --preset indoor   # 屋内・追跡重視
+python main.py --cli input.mp4 --preset mixed    # 混合・適応型
+
 # 詳細ログ出力
 python main.py --cli input.mp4 -v
 ```
@@ -103,6 +116,7 @@ python main.py --cli input.mp4 -v
 | `--cli VIDEO` | CLIモードで動画を解析 | — |
 | `-o, --output DIR` | 出力ディレクトリ | `./keyframes` |
 | `--format {png,jpg,tiff}` | 出力画像フォーマット | `png` |
+| `--preset {outdoor,indoor,mixed}` | 環境プリセット（下記参照） | — |
 | `--max-keyframes N` | 最大キーフレーム数 | 自動決定 |
 | `--min-interval N` | 最小キーフレーム間隔（フレーム数） | `5` |
 | `--ssim-threshold F` | SSIM変化検知閾値 (0.0-1.0) | `0.85` |
@@ -113,6 +127,79 @@ python main.py --cli input.mp4 -v
 | `-v, --verbose` | 詳細ログ出力 | `false` |
 
 
+## 環境プリセット機能
+
+撮影環境（屋外・屋内・混合）に応じて最適なキーフレーム抽出パラメータを即座に適用できるプリセット管理システムを搭載しています。
+
+### プリセット一覧
+
+#### 🌞 Outdoor (屋外・高品質)
+**戦略**: 品質重視。3D Gaussian Splattingの学習データとして最高品質を目指します。
+
+```bash
+python main.py --cli video.mp4 --preset outdoor
+```
+
+**特徴**:
+- **laplacian_threshold: 300.0** — 非常に高い鮮明度を要求
+- **motion_blur_threshold: 0.15** — わずかなブレも許容しない
+- **min_keyframe_interval: 10** — 遠景が多いため間隔を広げてデータ量を削減
+- **weight_sharpness: 0.40** — 鮮明度を最重視
+
+**適用シーン**: 晴天の屋外撮影、建築物の外観、風景の3Dモデル作成
+
+#### 🏠 Indoor (屋内・追跡重視)
+**戦略**: 接続性重視。特徴点が少なく暗い環境でもSfMの追跡が切れないことを最優先します。
+
+```bash
+python main.py --cli video.mp4 --preset indoor
+```
+
+**特徴**:
+- **laplacian_threshold: 50.0** — 高感度ノイズやソフトフォーカスを許容
+- **motion_blur_threshold: 0.4** — 多少のブレよりもフレーム数を確保
+- **weight_geometric: 0.60** — 幾何学的な繋がりを最重視
+- **min_feature_matches: 20** — 特徴点が少ない壁面などに対応
+- **enable_rescue_mode: true** — レスキューモード有効化
+
+**適用シーン**: 屋内撮影、暗所、テクスチャの少ない環境（オフィス、廊下など）
+
+#### 🌗 Mixed (混合・適応型)
+**戦略**: 適応性重視。明暗差（ダイナミックレンジ）の激しい変化に対応します。
+
+```bash
+python main.py --cli video.mp4 --preset mixed
+```
+
+**特徴**:
+- **weight_exposure: 0.40** — 露出の急激な変化を検知
+- **ssim_threshold: 0.90** — シーンの変化に敏感に反応
+- **adaptive_thresholding: true** — スコア履歴に基づく動的しきい値
+- **force_keyframe_on_exposure_change: true** — ドアを抜けた瞬間などの急激な画変わりで強制挿入
+
+**適用シーン**: 屋外⇔屋内の移動、トンネル出入口、明暗差の激しい環境
+
+### GUIでのプリセット使用
+
+GUIモードでは、設定ダイアログの「キーフレーム選択」タブ上部にプリセット選択UIがあります。
+
+1. プリセットを選択すると、全パラメータが即座に更新されます
+2. プリセット適用後も、個別のパラメータを微調整可能です
+3. 「Custom (手動設定)」を選択すると、プリセット非適用状態になります
+
+### レスキューモード
+
+**Indoor**および**Mixed**プリセットでは、特徴点不足時の「レスキューモード」が有効化されています。
+
+**機能**:
+- 特徴点マッチング数が閾値（デフォルト15点）以下の状態が続くと自動的に発動
+- Laplacian閾値を一時的に緩和（デフォルト: 50%倍率）
+- 画質が低くても、追跡維持のためにキーフレームを強制採用
+- GUIタイムライン上で黄色/オレンジ色で表示され、後で確認・削除可能
+
+**目的**: 屋内・暗所でSfMのトラッキングロストを防止
+
+
 ## アーキテクチャ
 
 ### プロジェクト構成
@@ -120,25 +207,34 @@ python main.py --cli input.mp4 -v
 ```
 360split/
 ├── main.py                  # エントリポイント（GUI/CLI）
-├── config.py                # 設定定数
+├── config.py                # 設定定数・データクラス定義
 ├── requirements.txt         # 依存パッケージ
+├── presets/                 # 環境別プリセット設定
+│   ├── outdoor_high_quality.json     # 屋外・高品質プリセット
+│   ├── indoor_robust_tracking.json   # 屋内・追跡重視プリセット
+│   └── mixed_adaptive.json           # 混合・適応型プリセット
 ├── core/                    # コアアルゴリズム
+│   ├── config_loader.py     # プリセット管理システム
 │   ├── accelerator.py       # ハードウェア抽象化レイヤ（MPS/CUDA/CPU自動検出）
 │   ├── video_loader.py      # ビデオ読み込み（HWデコード、LRUキャッシュ、プリフェッチ）
 │   ├── quality_evaluator.py # 品質評価（ラプラシアン鮮明度、露光、モーションブラー）
 │   ├── geometric_evaluator.py # 幾何学的評価（GRIC、特徴点マッチング、光線分散）
 │   ├── adaptive_selector.py # 適応的選択（SSIM、オプティカルフロー、カメラ運動量）
-│   └── keyframe_selector.py # 2段階パイプライン統合（メインエンジン）
+│   ├── keyframe_selector.py # 2段階パイプライン統合（メインエンジン）
+│   └── exceptions.py        # カスタム例外定義
 ├── processing/              # 360度画像処理
 │   ├── equirectangular.py   # Equirectangular ↔ Cubemap / Perspective変換
 │   ├── mask_processor.py    # 天底/天頂マスク、撮影機材マスク生成
 │   └── stitching.py         # 画像スティッチング（Fast/HQS/DMS 3モード）
 ├── gui/                     # PySide6 GUI
-│   ├── main_window.py       # メインウィンドウ、分析ワーカースレッド
+│   ├── main_window.py       # メインウィンドウ、UI統合
 │   ├── video_player.py      # 動画プレビュー、フレームナビゲーション
-│   ├── timeline_widget.py   # タイムラインUI、品質スコア可視化
-│   ├── keyframe_panel.py    # キーフレーム一覧、サムネイル表示
-│   └── settings_dialog.py   # 設定ダイアログ（4タブ構成）
+│   ├── timeline_widget.py   # タイムラインUI、pyqtgraphスコアグラフ
+│   ├── keyframe_panel.py    # キーフレーム詳細パネル
+│   ├── keyframe_list.py     # キーフレーム一覧、サムネイル表示
+│   ├── settings_dialog.py   # 設定ダイアログ（4タブ構成）
+│   ├── settings_panel.py    # 設定パネルコンポーネント
+│   └── workers.py           # バックグラウンド処理ワーカー（Stage1/2/Export）
 └── utils/
     └── logger.py            # ロギングユーティリティ
 ```
@@ -174,22 +270,24 @@ python main.py --cli input.mp4 -v
 
 ## 設定ファイル
 
-JSON形式の設定ファイルで各パラメータをカスタマイズできます。
+JSON形式の設定ファイルで各パラメータをカスタマイズできます。`config.py` にはデータクラスベースの設定が定義されており、JSON形式でオーバーライド可能です。
 
 ```json
 {
   "laplacian_threshold": 100.0,
   "motion_blur_threshold": 0.3,
   "softmax_beta": 5.0,
-  "gric_ratio_threshold": 0.8,
-  "min_feature_matches": 30,
-  "ssim_change_threshold": 0.85,
+  "gric_degeneracy_threshold": 0.85,
+  "min_feature_matches": 15,
+  "ssim_threshold": 0.85,
   "min_keyframe_interval": 5,
   "max_keyframe_interval": 60,
   "weight_sharpness": 0.30,
   "weight_exposure": 0.15,
   "weight_geometric": 0.30,
   "weight_content": 0.25,
+  "enable_polar_mask": true,
+  "mask_polar_ratio": 0.10,
   "output_image_format": "png",
   "output_jpeg_quality": 95
 }
@@ -197,16 +295,20 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
 
 ### 主要パラメータ
 
-| パラメータ | 説明 | 推奨値 |
+| パラメータ | 説明 | デフォルト値 |
 |---|---|---|
-| `laplacian_threshold` | ラプラシアン鮮明度の最小閾値。低いほどブレたフレームも許容 | 100.0 |
-| `ssim_change_threshold` | SSIMの変化閾値。低いほど大きな変化のみキーフレームとして採用 | 0.85 |
+| `laplacian_threshold` | ラプラシアン鮮明度の最小閾値（Stage 1）。低いほどブレたフレームも許容 | 100.0 |
+| `motion_blur_threshold` | モーションブラー許容閾値。高いほど動きのあるフレームも許容 | 0.3 |
+| `ssim_threshold` | SSIM変化検知閾値。低いほど大きな変化のみキーフレームとして採用 | 0.85 |
 | `min_keyframe_interval` | キーフレーム間の最小フレーム数 | 5 |
 | `max_keyframe_interval` | キーフレーム間の最大フレーム数（超過時は強制挿入） | 60 |
-| `weight_sharpness` | 鮮明度スコアの重み | 0.30 |
-| `weight_geometric` | 幾何学的スコアの重み | 0.30 |
-| `weight_content` | コンテンツ変化スコアの重み | 0.25 |
-| `weight_exposure` | 露光スコアの重み | 0.15 |
+| `weight_sharpness` | 鮮明度スコアの重み（α） | 0.30 |
+| `weight_geometric` | 幾何学的スコアの重み（β、GRIC） | 0.30 |
+| `weight_content` | コンテンツ変化スコアの重み（γ、SSIM） | 0.25 |
+| `weight_exposure` | 露光スコアの重み（δ） | 0.15 |
+| `gric_degeneracy_threshold` | GRIC縮退判定閾値。高いほど回転のみシーンを除外しやすい | 0.85 |
+| `enable_polar_mask` | 360度動画の天頂/天底マスク有効化 | true |
+| `mask_polar_ratio` | 天頂/天底マスク比率（上下の何%をマスクするか） | 0.10 |
 
 
 ## 出力

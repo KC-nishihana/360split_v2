@@ -32,6 +32,7 @@ from gui.timeline_widget import TimelineWidget
 from gui.settings_panel import SettingsPanel
 from gui.settings_dialog import SettingsDialog
 from gui.keyframe_list import KeyframeListWidget
+from gui.export_dialog import ExportDialog
 from gui.workers import Stage1Worker, Stage2Worker, FullAnalysisWorker, ExportWorker, FrameScoreData
 
 from config import KeyframeConfig, NormalizationConfig
@@ -509,107 +510,58 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "エクスポートするキーフレームがありません")
             return
 
-        # 設定ファイルから出力設定を読み込む
-        settings_file = Path.home() / ".360split" / "settings.json"
+        # エクスポートダイアログを表示
+        dlg = ExportDialog(self, num_keyframes=len(selected))
+        if not dlg.exec():
+            return
 
-        # デフォルト値
-        output_format = 'png'
-        jpeg_quality = 95
-        naming_prefix = 'keyframe'
-        default_output_dir = str(Path.home() / "360split_output")
-
-        # 360度処理設定のデフォルト値
-        enable_equirect = False
-        equirect_width = 4096
-        equirect_height = 2048
-        enable_polar_mask = False
-        mask_polar_ratio = 0.10
-
-        # マスク処理設定のデフォルト値
-        enable_nadir_mask = False
-        nadir_mask_radius = 100
-        enable_equipment_detection = False
-        mask_dilation_size = 15
-
-        if settings_file.exists():
-            try:
-                with open(settings_file, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-
-                    # 出力設定
-                    output_format = settings.get('output_image_format', 'png')
-                    jpeg_quality = settings.get('output_jpeg_quality', 95)
-                    naming_prefix = settings.get('naming_prefix', 'keyframe')
-                    default_output_dir = settings.get('output_directory', default_output_dir)
-
-                    # 360度処理設定
-                    equirect_width = settings.get('equirect_width', 4096)
-                    equirect_height = settings.get('equirect_height', 2048)
-                    enable_polar_mask = settings.get('enable_polar_mask', False)
-                    mask_polar_ratio = settings.get('mask_polar_ratio', 0.10)
-
-                    # マスク処理設定
-                    enable_nadir_mask = settings.get('enable_nadir_mask', False)
-                    nadir_mask_radius = settings.get('nadir_mask_radius', 100)
-                    enable_equipment_detection = settings.get('enable_equipment_detection', False)
-                    mask_dilation_size = settings.get('mask_dilation_size', 15)
-
-            except Exception as e:
-                logger.warning(f"設定読み込みエラー（デフォルト値を使用）: {e}")
-
-        # 360度処理またはマスク処理が有効な場合は確認
-        enable_equirect = enable_polar_mask or (equirect_width != 4096 or equirect_height != 2048)
-        processing_enabled = enable_equirect or enable_nadir_mask or enable_equipment_detection
-
-        if processing_enabled:
-            msg = "以下の処理を適用してエクスポートします：\n\n"
-            if enable_equirect:
-                msg += f"✓ 360度処理（{equirect_width}x{equirect_height}）\n"
-            if enable_polar_mask:
-                msg += f"✓ ポーラーマスク（比率: {mask_polar_ratio:.2f}）\n"
-            if enable_nadir_mask:
-                msg += f"✓ ナディアマスク（半径: {nadir_mask_radius}）\n"
-            if enable_equipment_detection:
-                msg += f"✓ 装備検出マスク（膨張: {mask_dilation_size}）\n"
-            msg += "\n処理を実行しますか？"
-
-            reply = QMessageBox.question(
-                self, "処理確認", msg,
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        export_dir = QFileDialog.getExistingDirectory(
-            self, "エクスポート先を選択",
-            default_output_dir
-        )
+        s = dlg.get_settings()
+        export_dir = s["output_dir"]
         if not export_dir:
             return
 
         self._export_worker = ExportWorker(
             self.video_path, selected, export_dir,
-            format=output_format,
-            jpeg_quality=jpeg_quality,
-            prefix=naming_prefix,
+            format=s["output_format"],
+            jpeg_quality=s["jpeg_quality"],
+            prefix=s["prefix"],
             # 360度処理設定
-            enable_equirect=enable_equirect,
-            equirect_width=equirect_width,
-            equirect_height=equirect_height,
-            enable_polar_mask=enable_polar_mask,
-            mask_polar_ratio=mask_polar_ratio,
+            enable_equirect=s["enable_equirect"],
+            equirect_width=s["equirect_width"],
+            equirect_height=s["equirect_height"],
+            enable_polar_mask=s["enable_polar_mask"],
+            mask_polar_ratio=s["mask_polar_ratio"],
+            # Cubemap 出力
+            enable_cubemap=s["enable_cubemap"],
+            cubemap_face_size=s["cubemap_face_size"],
+            # Perspective 出力
+            enable_perspective=s["enable_perspective"],
+            perspective_fov=s["perspective_fov"],
+            perspective_yaw_list=s["perspective_yaw_list"],
+            perspective_pitch_list=s["perspective_pitch_list"],
+            perspective_size=tuple(s["perspective_size"]),
             # マスク処理設定
-            enable_nadir_mask=enable_nadir_mask,
-            nadir_mask_radius=nadir_mask_radius,
-            enable_equipment_detection=enable_equipment_detection,
-            mask_dilation_size=mask_dilation_size
+            enable_nadir_mask=s["enable_nadir_mask"],
+            nadir_mask_radius=s["nadir_mask_radius"],
+            enable_equipment_detection=s["enable_equipment_detection"],
+            mask_dilation_size=s["mask_dilation_size"]
         )
         self._export_worker.progress.connect(self._on_progress)
         self._export_worker.finished.connect(self._on_export_finished)
         self._export_worker.error.connect(self._on_error)
 
+        # 出力内容のサマリをステータスバーに表示
+        modes = []
+        if s["enable_cubemap"]:
+            modes.append(f"Cubemap({s['cubemap_face_size']}px)")
+        if s["enable_perspective"]:
+            ny = len(s["perspective_yaw_list"])
+            np_ = len(s["perspective_pitch_list"])
+            modes.append(f"Perspective({ny}×{np_}方向)")
+        mode_str = " + ".join(modes) if modes else "元画像のみ"
+
         self._progress_bar.setVisible(True)
-        self.statusBar().showMessage("エクスポート中...")
+        self.statusBar().showMessage(f"エクスポート中... [{mode_str}]")
         self._export_worker.start()
 
     def _on_export_finished(self, count: int):

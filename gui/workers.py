@@ -416,6 +416,15 @@ class ExportWorker(QThread):
                  equirect_height: int = 2048,
                  enable_polar_mask: bool = False,
                  mask_polar_ratio: float = 0.10,
+                 # Cubemap 出力設定
+                 enable_cubemap: bool = False,
+                 cubemap_face_size: int = 1024,
+                 # Perspective 出力設定
+                 enable_perspective: bool = False,
+                 perspective_fov: float = 90.0,
+                 perspective_yaw_list: List[float] = None,
+                 perspective_pitch_list: List[float] = None,
+                 perspective_size: tuple = (1024, 1024),
                  # マスク処理設定
                  enable_nadir_mask: bool = False,
                  nadir_mask_radius: int = 100,
@@ -436,6 +445,17 @@ class ExportWorker(QThread):
         self.equirect_height = equirect_height
         self.enable_polar_mask = enable_polar_mask
         self.mask_polar_ratio = mask_polar_ratio
+
+        # Cubemap 出力設定
+        self.enable_cubemap = enable_cubemap
+        self.cubemap_face_size = cubemap_face_size
+
+        # Perspective 出力設定
+        self.enable_perspective = enable_perspective
+        self.perspective_fov = perspective_fov
+        self.perspective_yaw_list = perspective_yaw_list or [0.0, 90.0, 180.0, -90.0]
+        self.perspective_pitch_list = perspective_pitch_list or [0.0]
+        self.perspective_size = perspective_size
 
         # マスク処理設定
         self.enable_nadir_mask = enable_nadir_mask
@@ -462,7 +482,8 @@ class ExportWorker(QThread):
             equirect_processor = None
             mask_processor = None
 
-            if self.enable_equirect:
+            needs_equirect = self.enable_equirect or self.enable_cubemap or self.enable_perspective
+            if needs_equirect:
                 try:
                     from processing.equirectangular import EquirectangularProcessor
                     equirect_processor = EquirectangularProcessor()
@@ -470,6 +491,8 @@ class ExportWorker(QThread):
                 except ImportError as e:
                     logger.warning(f"EquirectangularProcessor のインポートに失敗: {e}")
                     self.enable_equirect = False
+                    self.enable_cubemap = False
+                    self.enable_perspective = False
 
             if self.enable_nadir_mask or self.enable_equipment_detection:
                 try:
@@ -566,6 +589,49 @@ class ExportWorker(QThread):
                         cv2.imwrite(str(filepath), processed_frame)
 
                     exported += 1
+
+                    # --- Cubemap 出力 ---
+                    if self.enable_cubemap and equirect_processor:
+                        try:
+                            cubemap_dir = output_path / "cubemap" / f"frame_{frame_idx:06d}"
+                            cubemap_dir.mkdir(parents=True, exist_ok=True)
+                            faces = equirect_processor.to_cubemap(
+                                processed_frame, self.cubemap_face_size
+                            )
+                            for face_name, face_img in faces.items():
+                                face_path = cubemap_dir / f"{face_name}.{ext}"
+                                if ext == 'jpg':
+                                    cv2.imwrite(str(face_path), face_img,
+                                                [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                                else:
+                                    cv2.imwrite(str(face_path), face_img)
+                            logger.debug(f"Cubemap 出力: {cubemap_dir}")
+                        except Exception as e:
+                            logger.warning(f"Cubemap 出力エラー（フレーム {frame_idx}）: {e}")
+
+                    # --- Perspective 出力 ---
+                    if self.enable_perspective and equirect_processor:
+                        try:
+                            persp_dir = output_path / "perspective" / f"frame_{frame_idx:06d}"
+                            persp_dir.mkdir(parents=True, exist_ok=True)
+                            for yaw in self.perspective_yaw_list:
+                                for pitch in self.perspective_pitch_list:
+                                    persp_img = equirect_processor.to_perspective(
+                                        processed_frame,
+                                        yaw=yaw, pitch=pitch,
+                                        fov=self.perspective_fov,
+                                        output_size=self.perspective_size
+                                    )
+                                    name = f"y{yaw:+.0f}_p{pitch:+.0f}.{ext}"
+                                    persp_path = persp_dir / name
+                                    if ext == 'jpg':
+                                        cv2.imwrite(str(persp_path), persp_img,
+                                                    [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                                    else:
+                                        cv2.imwrite(str(persp_path), persp_img)
+                            logger.debug(f"Perspective 出力: {persp_dir}")
+                        except Exception as e:
+                            logger.warning(f"Perspective 出力エラー（フレーム {frame_idx}）: {e}")
 
                 self.progress.emit(i + 1, total,
                                    f"エクスポート: {i+1}/{total}")

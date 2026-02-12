@@ -53,6 +53,16 @@ class VideoPlayerWidget(QWidget):
         self.current_frame: Optional[np.ndarray] = None
         self.video_path: Optional[str] = None
 
+        # ステレオ（OSV）対応
+        self.is_stereo: bool = False
+        self.cap_l: Optional[cv2.VideoCapture] = None
+        self.cap_r: Optional[cv2.VideoCapture] = None
+        self.stereo_left_path: Optional[str] = None
+        self.stereo_right_path: Optional[str] = None
+        self.current_frame_l: Optional[np.ndarray] = None
+        self.current_frame_r: Optional[np.ndarray] = None
+        self.stereo_display_mode: str = "side_by_side"  # side_by_side, anaglyph, toggle, mono_left, mono_right
+
         # 再生制御
         self.is_playing: bool = False
         self.playback_speed: float = 1.0
@@ -129,6 +139,22 @@ class VideoPlayerWidget(QWidget):
         self.grid_toggle.toggled.connect(self._on_grid_toggle)
         ctrl.addWidget(self.grid_toggle)
 
+        # ステレオ表示モード切り替え
+        ctrl.addWidget(QLabel("ステレオ:"))
+        self.stereo_mode_combo = QComboBox()
+        self.stereo_mode_combo.addItems([
+            "Side-by-Side",
+            "アナグリフ",
+            "左のみ",
+            "右のみ",
+            "L/R切替"
+        ])
+        self.stereo_mode_combo.setCurrentIndex(0)
+        self.stereo_mode_combo.setFixedWidth(120)
+        self.stereo_mode_combo.currentIndexChanged.connect(self._on_stereo_mode_changed)
+        self.stereo_mode_combo.setVisible(False)  # 初期は非表示
+        ctrl.addWidget(self.stereo_mode_combo)
+
         self.mark_button = QPushButton("★ マーク")
         self.mark_button.setFixedWidth(80)
         self.mark_button.clicked.connect(lambda: self.keyframe_marked.emit(self.current_frame_idx))
@@ -189,6 +215,10 @@ class VideoPlayerWidget(QWidget):
         if self.cap:
             self.cap.release()
 
+        # ステレオモードをリセット
+        self.is_stereo = False
+        self.stereo_mode_combo.setVisible(False)
+
         loader = VideoLoader()
         metadata = loader.load(video_path)
 
@@ -209,6 +239,64 @@ class VideoPlayerWidget(QWidget):
 
         self._load_and_display_frame(0)
         logger.info(f"ビデオ読み込み: {video_path}")
+        return metadata
+
+    def load_video_stereo(self, left_path: str, right_path: str):
+        """
+        ステレオビデオを読み込む（OSV用）
+
+        Parameters
+        ----------
+        left_path : str
+            左目ストリームのパス
+        right_path : str
+            右目ストリームのパス
+
+        Returns
+        -------
+        VideoMetadata
+            メタデータ（左目ストリームベース）
+        """
+        from core.video_loader import VideoLoader, VideoMetadata
+
+        # 既存キャプチャをクリーンアップ
+        if self.cap:
+            self.cap.release()
+        if self.cap_l:
+            self.cap_l.release()
+        if self.cap_r:
+            self.cap_r.release()
+
+        # メタデータ取得（左目ストリームから）
+        loader = VideoLoader()
+        metadata = loader.load(left_path)
+
+        # ステレオキャプチャを開く
+        self.cap_l = cv2.VideoCapture(left_path)
+        self.cap_r = cv2.VideoCapture(right_path)
+        self.stereo_left_path = left_path
+        self.stereo_right_path = right_path
+        self.is_stereo = True
+
+        self.video_path = f"{left_path} (Stereo)"
+        self.total_frames = metadata.frame_count
+        self.fps = metadata.fps
+        self.current_frame_idx = 0
+        self._pan_offset_x = 0
+
+        # Equirectangular 判定
+        ratio = metadata.width / metadata.height if metadata.height > 0 else 1
+        self._is_equirectangular = (1.9 <= ratio <= 2.1)
+
+        self.frame_slider.setMaximum(max(0, self.total_frames - 1))
+        self.frame_spinbox.setMaximum(max(0, self.total_frames - 1))
+        self.frame_count_label.setText(f"/ {self.total_frames}")
+
+        # ステレオモードコンボボックスを表示
+        self.stereo_mode_combo.setVisible(True)
+
+        self._load_and_display_frame(0)
+        logger.info(f"ステレオビデオ読み込み: L={left_path}, R={right_path}")
         return metadata
 
     def set_keyframe_indices(self, indices):
@@ -257,21 +345,44 @@ class VideoPlayerWidget(QWidget):
     # ==================================================================
 
     def _load_and_display_frame(self, frame_idx: int):
-        if not self.cap:
-            return
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
-            return
+        if self.is_stereo:
+            # ステレオモード
+            if not self.cap_l or not self.cap_r:
+                return
 
-        self.current_frame = frame
-        self.current_frame_idx = frame_idx
-        self._display_frame(frame)
+            self.cap_l.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            self.cap_r.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret_l, frame_l = self.cap_l.read()
+            ret_r, frame_r = self.cap_r.read()
+
+            if not ret_l or not ret_r or frame_l is None or frame_r is None:
+                return
+
+            self.current_frame_l = frame_l
+            self.current_frame_r = frame_r
+            self.current_frame = frame_l  # デフォルトは左
+            self.current_frame_idx = frame_idx
+            self._display_frame_stereo(frame_l, frame_r)
+        else:
+            # 通常のモノラルモード
+            if not self.cap:
+                return
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = self.cap.read()
+            if not ret or frame is None:
+                return
+
+            self.current_frame = frame
+            self.current_frame_idx = frame_idx
+            self._display_frame(frame)
+
         self._update_frame_info(frame_idx)
         self.frame_changed.emit(frame_idx)
 
     def _redraw_current(self):
-        if self.current_frame is not None:
+        if self.is_stereo and self.current_frame_l is not None and self.current_frame_r is not None:
+            self._display_frame_stereo(self.current_frame_l, self.current_frame_r)
+        elif self.current_frame is not None:
             self._display_frame(self.current_frame)
 
     def _display_frame(self, frame: np.ndarray):
@@ -320,6 +431,163 @@ class VideoPlayerWidget(QWidget):
             painter.end()
 
         self.frame_label.setPixmap(pixmap)
+
+    def _display_frame_stereo(self, frame_l: np.ndarray, frame_r: np.ndarray):
+        """
+        ステレオフレームを表示
+
+        Parameters
+        ----------
+        frame_l : np.ndarray
+            左目フレーム
+        frame_r : np.ndarray
+            右目フレーム
+        """
+        # ステレオ表示モードに応じて処理
+        mode_index = self.stereo_mode_combo.currentIndex()
+
+        if mode_index == 0:  # Side-by-Side
+            display = self._create_side_by_side(frame_l, frame_r)
+        elif mode_index == 1:  # アナグリフ
+            display = self._create_anaglyph(frame_l, frame_r)
+        elif mode_index == 2:  # 左のみ
+            display = frame_l.copy()
+        elif mode_index == 3:  # 右のみ
+            display = frame_r.copy()
+        elif mode_index == 4:  # L/R切替（時間ベース）
+            # 500ms ごとに切り替え
+            import time
+            toggle = int(time.time() * 2) % 2
+            display = frame_l.copy() if toggle == 0 else frame_r.copy()
+        else:
+            display = frame_l.copy()
+
+        # 360° パンオフセット適用
+        if self._is_equirectangular and self._pan_offset_x != 0:
+            h, w = display.shape[:2]
+            shift = self._pan_offset_x % w
+            display = np.roll(display, shift, axis=1)
+
+        # グリッドオーバーレイ
+        if self.show_grid:
+            display = self._draw_grid(display)
+
+        # 表示処理
+        label_w = self.frame_label.width() - 2
+        label_h = self.frame_label.height() - 2
+        h, w = display.shape[:2]
+
+        # リサイズ
+        scale = min(label_w / w, label_h / h, 1.0)
+        tw, th = int(w * scale), int(h * scale)
+        if scale < 0.95:
+            display = cv2.resize(display, (tw, th), interpolation=cv2.INTER_AREA)
+
+        # BGR→RGB
+        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        rgb = np.ascontiguousarray(rgb)
+        dh, dw, _ = rgb.shape
+        qimg = QImage(rgb.data, dw, dh, 3 * dw, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+
+        # キーフレームインジケータをオーバーレイ
+        if self.current_frame_idx in self._keyframe_set:
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setBrush(QColor(0, 180, 0, 180))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(dw - 140, 8, 130, 28, 6, 6)
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            font = QFont("sans-serif", 12, QFont.Bold)
+            painter.setFont(font)
+            painter.drawText(dw - 135, 10, 120, 24, Qt.AlignCenter, "✅ Keyframe")
+            painter.end()
+
+        self.frame_label.setPixmap(pixmap)
+
+    def _create_side_by_side(self, frame_l: np.ndarray, frame_r: np.ndarray) -> np.ndarray:
+        """
+        Side-by-Side 表示を作成
+
+        Parameters
+        ----------
+        frame_l : np.ndarray
+            左目フレーム
+        frame_r : np.ndarray
+            右目フレーム
+
+        Returns
+        -------
+        np.ndarray
+            並列表示されたフレーム
+        """
+        # 高さを揃える
+        h_l, w_l = frame_l.shape[:2]
+        h_r, w_r = frame_r.shape[:2]
+
+        target_h = min(h_l, h_r)
+
+        # 左をリサイズ
+        if h_l != target_h:
+            scale = target_h / h_l
+            frame_l = cv2.resize(frame_l, (int(w_l * scale), target_h), interpolation=cv2.INTER_AREA)
+
+        # 右をリサイズ
+        if h_r != target_h:
+            scale = target_h / h_r
+            frame_r = cv2.resize(frame_r, (int(w_r * scale), target_h), interpolation=cv2.INTER_AREA)
+
+        # 水平に結合
+        combined = np.hstack([frame_l, frame_r])
+
+        # 中央に境界線を描画
+        mid_x = frame_l.shape[1]
+        cv2.line(combined, (mid_x, 0), (mid_x, combined.shape[0]), (0, 255, 0), 2)
+
+        # ラベルを追加
+        cv2.putText(combined, "LEFT", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                   1.0, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(combined, "RIGHT", (mid_x + 10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                   1.0, (0, 255, 0), 2, cv2.LINE_AA)
+
+        return combined
+
+    def _create_anaglyph(self, frame_l: np.ndarray, frame_r: np.ndarray) -> np.ndarray:
+        """
+        アナグリフ（赤青メガネ用）表示を作成
+
+        Parameters
+        ----------
+        frame_l : np.ndarray
+            左目フレーム
+        frame_r : np.ndarray
+            右目フレーム
+
+        Returns
+        -------
+        np.ndarray
+            アナグリフ表示されたフレーム
+        """
+        # サイズを揃える
+        h_l, w_l = frame_l.shape[:2]
+        h_r, w_r = frame_r.shape[:2]
+
+        if (h_l, w_l) != (h_r, w_r):
+            # 右を左のサイズにリサイズ
+            frame_r = cv2.resize(frame_r, (w_l, h_l), interpolation=cv2.INTER_AREA)
+
+        # グレースケールに変換
+        gray_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2GRAY)
+        gray_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
+
+        # アナグリフ作成
+        # 赤チャンネルに左目、青・緑チャンネルに右目
+        anaglyph = np.zeros_like(frame_l)
+        anaglyph[:, :, 2] = gray_l  # Red = Left
+        anaglyph[:, :, 0] = gray_r  # Blue = Right
+        anaglyph[:, :, 1] = gray_r  # Green = Right
+
+        return anaglyph
 
     def _draw_grid(self, frame: np.ndarray) -> np.ndarray:
         """Equirectangular グリッドを描画"""
@@ -411,6 +679,12 @@ class VideoPlayerWidget(QWidget):
         self.grid_toggle.setText("Grid ON" if checked else "Grid OFF")
         self._redraw_current()
 
+    def _on_stereo_mode_changed(self, index: int):
+        """ステレオ表示モード変更時の処理"""
+        if self.is_stereo:
+            self._redraw_current()
+            logger.debug(f"ステレオ表示モード変更: {self.stereo_mode_combo.currentText()}")
+
     # ==================================================================
     # クリーンアップ
     # ==================================================================
@@ -420,4 +694,8 @@ class VideoPlayerWidget(QWidget):
             self.play_timer.stop()
         if self.cap:
             self.cap.release()
+        if self.cap_l:
+            self.cap_l.release()
+        if self.cap_r:
+            self.cap_r.release()
         super().closeEvent(event)

@@ -7,13 +7,14 @@ OpenCVを使用したビデオフレーム抽出とメタデータ管理。
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
 from collections import OrderedDict
 import threading
 import queue
 import platform
 import time
+import subprocess
 
 from core.accelerator import get_accelerator
 
@@ -692,6 +693,300 @@ class VideoLoader:
             self._cap = None
             self._metadata = None
             logger.info("ビデオファイルをクローズしました")
+
+    def __del__(self):
+        """デストラクタ"""
+        self.close()
+
+
+# ==============================================================================
+# OSV (Omnidirectional Stereo Video) サポート
+# ==============================================================================
+
+class DualVideoLoader:
+    """
+    OSVファイル対応デュアルストリームローダー
+
+    .osv ファイルから左右（Left/Right）の映像ストリームを分離し、
+    フレーム単位で完全に同期して読み込む。既存の VideoLoader と
+    互換性のあるインターフェースを提供。
+
+    処理フロー:
+    1. ffmpeg で .osv を left_eye.mp4 / right_eye.mp4 に分離
+    2. 2つの VideoCapture で同期読み込み
+    3. キーフレーム判定は Left 画像を代表として使用
+    4. エクスポート時は L/R ペアで保存
+
+    Attributes:
+    -----------
+    osv_path : str
+        元の .osv ファイルパス
+    left_path : str
+        分離後の左目映像パス
+    right_path : str
+        分離後の右目映像パス
+    """
+
+    def __init__(self, temp_dir: str = "temp_streams"):
+        """
+        初期化
+
+        Parameters:
+        -----------
+        temp_dir : str
+            一時ストリーム保存ディレクトリ
+        """
+        self.osv_path: Optional[str] = None
+        self.left_path: Optional[str] = None
+        self.right_path: Optional[str] = None
+        self.temp_dir = Path(temp_dir)
+
+        self.cap_l: Optional[cv2.VideoCapture] = None
+        self.cap_r: Optional[cv2.VideoCapture] = None
+        self._metadata: Optional[VideoMetadata] = None
+        self._current_frame_idx = -1
+
+        # フレームバッファ（L/R 両方をキャッシュ）
+        self._frame_buffer_l = FrameBuffer(max_size=100)
+        self._frame_buffer_r = FrameBuffer(max_size=100)
+
+    def load(self, osv_path: str) -> VideoMetadata:
+        """
+        OSV ファイルを読み込み、左右ストリームに分離
+
+        Parameters:
+        -----------
+        osv_path : str
+            .osv ファイルパス
+
+        Returns:
+        --------
+        VideoMetadata
+            左目ストリームのメタデータ（代表として使用）
+
+        Raises:
+        -------
+        FileNotFoundError
+            OSV ファイルが見つからない場合
+        RuntimeError
+            ストリーム分離または読み込みに失敗した場合
+        """
+        osv_path_obj = Path(osv_path)
+        if not osv_path_obj.exists():
+            raise FileNotFoundError(f"OSV ファイルが見つかりません: {osv_path}")
+
+        self.osv_path = str(osv_path_obj)
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+        # 一時ファイルパス
+        stem = osv_path_obj.stem
+        self.left_path = str(self.temp_dir / f"{stem}_left_eye.mp4")
+        self.right_path = str(self.temp_dir / f"{stem}_right_eye.mp4")
+
+        # ストリーム分離（キャッシュがない場合のみ）
+        if not Path(self.left_path).exists() or not Path(self.right_path).exists():
+            logger.info(f"OSV ストリームを分離中: {osv_path}")
+            self._split_osv_streams()
+
+        # 左右のストリームを開く
+        self.cap_l = cv2.VideoCapture(self.left_path)
+        self.cap_r = cv2.VideoCapture(self.right_path)
+
+        if not self.cap_l.isOpened() or not self.cap_r.isOpened():
+            raise RuntimeError(f"OSV ストリームを開けません: {osv_path}")
+
+        # メタデータを取得（左目を代表として使用）
+        fps = self.cap_l.get(cv2.CAP_PROP_FPS)
+        frame_count = int(self.cap_l.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(self.cap_l.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap_l.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration = frame_count / fps if fps > 0 else 0
+
+        # 右目のフレーム数と一致確認
+        frame_count_r = int(self.cap_r.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count != frame_count_r:
+            logger.warning(
+                f"左右のフレーム数が不一致: L={frame_count}, R={frame_count_r}"
+            )
+
+        self._metadata = VideoMetadata(
+            fps=fps,
+            frame_count=frame_count,
+            width=width,
+            height=height,
+            duration=duration,
+            codec="osv_dual_stream"
+        )
+
+        logger.info(
+            f"OSV 読み込み完了: {osv_path_obj.name} | "
+            f"{width}x{height} @ {fps:.2f}fps | "
+            f"{frame_count}フレーム (L/R ペア)"
+        )
+
+        return self._metadata
+
+    def _split_osv_streams(self):
+        """
+        ffmpeg を使用して OSV ファイルを左右ストリームに分離
+
+        Raises:
+        -------
+        RuntimeError
+            ffmpeg 実行に失敗した場合
+        """
+        import subprocess
+
+        try:
+            # OSV ファイルは通常、ストリーム0=Left, ストリーム1=Right
+            cmd = [
+                "ffmpeg", "-y", "-i", self.osv_path,
+                "-map", "0:0", "-c", "copy", self.left_path,
+                "-map", "0:1", "-c", "copy", self.right_path
+            ]
+
+            logger.debug(f"ffmpeg コマンド: {' '.join(cmd)}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            logger.info(f"OSV ストリーム分離完了: L={self.left_path}, R={self.right_path}")
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"ffmpeg エラー: {e.stderr}")
+            raise RuntimeError(f"OSV ストリーム分離に失敗: {e.stderr}")
+        except FileNotFoundError:
+            raise RuntimeError(
+                "ffmpeg が見つかりません。ffmpeg をインストールしてください。\n"
+                "macOS: brew install ffmpeg\n"
+                "Ubuntu: sudo apt install ffmpeg\n"
+                "Windows: https://ffmpeg.org/download.html"
+            )
+
+    def get_frame_pair(self, index: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        左右のフレームペアを同期して取得
+
+        Parameters:
+        -----------
+        index : int
+            フレーム番号（0ベース）
+
+        Returns:
+        --------
+        tuple[np.ndarray, np.ndarray] or (None, None)
+            (左目フレーム, 右目フレーム) のタプル
+        """
+        if self.cap_l is None or self.cap_r is None:
+            raise RuntimeError("OSV が読み込まれていません")
+
+        if index < 0 or index >= self._metadata.frame_count:
+            logger.warning(f"フレーム番号が範囲外です: {index}")
+            return None, None
+
+        # キャッシュから確認
+        cached_l = self._frame_buffer_l.get(index)
+        cached_r = self._frame_buffer_r.get(index)
+        if cached_l is not None and cached_r is not None:
+            self._current_frame_idx = index
+            return cached_l, cached_r
+
+        # 左右を同期して読み込み
+        self.cap_l.set(cv2.CAP_PROP_POS_FRAMES, index)
+        self.cap_r.set(cv2.CAP_PROP_POS_FRAMES, index)
+
+        ret_l, frame_l = self.cap_l.read()
+        ret_r, frame_r = self.cap_r.read()
+
+        if not ret_l or not ret_r:
+            logger.warning(f"フレームペア読み込み失敗: {index}")
+            return None, None
+
+        # キャッシュに保存
+        self._frame_buffer_l.put(index, frame_l.copy())
+        self._frame_buffer_r.put(index, frame_r.copy())
+        self._current_frame_idx = index
+
+        return frame_l, frame_r
+
+    def get_frame(self, index: int) -> Optional[np.ndarray]:
+        """
+        左目フレームのみを取得（VideoLoader 互換）
+
+        Parameters:
+        -----------
+        index : int
+            フレーム番号
+
+        Returns:
+        --------
+        np.ndarray or None
+            左目フレーム
+        """
+        frame_l, _ = self.get_frame_pair(index)
+        return frame_l
+
+    def get_metadata(self) -> Optional[VideoMetadata]:
+        """メタデータを取得"""
+        return self._metadata
+
+    @property
+    def fps(self) -> float:
+        """フレームレート"""
+        return self._metadata.fps if self._metadata else 0
+
+    @property
+    def frame_count(self) -> int:
+        """総フレーム数"""
+        return self._metadata.frame_count if self._metadata else 0
+
+    @property
+    def width(self) -> int:
+        """フレーム幅"""
+        return self._metadata.width if self._metadata else 0
+
+    @property
+    def height(self) -> int:
+        """フレーム高さ"""
+        return self._metadata.height if self._metadata else 0
+
+    @property
+    def duration(self) -> float:
+        """ビデオ総長（秒）"""
+        return self._metadata.duration if self._metadata else 0
+
+    @property
+    def is_stereo(self) -> bool:
+        """ステレオ（OSV）であるかを判定"""
+        return True
+
+    def close(self):
+        """リソースを解放"""
+        if self.cap_l is not None:
+            self.cap_l.release()
+            self.cap_l = None
+
+        if self.cap_r is not None:
+            self.cap_r.release()
+            self.cap_r = None
+
+        self._frame_buffer_l.clear()
+        self._frame_buffer_r.clear()
+        self._metadata = None
+        logger.info("OSV ファイルをクローズしました")
+
+    def __enter__(self):
+        """コンテキストマネージャエントリ"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """コンテキストマネージャ終了"""
+        self.close()
+        return False
 
     def __del__(self):
         """デストラクタ"""

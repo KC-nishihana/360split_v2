@@ -465,7 +465,18 @@ class ExportWorker(QThread):
         self.enable_equipment_detection = enable_equipment_detection
         self.mask_dilation_size = mask_dilation_size
 
+        # ステレオ（OSV）設定
+        self.is_stereo = False
+        self.stereo_left_path = None
+        self.stereo_right_path = None
+
         self._is_running = True
+
+    def set_stereo_paths(self, left_path: str, right_path: str):
+        """ステレオペア出力用のパスを設定"""
+        self.is_stereo = True
+        self.stereo_left_path = left_path
+        self.stereo_right_path = right_path
 
     def stop(self):
         self._is_running = False
@@ -475,10 +486,23 @@ class ExportWorker(QThread):
             output_path = Path(self.output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
 
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                self.error.emit(f"ビデオを開けません: {self.video_path}")
-                return
+            # ステレオ判定
+            if self.is_stereo and self.stereo_left_path and self.stereo_right_path:
+                # ステレオペア出力モード
+                cap_l = cv2.VideoCapture(self.stereo_left_path)
+                cap_r = cv2.VideoCapture(self.stereo_right_path)
+                if not cap_l.isOpened() or not cap_r.isOpened():
+                    self.error.emit(f"ステレオストリームを開けません")
+                    return
+                logger.info("ステレオペア出力モードで実行")
+                cap = None  # 単眼キャプチャは使用しない
+            else:
+                # 通常の単眼モード
+                cap = cv2.VideoCapture(self.video_path)
+                if not cap.isOpened():
+                    self.error.emit(f"ビデオを開けません: {self.video_path}")
+                    return
+                cap_l = cap_r = None
 
             # 360度処理とマスク処理のプロセッサを初期化
             equirect_processor = None
@@ -513,10 +537,32 @@ class ExportWorker(QThread):
                 if not self._is_running:
                     break
 
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
+                # フレーム読み込み（ステレオ/単眼）
+                if self.is_stereo:
+                    # ステレオペア読み込み
+                    cap_l.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    cap_r.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret_l, frame_l = cap_l.read()
+                    ret_r, frame_r = cap_r.read()
 
-                if ret and frame is not None:
+                    if not ret_l or not ret_r or frame_l is None or frame_r is None:
+                        logger.warning(f"ステレオフレーム読み込み失敗: {frame_idx}")
+                        continue
+
+                    frames_to_process = [(frame_l, '_L'), (frame_r, '_R')]
+                else:
+                    # 単眼読み込み
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, frame = cap.read()
+
+                    if not ret or frame is None:
+                        logger.warning(f"フレーム読み込み失敗: {frame_idx}")
+                        continue
+
+                    frames_to_process = [(frame, '')]
+
+                # 各フレーム（L/R または単眼）を処理
+                for frame, suffix in frames_to_process:
                     processed_frame = frame
 
                     # 360度処理を適用
@@ -579,9 +625,9 @@ class ExportWorker(QThread):
                         except Exception as e:
                             logger.warning(f"マスク処理エラー（フレーム {frame_idx}）: {e}")
 
-                    # ファイルを保存
+                    # ファイルを保存（ステレオの場合は _L / _R サフィックス付き）
                     ext = 'jpg' if self.format in ('jpg', 'jpeg') else self.format
-                    filename = f"{self.prefix}_{frame_idx:06d}.{ext}"
+                    filename = f"{self.prefix}_{frame_idx:06d}{suffix}.{ext}"
                     filepath = output_path / filename
 
                     if ext == 'jpg':
@@ -655,7 +701,16 @@ class ExportWorker(QThread):
                 self.progress.emit(i + 1, total,
                                    f"エクスポート: {i+1}/{total}")
 
-            cap.release()
+            # キャプチャのクリーンアップ
+            if self.is_stereo:
+                if cap_l is not None:
+                    cap_l.release()
+                if cap_r is not None:
+                    cap_r.release()
+            else:
+                if cap is not None:
+                    cap.release()
+
             self.finished.emit(exported)
 
         except Exception as e:

@@ -565,6 +565,32 @@ class ExportWorker(QThread):
                 for frame, suffix in frames_to_process:
                     processed_frame = frame
 
+                    # ステレオの場合はスティッチ未処理のため分割処理をスキップ
+                    if self.is_stereo:
+                        # パノラマ画像のみを L/ または R/ フォルダに保存
+                        output_subdir = output_path / suffix.strip('_')  # 'L' or 'R'
+                        output_subdir.mkdir(parents=True, exist_ok=True)
+
+                        # ファイル名にサフィックスなし
+                        filename = f"{self.prefix}_{frame_idx:06d}.{ext}"
+                        filepath = output_subdir / filename
+
+                        if ext == 'jpg':
+                            saved = write_image(
+                                filepath,
+                                processed_frame,
+                                [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+                            )
+                        else:
+                            saved = write_image(filepath, processed_frame)
+
+                        if not saved:
+                            logger.warning(f"保存失敗（フレーム {frame_idx}{suffix}）: {filepath}")
+                            continue
+
+                        exported += 1
+                        continue  # ステレオの場合はここで次のフレームへ
+
                     # 360度処理を適用
                     if self.enable_equirect and equirect_processor:
                         try:
@@ -648,13 +674,16 @@ class ExportWorker(QThread):
                     # --- Cubemap 出力 ---
                     if self.enable_cubemap and equirect_processor:
                         try:
-                            cubemap_dir = output_path / "cubemap" / f"frame_{frame_idx:06d}"
-                            cubemap_dir.mkdir(parents=True, exist_ok=True)
                             faces = equirect_processor.to_cubemap(
                                 processed_frame, self.cubemap_face_size
                             )
                             for face_name, face_img in faces.items():
-                                face_path = cubemap_dir / f"{face_name}.{ext}"
+                                # 方向ごとのフォルダ: cubemap/front/, cubemap/back/ など
+                                face_dir = output_path / "cubemap" / face_name
+                                face_dir.mkdir(parents=True, exist_ok=True)
+
+                                # ファイル名: keyframe_NNNNNN.jpg（サフィックスなし）
+                                face_path = face_dir / f"keyframe_{frame_idx:06d}.{ext}"
                                 if ext == 'jpg':
                                     if not write_image(
                                         face_path,
@@ -665,15 +694,13 @@ class ExportWorker(QThread):
                                 else:
                                     if not write_image(face_path, face_img):
                                         logger.warning(f"Cubemap保存失敗: {face_path}")
-                            logger.debug(f"Cubemap 出力: {cubemap_dir}")
+                            logger.debug(f"Cubemap 出力完了（フレーム {frame_idx}）")
                         except Exception as e:
                             logger.warning(f"Cubemap 出力エラー（フレーム {frame_idx}）: {e}")
 
                     # --- Perspective 出力 ---
                     if self.enable_perspective and equirect_processor:
                         try:
-                            persp_dir = output_path / "perspective" / f"frame_{frame_idx:06d}"
-                            persp_dir.mkdir(parents=True, exist_ok=True)
                             for yaw in self.perspective_yaw_list:
                                 for pitch in self.perspective_pitch_list:
                                     persp_img = equirect_processor.to_perspective(
@@ -682,8 +709,13 @@ class ExportWorker(QThread):
                                         fov=self.perspective_fov,
                                         output_size=self.perspective_size
                                     )
-                                    name = f"y{yaw:+.0f}_p{pitch:+.0f}.{ext}"
-                                    persp_path = persp_dir / name
+                                    # 角度ごとのフォルダ: perspective/y+0_p+0/, perspective/y+90_p+0/ など
+                                    angle_name = f"y{yaw:+.0f}_p{pitch:+.0f}"
+                                    angle_dir = output_path / "perspective" / angle_name
+                                    angle_dir.mkdir(parents=True, exist_ok=True)
+
+                                    # ファイル名: keyframe_NNNNNN.jpg（サフィックスなし）
+                                    persp_path = angle_dir / f"keyframe_{frame_idx:06d}.{ext}"
                                     if ext == 'jpg':
                                         if not write_image(
                                             persp_path,
@@ -694,7 +726,7 @@ class ExportWorker(QThread):
                                     else:
                                         if not write_image(persp_path, persp_img):
                                             logger.warning(f"Perspective保存失敗: {persp_path}")
-                            logger.debug(f"Perspective 出力: {persp_dir}")
+                            logger.debug(f"Perspective 出力完了（フレーム {frame_idx}）")
                         except Exception as e:
                             logger.warning(f"Perspective 出力エラー（フレーム {frame_idx}）: {e}")
 

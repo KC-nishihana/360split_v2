@@ -352,6 +352,28 @@ def run_cli(args):
 
         # 各フレーム（L/R または単眼）を処理
         for frame, suffix in frames_to_process:
+            # ステレオの場合はスティッチ未処理のため分割処理をスキップ
+            if is_osv:
+                # パノラマ画像のみを L/ または R/ フォルダに保存
+                output_subdir = output_dir / suffix.strip('_')  # 'L' or 'R'
+                output_subdir.mkdir(parents=True, exist_ok=True)
+
+                # ファイル名にサフィックスなし
+                filename = f"keyframe_{kf.frame_index:06d}.{fmt}"
+                filepath = output_subdir / filename
+
+                if fmt == "jpg":
+                    saved = write_image(
+                        filepath,
+                        frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, config["output_jpeg_quality"]]
+                    )
+                else:
+                    saved = write_image(filepath, frame)
+                if not saved:
+                    logger.warning(f"保存失敗（フレーム {kf.frame_index}{suffix}）: {filepath}")
+                continue  # ステレオの場合はここで次のフレームへ
+
             # マスク処理
             if mask_processor and args.apply_mask:
                 h, w = frame.shape[:2]
@@ -359,7 +381,7 @@ def run_cli(args):
                 frame = mask_processor.apply_mask(frame, nadir_mask)
 
             # 通常画像の出力
-            filename = f"keyframe_{kf.frame_index:06d}{suffix}.{fmt}"
+            filename = f"keyframe_{kf.frame_index:06d}.{fmt}"
             filepath = output_dir / filename
 
             if fmt == "jpg":
@@ -371,16 +393,19 @@ def run_cli(args):
             else:
                 saved = write_image(filepath, frame)
             if not saved:
-                logger.warning(f"保存失敗（フレーム {kf.frame_index}{suffix}）: {filepath}")
+                logger.warning(f"保存失敗（フレーム {kf.frame_index}）: {filepath}")
                 continue
 
             # Cubemap出力
             if args.cubemap and equirect_processor:
-                cubemap_dir = output_dir / "cubemap" / f"frame_{kf.frame_index:06d}{suffix}"
-                cubemap_dir.mkdir(parents=True, exist_ok=True)
                 faces = equirect_processor.to_cubemap(frame, config["cubemap_face_size"])
                 for face_name, face_img in faces.items():
-                    face_path = cubemap_dir / f"{face_name}.{fmt}"
+                    # 方向ごとのフォルダ: cubemap/front/, cubemap/back/ など
+                    face_dir = output_dir / "cubemap" / face_name
+                    face_dir.mkdir(parents=True, exist_ok=True)
+
+                    # ファイル名: keyframe_NNNNNN.jpg（サフィックスなし）
+                    face_path = face_dir / f"keyframe_{kf.frame_index:06d}.{fmt}"
                     if not write_image(face_path, face_img):
                         logger.warning(f"Cubemap保存失敗: {face_path}")
 

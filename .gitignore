@@ -1,5 +1,7 @@
 # Pythonで生成されるバイトコード / キャッシュ
 __pycache__/
+test/
+temp_streams/
 */__pycache__/
 *.py[cod]
 *$py.class

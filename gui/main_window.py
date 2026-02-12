@@ -62,6 +62,11 @@ class MainWindow(QMainWindow):
         self._full_worker: Optional[FullAnalysisWorker] = None
         self._export_worker: Optional[ExportWorker] = None
 
+        # ステレオ（OSV）対応
+        self.is_stereo: bool = False
+        self.stereo_left_path: Optional[str] = None
+        self.stereo_right_path: Optional[str] = None
+
         self._setup_ui()
         self._setup_menu()
         self._setup_toolbar()
@@ -224,14 +229,14 @@ class MainWindow(QMainWindow):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 path = url.toLocalFile().lower()
-                if path.endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+                if path.endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm', '.osv')):
                     event.acceptProposedAction()
                     return
 
     def dropEvent(self, event: QDropEvent):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+            if path.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm', '.osv')):
                 self._load_video(path)
                 return
 
@@ -242,7 +247,7 @@ class MainWindow(QMainWindow):
     def open_video(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "ビデオファイルを開く", "",
-            "ビデオ (*.mp4 *.mov *.avi *.mkv *.webm);;すべて (*)"
+            "ビデオ (*.mp4 *.mov *.avi *.mkv *.webm *.osv);;すべて (*)"
         )
         if path:
             self._load_video(path)
@@ -250,17 +255,51 @@ class MainWindow(QMainWindow):
     def _load_video(self, path: str):
         try:
             self.video_path = path
-            metadata = self.video_player.load_video(path)
+
+            # OSV ファイル判定
+            if path.lower().endswith('.osv'):
+                # DualVideoLoader でストリーム分離
+                from core.video_loader import DualVideoLoader
+
+                logger.info(f"OSV ファイルを検出: {path}")
+                loader = DualVideoLoader()
+                metadata = loader.load(path)
+
+                # ステレオ情報を保存
+                self.is_stereo = True
+                self.stereo_left_path = loader.left_path
+                self.stereo_right_path = loader.right_path
+
+                # ステレオビデオプレーヤーに読み込み
+                metadata = self.video_player.load_video_stereo(loader.left_path, loader.right_path)
+
+                logger.info(f"ステレオモード有効化: L={loader.left_path}, R={loader.right_path}")
+                status_msg = (
+                    f"読み込み完了（OSV - ステレオ）: {Path(path).name}  "
+                    f"({metadata.width}×{metadata.height}, "
+                    f"{metadata.fps:.1f}fps, {metadata.frame_count}フレーム) - ステレオ表示可能"
+                )
+            else:
+                # 通常の単眼ビデオ
+                self.is_stereo = False
+                self.stereo_left_path = None
+                self.stereo_right_path = None
+
+                metadata = self.video_player.load_video(path)
+
+                status_msg = (
+                    f"読み込み完了: {Path(path).name}  "
+                    f"({metadata.width}×{metadata.height}, "
+                    f"{metadata.fps:.1f}fps, {metadata.frame_count}フレーム)"
+                )
+
             self.timeline.set_duration(metadata.frame_count, metadata.fps)
             self.keyframe_list.set_video_path(path)
             self.keyframe_list.clear()
             self._stage1_scores.clear()
 
-            self.statusBar().showMessage(
-                f"読み込み完了: {Path(path).name}  "
-                f"({metadata.width}×{metadata.height}, "
-                f"{metadata.fps:.1f}fps, {metadata.frame_count}フレーム)"
-            )
+            self.statusBar().showMessage(status_msg)
+
         except Exception as e:
             logger.exception(f"ビデオ読み込みエラー: {path}")
             QMessageBox.critical(self, "エラー", f"読み込み失敗:\n{e}")
@@ -546,6 +585,12 @@ class MainWindow(QMainWindow):
             enable_equipment_detection=s["enable_equipment_detection"],
             mask_dilation_size=s["mask_dilation_size"]
         )
+
+        # ステレオ（OSV）対応: 左右ストリームパスを設定
+        if self.is_stereo and self.stereo_left_path and self.stereo_right_path:
+            self._export_worker.set_stereo_paths(self.stereo_left_path, self.stereo_right_path)
+            logger.info(f"エクスポート: ステレオペア出力モード（L/R）")
+
         self._export_worker.progress.connect(self._on_progress)
         self._export_worker.finished.connect(self._on_export_finished)
         self._export_worker.error.connect(self._on_error)

@@ -309,7 +309,7 @@ class KeyframeSelector:
 
         return base_threshold
 
-    def select_keyframes(self, video_loader: VideoLoader,
+    def select_keyframes(self, video_loader,
                         progress_callback: Optional[Callable[[int, int], None]] = None
                         ) -> List[KeyframeInfo]:
         """
@@ -318,11 +318,13 @@ class KeyframeSelector:
         アルゴリズム：
         Stage 1: 高速フィルタリング（全フレーム）
           - 品質スコアのみ計算（~5ms/フレーム）
+          - ステレオの場合：L/R両方が基準を満たすかチェック（AND条件）
           - 閾値以下のフレームを即座に除外（60-70%フィルタリング）
           - マルチスレッド処理で高速化
 
         Stage 2: 精密評価（候補フレームのみ）
           - 幾何学的・適応的評価（~50ms/フレーム）
+          - ステレオの場合：Left画像のみで移動判定（コスト削減）
           - Stage 1通過フレームのみ処理
           - NMS適用
 
@@ -331,8 +333,8 @@ class KeyframeSelector:
 
         Parameters:
         -----------
-        video_loader : VideoLoader
-            読み込み済みのVideoLoaderインスタンス
+        video_loader : VideoLoader or DualVideoLoader
+            読み込み済みのローダーインスタンス
         progress_callback : callable, optional
             進捗コールバック関数 (current_frame, total_frames)
 
@@ -345,8 +347,18 @@ class KeyframeSelector:
         if metadata is None:
             raise RuntimeError("ビデオが読み込まれていません")
 
+        # ステレオ判定
+        is_stereo = hasattr(video_loader, 'is_stereo') and video_loader.is_stereo
+        if is_stereo:
+            logger.info("ステレオモード（OSV）でキーフレーム選択を実行")
+
         # ビデオパスを取得（独立キャプチャ用）
-        video_path = video_loader._video_path
+        if is_stereo:
+            # DualVideoLoader の場合は左目ストリームを使用
+            video_path = video_loader.left_path
+        else:
+            video_path = video_loader._video_path
+
         if video_path is None:
             raise RuntimeError("ビデオパスが取得できません")
 
@@ -690,6 +702,59 @@ class KeyframeSelector:
             frame,
             beta=self.config['SOFTMAX_BETA']
         )
+
+    def _compute_quality_score_stereo(self, frame_l: np.ndarray,
+                                     frame_r: np.ndarray) -> Dict[str, float]:
+        """
+        ステレオフレームペアの品質スコアを計算（Conservative: AND条件）
+
+        左右どちらか一方でもブレていたり暗すぎたりした場合、
+        そのフレームペアは3DGSのノイズになるため破棄する。
+
+        Parameters:
+        -----------
+        frame_l : np.ndarray
+            左目フレーム
+        frame_r : np.ndarray
+            右目フレーム
+
+        Returns:
+        --------
+        dict
+            統合品質スコア（悪い方に合わせる）
+        """
+        # 左右それぞれの品質を評価
+        score_l = self.quality_evaluator.evaluate(
+            frame_l,
+            beta=self.config['SOFTMAX_BETA']
+        )
+        score_r = self.quality_evaluator.evaluate(
+            frame_r,
+            beta=self.config['SOFTMAX_BETA']
+        )
+
+        # Conservative: 悪い方に合わせる（AND条件）
+        # 片方のレンズに汚れや直射日光が入った場合を厳しく除外
+        combined_score = {
+            'sharpness': min(score_l.get('sharpness', 0),
+                           score_r.get('sharpness', 0)),
+            'exposure': min(score_l.get('exposure', 0),
+                          score_r.get('exposure', 0)),
+            'motion_blur': max(score_l.get('motion_blur', 1.0),
+                             score_r.get('motion_blur', 1.0)),  # ブラーは大きい方が悪い
+            'feature_count': min(score_l.get('feature_count', 0),
+                               score_r.get('feature_count', 0)),
+        }
+
+        logger.debug(
+            f"Stereo Quality - L: sharp={score_l.get('sharpness', 0):.1f} "
+            f"exp={score_l.get('exposure', 0):.2f} | "
+            f"R: sharp={score_r.get('sharpness', 0):.1f} "
+            f"exp={score_r.get('exposure', 0):.2f} | "
+            f"Combined: sharp={combined_score['sharpness']:.1f}"
+        )
+
+        return combined_score
 
     def _compute_combined_score(self, quality_scores: Dict[str, float],
                                geometric_scores: Dict[str, float],

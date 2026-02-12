@@ -219,7 +219,7 @@ def load_config(config_path: str = None, preset_id: str = None) -> dict:
 
 def run_cli(args):
     """CLIモードでキーフレーム抽出を実行する。"""
-    from core.video_loader import VideoLoader
+    from core.video_loader import VideoLoader, DualVideoLoader
     from core.keyframe_selector import KeyframeSelector
     from processing.equirectangular import EquirectangularProcessor
     from processing.mask_processor import MaskProcessor
@@ -228,6 +228,11 @@ def run_cli(args):
     if not Path(video_path).exists():
         logger.error(f"動画ファイルが見つかりません: {video_path}")
         sys.exit(1)
+
+    # OSV ファイル判定
+    is_osv = video_path.lower().endswith('.osv')
+    if is_osv:
+        logger.info("OSV（ステレオ）ファイルを検出しました")
 
     # 設定ロード（プリセット → 設定ファイル → CLI引数の順で優先）
     config = load_config(args.config, args.preset)
@@ -254,6 +259,8 @@ def run_cli(args):
     logger.info(f"入力動画: {video_path}")
     logger.info(f"出力先:   {output_dir}")
     logger.info(f"フォーマット: {config['output_image_format']}")
+    if is_osv:
+        logger.info("ステレオモード（OSV）: 有効（L/Rペア出力）")
     if args.equirectangular:
         logger.info("360度 Equirectangular モード: 有効")
     if args.apply_mask:
@@ -261,12 +268,25 @@ def run_cli(args):
     logger.info("-" * 60)
 
     # 動画読み込み
-    loader = VideoLoader()
-    try:
-        loader.load(video_path)
-    except (FileNotFoundError, RuntimeError) as e:
-        logger.error(f"動画の読み込みに失敗しました: {e}")
-        sys.exit(1)
+    if is_osv:
+        # ステレオ（OSV）モード
+        loader = DualVideoLoader()
+        try:
+            loader.load(video_path)
+            stereo_left_path = loader.left_path
+            stereo_right_path = loader.right_path
+            logger.info(f"ステレオストリームを分離しました: L={stereo_left_path}, R={stereo_right_path}")
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.error(f"OSVファイルの読み込みに失敗しました: {e}")
+            sys.exit(1)
+    else:
+        # 通常の単眼モード
+        loader = VideoLoader()
+        try:
+            loader.load(video_path)
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.error(f"動画の読み込みに失敗しました: {e}")
+            sys.exit(1)
 
     meta = loader.get_metadata()
     logger.info(f"動画情報: {meta.width}x{meta.height}, "
@@ -315,44 +335,58 @@ def run_cli(args):
     fmt = config["output_image_format"]
 
     for i, kf in enumerate(keyframes):
-        frame = loader.get_frame(kf.frame_index)
-        if frame is None:
-            continue
-
-        # マスク処理
-        if mask_processor and args.apply_mask:
-            h, w = frame.shape[:2]
-            nadir_mask = mask_processor.create_nadir_mask(w, h)
-            frame = mask_processor.apply_mask(frame, nadir_mask)
-
-        # 通常画像の出力
-        filename = f"keyframe_{kf.frame_index:06d}.{fmt}"
-        filepath = output_dir / filename
-
-        if fmt == "jpg":
-            saved = write_image(
-                filepath,
-                frame,
-                [cv2.IMWRITE_JPEG_QUALITY, config["output_jpeg_quality"]]
-            )
+        # ステレオ判定
+        if is_osv:
+            # ステレオペア取得
+            frame_l, frame_r = loader.get_frame_pair(kf.frame_index)
+            if frame_l is None or frame_r is None:
+                logger.warning(f"ステレオフレーム読み込み失敗: {kf.frame_index}")
+                continue
+            frames_to_process = [(frame_l, '_L'), (frame_r, '_R')]
         else:
-            saved = write_image(filepath, frame)
-        if not saved:
-            logger.warning(f"保存失敗（フレーム {kf.frame_index}）: {filepath}")
-            continue
+            # 単眼フレーム取得
+            frame = loader.get_frame(kf.frame_index)
+            if frame is None:
+                continue
+            frames_to_process = [(frame, '')]
 
-        # Cubemap出力
-        if args.cubemap and equirect_processor:
-            cubemap_dir = output_dir / "cubemap" / f"frame_{kf.frame_index:06d}"
-            cubemap_dir.mkdir(parents=True, exist_ok=True)
-            faces = equirect_processor.to_cubemap(frame, config["cubemap_face_size"])
-            for face_name, face_img in faces.items():
-                face_path = cubemap_dir / f"{face_name}.{fmt}"
-                if not write_image(face_path, face_img):
-                    logger.warning(f"Cubemap保存失敗: {face_path}")
+        # 各フレーム（L/R または単眼）を処理
+        for frame, suffix in frames_to_process:
+            # マスク処理
+            if mask_processor and args.apply_mask:
+                h, w = frame.shape[:2]
+                nadir_mask = mask_processor.create_nadir_mask(w, h)
+                frame = mask_processor.apply_mask(frame, nadir_mask)
+
+            # 通常画像の出力
+            filename = f"keyframe_{kf.frame_index:06d}{suffix}.{fmt}"
+            filepath = output_dir / filename
+
+            if fmt == "jpg":
+                saved = write_image(
+                    filepath,
+                    frame,
+                    [cv2.IMWRITE_JPEG_QUALITY, config["output_jpeg_quality"]]
+                )
+            else:
+                saved = write_image(filepath, frame)
+            if not saved:
+                logger.warning(f"保存失敗（フレーム {kf.frame_index}{suffix}）: {filepath}")
+                continue
+
+            # Cubemap出力
+            if args.cubemap and equirect_processor:
+                cubemap_dir = output_dir / "cubemap" / f"frame_{kf.frame_index:06d}{suffix}"
+                cubemap_dir.mkdir(parents=True, exist_ok=True)
+                faces = equirect_processor.to_cubemap(frame, config["cubemap_face_size"])
+                for face_name, face_img in faces.items():
+                    face_path = cubemap_dir / f"{face_name}.{fmt}"
+                    if not write_image(face_path, face_img):
+                        logger.warning(f"Cubemap保存失敗: {face_path}")
 
         # スコア情報の表示
-        logger.info(f"  [{i+1}/{len(keyframes)}] Frame {kf.frame_index:6d} | "
+        suffix_str = " (L/R)" if is_osv else ""
+        logger.info(f"  [{i+1}/{len(keyframes)}] Frame {kf.frame_index:6d}{suffix_str} | "
                     f"Time {kf.timestamp:7.2f}s | Score {kf.combined_score:.3f}")
 
     # メタデータ出力

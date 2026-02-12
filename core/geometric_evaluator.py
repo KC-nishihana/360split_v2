@@ -418,7 +418,14 @@ class GeometricEvaluator:
         n_points = len(pts1)
 
         # ===== ホモグラフィH推定 =====
-        H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, cfg.ransac_threshold)
+        try:
+            H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, cfg.ransac_threshold)
+        except cv2.error as e:
+            raise EstimationFailureError(
+                reason=f"ホモグラフィ推定でOpenCVエラー: {e}",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
         if H is None or mask_H is None:
             raise EstimationFailureError(
                 reason="ホモグラフィ推定失敗（RANSAC収束不可）",
@@ -427,13 +434,26 @@ class GeometricEvaluator:
             )
 
         # ===== 基礎行列F推定 =====
-        F, mask_F = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, cfg.ransac_threshold)
+        try:
+            F, mask_F = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, cfg.ransac_threshold)
+        except cv2.error as e:
+            # OpenCV内部のアサーション失敗（特定の点配置で発生し得る）
+            raise EstimationFailureError(
+                reason=f"基礎行列推定でOpenCVエラー: {e}",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
         if F is None or mask_F is None:
             raise EstimationFailureError(
                 reason="基礎行列推定失敗（RANSAC収束不可）",
                 match_count=n_points,
                 required_count=cfg.min_matches
             )
+
+        # findFundamentalMatは複数解を返すことがある（9x3等）→ 先頭3x3を使用
+        if F.shape[0] > 3:
+            logger.debug(f"基礎行列が複数解 ({F.shape}) → 先頭3x3を使用")
+            F = F[:3, :]
 
         # インライア率
         inlier_ratio_H = float(np.sum(mask_H.ravel())) / n_points
@@ -699,26 +719,28 @@ class GeometricEvaluator:
         InsufficientFeaturesError
             特徴点マッチ不足
         """
-        # GRIC スコア計算（例外が発生し得る）
+        # GRIC スコア計算（カスタム例外が発生し得る → 呼び出し元でハンドリング）
         gric_score = self.compute_gric_score(
             frame1, frame2,
             frame1_idx=frame1_idx,
             frame2_idx=frame2_idx
         )
 
-        # 特徴点分布（例外は発生しない）
-        dist1 = self.compute_feature_distribution(frame1, frame_idx=frame1_idx)
-        dist2 = self.compute_feature_distribution(frame2, frame_idx=frame2_idx)
-
-        # マッチ数
-        match_count = self.compute_feature_match_count(
-            frame1, frame2,
-            frame1_idx=frame1_idx,
-            frame2_idx=frame2_idx
-        )
-
-        # 光線分散
-        ray_disp = self.compute_ray_dispersion(frame1, frame_idx=frame1_idx)
+        # 補助スコア計算（OpenCVエラーに対する安全ネット付き）
+        try:
+            dist1 = self.compute_feature_distribution(frame1, frame_idx=frame1_idx)
+            dist2 = self.compute_feature_distribution(frame2, frame_idx=frame2_idx)
+            match_count = self.compute_feature_match_count(
+                frame1, frame2,
+                frame1_idx=frame1_idx,
+                frame2_idx=frame2_idx
+            )
+            ray_disp = self.compute_ray_dispersion(frame1, frame_idx=frame1_idx)
+        except cv2.error as e:
+            logger.warning(f"補助スコア計算でOpenCVエラー（GRICスコアのみ使用）: {e}")
+            dist1, dist2 = 0.5, 0.5
+            match_count = 0
+            ray_disp = 0.5
 
         return {
             'gric': gric_score,

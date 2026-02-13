@@ -358,8 +358,8 @@ def run_cli(args):
                 output_subdir = output_dir / suffix.strip('_')  # 'L' or 'R'
                 output_subdir.mkdir(parents=True, exist_ok=True)
 
-                # ファイル名にサフィックスなし
-                filename = f"keyframe_{kf.frame_index:06d}.{fmt}"
+                # ファイル名にサフィックスあり (_L or _R)
+                filename = f"keyframe_{kf.frame_index:06d}{suffix}.{fmt}"
                 filepath = output_subdir / filename
 
                 if fmt == "jpg":
@@ -404,8 +404,8 @@ def run_cli(args):
                     face_dir = output_dir / "cubemap" / face_name
                     face_dir.mkdir(parents=True, exist_ok=True)
 
-                    # ファイル名: keyframe_NNNNNN.jpg（サフィックスなし）
-                    face_path = face_dir / f"keyframe_{kf.frame_index:06d}.{fmt}"
+                    # ファイル名: keyframe_NNNNNN_front.jpg（サフィックスあり）
+                    face_path = face_dir / f"keyframe_{kf.frame_index:06d}_{face_name}.{fmt}"
                     if not write_image(face_path, face_img):
                         logger.warning(f"Cubemap保存失敗: {face_path}")
 

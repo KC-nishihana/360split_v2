@@ -4,6 +4,11 @@
 
 品質評価・幾何学的評価・適応的選択の3軸で動画フレームをスコアリングし、3D再構成に最適なキーフレームを自動選別します。GUIモードとCLIモードの両方に対応しています。
 
+> **最新アップデート（2026年2月）**
+> - Visual Odometry（カメラ軌跡推定）モジュールの実験的実装を追加
+> - エクスポートダイアログUIの追加
+> - 画像I/Oユーティリティの拡張
+
 
 ## 主な特徴
 
@@ -33,9 +38,11 @@
 ### 1. リポジトリのクローン
 
 ```bash
-git clone https://github.com/yourname/360split.git
+git clone https://github.com/YOUR_USERNAME/360split.git
 cd 360split
 ```
+
+（注：`YOUR_USERNAME`を実際のGitHubユーザー名に置き換えてください）
 
 ### 2. Python仮想環境の作成
 
@@ -234,9 +241,12 @@ GUIモードでは、設定ダイアログの「キーフレーム選択」タ�
 │   ├── keyframe_list.py     # キーフレーム一覧、サムネイル表示
 │   ├── settings_dialog.py   # 設定ダイアログ（4タブ構成）
 │   ├── settings_panel.py    # 設定パネルコンポーネント
+│   ├── export_dialog.py     # エクスポートダイアログ（出力設定、フォーマット選択）
 │   └── workers.py           # バックグラウンド処理ワーカー（Stage1/2/Export）
-└── utils/
-    └── logger.py            # ロギングユーティリティ
+├── utils/                   # ユーティリティ
+│   ├── logger.py            # ロギングユーティリティ
+│   └── image_io.py          # 画像入出力（フォーマット変換、メタデータ保存）
+└── test/                    # 開発用テストスクリプト、サンプルデータ
 ```
 
 ### 2段階キーフレーム選択パイプライン
@@ -338,6 +348,39 @@ output/
 ### メタデータ (keyframe_metadata.json)
 
 各キーフレームのスコア詳細を含むJSONファイルが自動生成されます。フォトグラメトリソフトウェアとの連携や後処理スクリプトの入力として利用できます。
+
+
+## 実験的機能（開発中）
+
+### Visual Odometry（カメラ軌跡推定）
+
+`test/`ディレクトリに、360度動画からカメラの3D軌跡を推定するVisual Odometry（VO）モジュールが開発されています。
+
+**主な機能:**
+- モノキュラーVisual Odometry（単眼カメラによる自己位置推定）
+- 既存の`GeometricEvaluator`を活用した特徴点検出・マッチング
+- Essential Matrix推定によるカメラ姿勢計算
+- IMU融合による絶対スケール推定（開発中）
+- 3D軌跡の可視化
+
+**使用方法:**
+
+```bash
+cd test/
+
+# VO単独実行
+python3 vo_only_test.py
+
+# VO+IMU融合実行（IMUデータ準備後）
+python3 vo_imu_fusion.py
+```
+
+**詳細:**
+- `test/VO開発完了レポート.md` - 技術詳細とアーキテクチャ
+- `test/3D軌跡解析レポート.md` - 解析結果レポート
+- `test/OSVファイル_メタデータ調査レポート.md` - センサーデータ調査
+
+**注意:** この機能は実験的なものであり、メインシステムへの統合は今後予定されています。
 
 
 ## ライセンス

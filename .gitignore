@@ -1,13 +1,23 @@
 # Pythonで生成されるバイトコード / キャッシュ
 __pycache__/
-test/
-temp_streams/
 */__pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .mypy_cache/
 *.pyc
+
+# 一時ストリームディレクトリ
+temp_streams/
+
+# テストディレクトリ内の大容量データファイル
+test/*.OSV
+test/*.mp4
+test/*.csv
+test/*.txt
+test/*.png
+test/left_images/
+test/backup/
 
 # 仮想環境
 venv/

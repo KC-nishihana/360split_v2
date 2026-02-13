@@ -571,8 +571,8 @@ class ExportWorker(QThread):
                         output_subdir = output_path / suffix.strip('_')  # 'L' or 'R'
                         output_subdir.mkdir(parents=True, exist_ok=True)
 
-                        # ファイル名にサフィックスなし
-                        filename = f"{self.prefix}_{frame_idx:06d}.{ext}"
+                        # ファイル名にサフィックスあり (_L or _R)
+                        filename = f"{self.prefix}_{frame_idx:06d}{suffix}.{ext}"
                         filepath = output_subdir / filename
 
                         if ext == 'jpg':
@@ -682,8 +682,8 @@ class ExportWorker(QThread):
                                 face_dir = output_path / "cubemap" / face_name
                                 face_dir.mkdir(parents=True, exist_ok=True)
 
-                                # ファイル名: keyframe_NNNNNN.jpg（サフィックスなし）
-                                face_path = face_dir / f"keyframe_{frame_idx:06d}.{ext}"
+                                # ファイル名: keyframe_NNNNNN_front.jpg（サフィックスあり）
+                                face_path = face_dir / f"keyframe_{frame_idx:06d}_{face_name}.{ext}"
                                 if ext == 'jpg':
                                     if not write_image(
                                         face_path,
@@ -714,8 +714,8 @@ class ExportWorker(QThread):
                                     angle_dir = output_path / "perspective" / angle_name
                                     angle_dir.mkdir(parents=True, exist_ok=True)
 
-                                    # ファイル名: keyframe_NNNNNN.jpg（サフィックスなし）
-                                    persp_path = angle_dir / f"keyframe_{frame_idx:06d}.{ext}"
+                                    # ファイル名: keyframe_NNNNNN_y+0_p+0.jpg（サフィックスあり）
+                                    persp_path = angle_dir / f"keyframe_{frame_idx:06d}_{angle_name}.{ext}"
                                     if ext == 'jpg':
                                         if not write_image(
                                             persp_path,

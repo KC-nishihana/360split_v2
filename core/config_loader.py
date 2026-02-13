@@ -304,6 +304,7 @@ class ConfigManager:
             "brightness_min": default_config.BRIGHTNESS_MIN,
             "brightness_max": default_config.BRIGHTNESS_MAX,
             "motion_blur_threshold": default_config.MOTION_BLUR_THRESHOLD,
+            "exposure_threshold": 0.35,
             "softmax_beta": default_config.SOFTMAX_BETA,
             "gric_degeneracy_threshold": default_config.GRIC_RATIO_THRESHOLD,
             "min_feature_matches": default_config.MIN_FEATURE_MATCHES,
@@ -314,6 +315,9 @@ class ConfigManager:
             "weight_exposure": default_config.WEIGHT_EXPOSURE,
             "weight_geometric": default_config.WEIGHT_GEOMETRIC,
             "weight_content": default_config.WEIGHT_CONTENT,
+            "pair_motion_aggregation": "max",
+            "enable_rig_stitching": True,
+            "rig_feature_method": "orb",
             "output_image_format": default_config.OUTPUT_IMAGE_FORMAT,
             "output_jpeg_quality": default_config.OUTPUT_JPEG_QUALITY,
         }

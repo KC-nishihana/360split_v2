@@ -17,6 +17,7 @@ import time
 import subprocess
 
 from core.accelerator import get_accelerator
+from core.rig_models import RigCalibration, RigTransforms
 
 from utils.logger import get_logger
 logger = get_logger(__name__)
@@ -41,6 +42,12 @@ class VideoMetadata:
         ビデオ総長（秒）
     codec : str
         ビデオコーデック
+    rig_type : str
+        リグタイプ（monocular/stereo_lr/front_rear）
+    rig_calibration : Optional[RigCalibration]
+        リグキャリブレーション情報
+    rig_transforms : RigTransforms
+        スティッチング等で使用する変換行列
     """
     fps: float
     frame_count: int
@@ -48,6 +55,13 @@ class VideoMetadata:
     height: int
     duration: float
     codec: Optional[str] = None
+    rig_type: str = "monocular"
+    rig_calibration: Optional[RigCalibration] = None
+    rig_transforms: RigTransforms = None
+
+    def __post_init__(self):
+        if self.rig_transforms is None:
+            self.rig_transforms = RigTransforms()
 
 
 class FrameBuffer:
@@ -379,7 +393,8 @@ class VideoLoader:
             width=width,
             height=height,
             duration=duration,
-            codec=codec
+            codec=codec,
+            rig_type="monocular"
         )
 
         self._video_path = path
@@ -815,7 +830,8 @@ class DualVideoLoader:
             width=width,
             height=height,
             duration=duration,
-            codec="osv_dual_stream"
+            codec="osv_dual_stream",
+            rig_type="stereo_lr"
         )
 
         logger.info(
@@ -964,6 +980,16 @@ class DualVideoLoader:
         """ステレオ（OSV）であるかを判定"""
         return True
 
+    @property
+    def is_paired(self) -> bool:
+        """2レンズ同期ストリームであるかを判定"""
+        return True
+
+    @property
+    def rig_type(self) -> str:
+        """リグタイプ"""
+        return "stereo_lr"
+
     def close(self):
         """リソースを解放"""
         if self.cap_l is not None:
@@ -990,4 +1016,174 @@ class DualVideoLoader:
 
     def __del__(self):
         """デストラクタ"""
+        self.close()
+
+
+class FrontRearVideoLoader:
+    """
+    前後魚眼リグ用デュアルローダー。
+
+    2つの独立動画（front/rear）を同期して読み込み、VideoLoader互換APIを提供する。
+    """
+
+    def __init__(self):
+        self.front_path: Optional[str] = None
+        self.rear_path: Optional[str] = None
+        self.cap_front: Optional[cv2.VideoCapture] = None
+        self.cap_rear: Optional[cv2.VideoCapture] = None
+        self._metadata: Optional[VideoMetadata] = None
+        self._current_frame_idx = -1
+        self._frame_buffer_front = FrameBuffer(max_size=100)
+        self._frame_buffer_rear = FrameBuffer(max_size=100)
+
+    def load(self, front_path: str, rear_path: str) -> VideoMetadata:
+        front = Path(front_path)
+        rear = Path(rear_path)
+        if not front.exists():
+            raise FileNotFoundError(f"前方動画が見つかりません: {front}")
+        if not rear.exists():
+            raise FileNotFoundError(f"後方動画が見つかりません: {rear}")
+
+        self.front_path = str(front)
+        self.rear_path = str(rear)
+
+        self.cap_front = cv2.VideoCapture(self.front_path)
+        self.cap_rear = cv2.VideoCapture(self.rear_path)
+        if not self.cap_front.isOpened() or not self.cap_rear.isOpened():
+            raise RuntimeError(f"前後動画を開けません: front={front}, rear={rear}")
+
+        fps_f = self.cap_front.get(cv2.CAP_PROP_FPS)
+        fps_r = self.cap_rear.get(cv2.CAP_PROP_FPS)
+        frame_count_f = int(self.cap_front.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_count_r = int(self.cap_rear.get(cv2.CAP_PROP_FRAME_COUNT))
+        width_f = int(self.cap_front.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height_f = int(self.cap_front.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        width_r = int(self.cap_rear.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height_r = int(self.cap_rear.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if abs(fps_f - fps_r) > 1e-3:
+            logger.warning(f"前後FPSが不一致: front={fps_f:.3f}, rear={fps_r:.3f}")
+        if frame_count_f != frame_count_r:
+            logger.warning(f"前後フレーム数が不一致: front={frame_count_f}, rear={frame_count_r}")
+        if width_f != width_r or height_f != height_r:
+            logger.warning(
+                f"前後解像度が不一致: front={width_f}x{height_f}, rear={width_r}x{height_r}"
+            )
+
+        frame_count = min(frame_count_f, frame_count_r)
+        fps = fps_f if fps_f > 0 else fps_r
+        duration = frame_count / fps if fps > 0 else 0.0
+
+        self._metadata = VideoMetadata(
+            fps=fps,
+            frame_count=frame_count,
+            width=width_f,
+            height=height_f,
+            duration=duration,
+            codec="front_rear_dual_stream",
+            rig_type="front_rear"
+        )
+
+        logger.info(
+            f"前後魚眼読み込み完了: front={front.name}, rear={rear.name} | "
+            f"{width_f}x{height_f} @ {fps:.2f}fps | {frame_count}フレーム"
+        )
+        return self._metadata
+
+    def set_calibration(self, calibration: RigCalibration):
+        if self._metadata is None:
+            raise RuntimeError("先に load() を実行してください")
+        self._metadata.rig_calibration = calibration
+
+    def set_transform(self, name: str, matrix: np.ndarray):
+        if self._metadata is None:
+            raise RuntimeError("先に load() を実行してください")
+        self._metadata.rig_transforms.matrices[name] = matrix
+
+    def get_frame_pair(self, index: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.cap_front is None or self.cap_rear is None:
+            raise RuntimeError("前後動画が読み込まれていません")
+        if index < 0 or index >= self._metadata.frame_count:
+            return None, None
+
+        cached_f = self._frame_buffer_front.get(index)
+        cached_r = self._frame_buffer_rear.get(index)
+        if cached_f is not None and cached_r is not None:
+            self._current_frame_idx = index
+            return cached_f, cached_r
+
+        self.cap_front.set(cv2.CAP_PROP_POS_FRAMES, index)
+        self.cap_rear.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ret_f, frame_f = self.cap_front.read()
+        ret_r, frame_r = self.cap_rear.read()
+        if not ret_f or not ret_r:
+            return None, None
+
+        self._frame_buffer_front.put(index, frame_f.copy())
+        self._frame_buffer_rear.put(index, frame_r.copy())
+        self._current_frame_idx = index
+        return frame_f, frame_r
+
+    def get_frame(self, index: int) -> Optional[np.ndarray]:
+        frame_f, _ = self.get_frame_pair(index)
+        return frame_f
+
+    def get_metadata(self) -> Optional[VideoMetadata]:
+        return self._metadata
+
+    @property
+    def is_stereo(self) -> bool:
+        return False
+
+    @property
+    def is_front_rear(self) -> bool:
+        return True
+
+    @property
+    def is_paired(self) -> bool:
+        return True
+
+    @property
+    def rig_type(self) -> str:
+        return "front_rear"
+
+    @property
+    def fps(self) -> float:
+        return self._metadata.fps if self._metadata else 0
+
+    @property
+    def frame_count(self) -> int:
+        return self._metadata.frame_count if self._metadata else 0
+
+    @property
+    def width(self) -> int:
+        return self._metadata.width if self._metadata else 0
+
+    @property
+    def height(self) -> int:
+        return self._metadata.height if self._metadata else 0
+
+    @property
+    def duration(self) -> float:
+        return self._metadata.duration if self._metadata else 0
+
+    def close(self):
+        if self.cap_front is not None:
+            self.cap_front.release()
+            self.cap_front = None
+        if self.cap_rear is not None:
+            self.cap_rear.release()
+            self.cap_rear = None
+        self._frame_buffer_front.clear()
+        self._frame_buffer_rear.clear()
+        self._metadata = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __del__(self):
         self.close()

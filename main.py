@@ -60,6 +60,18 @@ def parse_arguments():
         default=None,
         help="CLIモード: 指定した動画ファイルを解析（GUIなし）"
     )
+    parser.add_argument(
+        "--front-video",
+        type=str,
+        default=None,
+        help="前後魚眼モード: 前方レンズ動画パス"
+    )
+    parser.add_argument(
+        "--rear-video",
+        type=str,
+        default=None,
+        help="前後魚眼モード: 後方レンズ動画パス"
+    )
 
     parser.add_argument(
         "-o", "--output",
@@ -182,6 +194,10 @@ def load_config(config_path: str = None, preset_id: str = None) -> dict:
         "weight_exposure": default_config.WEIGHT_EXPOSURE,
         "weight_geometric": default_config.WEIGHT_GEOMETRIC,
         "weight_content": default_config.WEIGHT_CONTENT,
+        "exposure_threshold": 0.35,
+        "pair_motion_aggregation": "max",
+        "enable_rig_stitching": True,
+        "rig_feature_method": "orb",
         "equirect_width": default_config.EQUIRECT_WIDTH,
         "equirect_height": default_config.EQUIRECT_HEIGHT,
         "cubemap_face_size": default_config.CUBEMAP_FACE_SIZE,
@@ -219,20 +235,29 @@ def load_config(config_path: str = None, preset_id: str = None) -> dict:
 
 def run_cli(args):
     """CLIモードでキーフレーム抽出を実行する。"""
-    from core.video_loader import VideoLoader, DualVideoLoader
+    from core.video_loader import VideoLoader, DualVideoLoader, FrontRearVideoLoader
     from core.keyframe_selector import KeyframeSelector
     from processing.equirectangular import EquirectangularProcessor
     from processing.mask_processor import MaskProcessor
 
     video_path = args.cli
-    if not Path(video_path).exists():
-        logger.error(f"動画ファイルが見つかりません: {video_path}")
-        sys.exit(1)
+    is_front_rear = bool(args.front_video and args.rear_video)
+    if is_front_rear:
+        if not Path(args.front_video).exists() or not Path(args.rear_video).exists():
+            logger.error(f"前後動画が見つかりません: front={args.front_video}, rear={args.rear_video}")
+            sys.exit(1)
+        video_path = args.front_video
+    else:
+        if not video_path or not Path(video_path).exists():
+            logger.error(f"動画ファイルが見つかりません: {video_path}")
+            sys.exit(1)
 
     # OSV ファイル判定
-    is_osv = video_path.lower().endswith('.osv')
+    is_osv = (not is_front_rear) and video_path.lower().endswith('.osv')
     if is_osv:
         logger.info("OSV（ステレオ）ファイルを検出しました")
+    if is_front_rear:
+        logger.info("前後魚眼モードを検出しました")
 
     # 設定ロード（プリセット → 設定ファイル → CLI引数の順で優先）
     config = load_config(args.config, args.preset)
@@ -259,7 +284,15 @@ def run_cli(args):
     logger.info(f"入力動画: {video_path}")
     logger.info(f"出力先:   {output_dir}")
     logger.info(f"フォーマット: {config['output_image_format']}")
-    if is_osv:
+    if is_front_rear:
+        loader = FrontRearVideoLoader()
+        try:
+            loader.load(args.front_video, args.rear_video)
+            logger.info(f"前後ストリームを読み込みました: F={args.front_video}, R={args.rear_video}")
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.error(f"前後魚眼ファイルの読み込みに失敗しました: {e}")
+            sys.exit(1)
+    elif is_osv:
         logger.info("ステレオモード（OSV）: 有効（L/Rペア出力）")
     if args.equirectangular:
         logger.info("360度 Equirectangular モード: 有効")
@@ -336,13 +369,14 @@ def run_cli(args):
 
     for i, kf in enumerate(keyframes):
         # ステレオ判定
-        if is_osv:
+        if is_osv or is_front_rear:
             # ステレオペア取得
             frame_l, frame_r = loader.get_frame_pair(kf.frame_index)
             if frame_l is None or frame_r is None:
-                logger.warning(f"ステレオフレーム読み込み失敗: {kf.frame_index}")
+                logger.warning(f"ペアフレーム読み込み失敗: {kf.frame_index}")
                 continue
-            frames_to_process = [(frame_l, '_L'), (frame_r, '_R')]
+            pair_suffix = ('_F', '_R') if is_front_rear else ('_L', '_R')
+            frames_to_process = [(frame_l, pair_suffix[0]), (frame_r, pair_suffix[1])]
         else:
             # 単眼フレーム取得
             frame = loader.get_frame(kf.frame_index)
@@ -353,7 +387,7 @@ def run_cli(args):
         # 各フレーム（L/R または単眼）を処理
         for frame, suffix in frames_to_process:
             # ステレオの場合はスティッチ未処理のため分割処理をスキップ
-            if is_osv:
+            if is_osv or is_front_rear:
                 # パノラマ画像のみを L/ または R/ フォルダに保存
                 output_subdir = output_dir / suffix.strip('_')  # 'L' or 'R'
                 output_subdir.mkdir(parents=True, exist_ok=True)
@@ -410,17 +444,48 @@ def run_cli(args):
                         logger.warning(f"Cubemap保存失敗: {face_path}")
 
         # スコア情報の表示
-        suffix_str = " (L/R)" if is_osv else ""
+        suffix_str = " (F/R)" if is_front_rear else (" (L/R)" if is_osv else "")
         logger.info(f"  [{i+1}/{len(keyframes)}] Frame {kf.frame_index:6d}{suffix_str} | "
                     f"Time {kf.timestamp:7.2f}s | Score {kf.combined_score:.3f}")
 
     # メタデータ出力
+    def _serialize_rig_metadata(meta_obj):
+        rig = {
+            "rig_type": getattr(meta_obj, "rig_type", "monocular")
+        }
+        calib = getattr(meta_obj, "rig_calibration", None)
+        if calib is not None:
+            rig["calibration"] = {
+                "lens_a": {
+                    "camera_matrix": calib.lens_a.camera_matrix.tolist(),
+                    "distortion_coeffs": calib.lens_a.distortion_coeffs.tolist(),
+                    "image_width": calib.lens_a.image_width,
+                    "image_height": calib.lens_a.image_height,
+                    "model": calib.lens_a.model,
+                },
+                "lens_b": {
+                    "camera_matrix": calib.lens_b.camera_matrix.tolist(),
+                    "distortion_coeffs": calib.lens_b.distortion_coeffs.tolist(),
+                    "image_width": calib.lens_b.image_width,
+                    "image_height": calib.lens_b.image_height,
+                    "model": calib.lens_b.model,
+                },
+                "rotation_ab": calib.rotation_ab.tolist(),
+                "translation_ab": calib.translation_ab.tolist(),
+                "reprojection_error": float(calib.reprojection_error),
+            }
+        transforms = getattr(meta_obj, "rig_transforms", None)
+        if transforms is not None and getattr(transforms, "matrices", None):
+            rig["transforms"] = {k: v.tolist() for k, v in transforms.matrices.items()}
+        return rig
+
     metadata = {
         "video_path": str(Path(video_path).resolve()),
         "total_frames": meta.frame_count,
         "fps": meta.fps,
         "duration": meta.duration,
         "resolution": f"{meta.width}x{meta.height}",
+        "rig": _serialize_rig_metadata(meta),
         "keyframe_count": len(keyframes),
         "settings": config,
         "keyframes": [
@@ -495,7 +560,7 @@ def main():
         import logging
         set_log_level(logging.DEBUG)
 
-    if args.cli:
+    if args.cli or (args.front_video and args.rear_video):
         run_cli(args)
     else:
         run_gui()

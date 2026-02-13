@@ -565,6 +565,9 @@ class ExportWorker(QThread):
                 for frame, suffix in frames_to_process:
                     processed_frame = frame
 
+                    # ファイル拡張子を決定（ステレオ/非ステレオ両方で使用）
+                    ext = 'jpg' if self.format in ('jpg', 'jpeg') else self.format
+
                     # ステレオの場合はスティッチ未処理のため分割処理をスキップ
                     if self.is_stereo:
                         # パノラマ画像のみを L/ または R/ フォルダに保存
@@ -652,7 +655,6 @@ class ExportWorker(QThread):
                             logger.warning(f"マスク処理エラー（フレーム {frame_idx}）: {e}")
 
                     # ファイルを保存（ステレオの場合は _L / _R サフィックス付き）
-                    ext = 'jpg' if self.format in ('jpg', 'jpeg') else self.format
                     filename = f"{self.prefix}_{frame_idx:06d}{suffix}.{ext}"
                     filepath = output_path / filename
 

@@ -73,6 +73,7 @@ class SelectionConfig:
     max_keyframe_interval: int = 60     # 最大キーフレーム間隔（フレーム数）
     laplacian_threshold: float = 100.0  # Stage 1 鮮明度閾値
     motion_blur_threshold: float = 0.3  # モーションブラー許容閾値
+    exposure_threshold: float = 0.35    # 露光スコア最小閾値
     ssim_change_threshold: float = 0.85  # SSIM変化検知閾値
     softmax_beta: float = 5.0           # Softmax温度パラメータ
     nms_time_window: float = 1.0        # NMS時間ウィンドウ（秒）
@@ -132,6 +133,7 @@ class KeyframeConfig:
             'RANSAC_THRESHOLD': self.gric.ransac_threshold,
             'SSIM_CHANGE_THRESHOLD': self.selection.ssim_change_threshold,
             'MOTION_BLUR_THRESHOLD': self.selection.motion_blur_threshold,
+            'EXPOSURE_THRESHOLD': self.selection.exposure_threshold,
             'MIN_FEATURE_MATCHES': self.gric.min_matches,
             'ENABLE_POLAR_MASK': self.equirect360.enable_polar_mask,
             'MASK_POLAR_RATIO': self.equirect360.mask_polar_ratio,
@@ -166,6 +168,8 @@ class KeyframeConfig:
         config.selection.max_keyframe_interval = d.get('max_keyframe_interval', config.selection.max_keyframe_interval)
         config.selection.softmax_beta = d.get('softmax_beta', config.selection.softmax_beta)
         config.selection.laplacian_threshold = d.get('laplacian_threshold', config.selection.laplacian_threshold)
+        config.selection.motion_blur_threshold = d.get('motion_blur_threshold', config.selection.motion_blur_threshold)
+        config.selection.exposure_threshold = d.get('exposure_threshold', config.selection.exposure_threshold)
         # GRIC
         config.gric.ransac_threshold = d.get('ransac_threshold', config.gric.ransac_threshold)
         config.gric.lambda1 = d.get('gric_lambda1', config.gric.lambda1)

@@ -17,6 +17,7 @@ from .quality_evaluator import QualityEvaluator
 from .geometric_evaluator import GeometricEvaluator
 from .adaptive_selector import AdaptiveSelector
 from .accelerator import get_accelerator
+from processing.fisheye_rig import FisheyeRigProcessor
 from .exceptions import (
     GeometricDegeneracyError,
     EstimationFailureError,
@@ -111,10 +112,16 @@ class KeyframeSelector:
             'GRIC_RATIO_THRESHOLD': 0.8,
             'SSIM_CHANGE_THRESHOLD': 0.85,
             'MOTION_BLUR_THRESHOLD': 0.3,
+            'EXPOSURE_THRESHOLD': 0.35,
+            'PAIR_MOTION_AGGREGATION': 'max',
             'MIN_FEATURE_MATCHES': 30,
             'THUMBNAIL_SIZE': (192, 108),
             'SAMPLE_INTERVAL': 1,
             'STAGE1_BATCH_SIZE': 32,
+            'ENABLE_RIG_STITCHING': True,
+            'EQUIRECT_WIDTH': 4096,
+            'EQUIRECT_HEIGHT': 2048,
+            'RIG_FEATURE_METHOD': 'orb',
             # レスキューモード設定
             'ENABLE_RESCUE_MODE': False,
             'RESCUE_FEATURE_THRESHOLD': 15,  # この値以下で特徴点不足と判定
@@ -129,6 +136,29 @@ class KeyframeSelector:
         # 外部設定でオーバーライド
         if config:
             self.config.update(config)
+            # lower_snake_case 設定との互換
+            alias_map = {
+                'laplacian_threshold': 'LAPLACIAN_THRESHOLD',
+                'motion_blur_threshold': 'MOTION_BLUR_THRESHOLD',
+                'exposure_threshold': 'EXPOSURE_THRESHOLD',
+                'min_keyframe_interval': 'MIN_KEYFRAME_INTERVAL',
+                'max_keyframe_interval': 'MAX_KEYFRAME_INTERVAL',
+                'softmax_beta': 'SOFTMAX_BETA',
+                'ssim_change_threshold': 'SSIM_CHANGE_THRESHOLD',
+                'ssim_threshold': 'SSIM_CHANGE_THRESHOLD',
+                'weight_sharpness': 'WEIGHT_SHARPNESS',
+                'weight_exposure': 'WEIGHT_EXPOSURE',
+                'weight_geometric': 'WEIGHT_GEOMETRIC',
+                'weight_content': 'WEIGHT_CONTENT',
+                'pair_motion_aggregation': 'PAIR_MOTION_AGGREGATION',
+                'enable_rig_stitching': 'ENABLE_RIG_STITCHING',
+                'equirect_width': 'EQUIRECT_WIDTH',
+                'equirect_height': 'EQUIRECT_HEIGHT',
+                'rig_feature_method': 'RIG_FEATURE_METHOD',
+            }
+            for src, dst in alias_map.items():
+                if src in config:
+                    self.config[dst] = config[src]
 
         # 正規化設定
         self.normalization = NormalizationConfig(
@@ -164,6 +194,7 @@ class KeyframeSelector:
             equirect_config=equirect_config
         )
         self.adaptive_selector = AdaptiveSelector()
+        self.rig_processor = FisheyeRigProcessor(equirect_config=equirect_config)
 
         # アクセレータから情報を取得
         self.accelerator = get_accelerator()
@@ -347,20 +378,14 @@ class KeyframeSelector:
         if metadata is None:
             raise RuntimeError("ビデオが読み込まれていません")
 
-        # ステレオ判定
+        is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
         is_stereo = hasattr(video_loader, 'is_stereo') and video_loader.is_stereo
-        if is_stereo:
+        rig_type = getattr(video_loader, 'rig_type', getattr(metadata, 'rig_type', 'monocular'))
+
+        if is_paired:
+            logger.info(f"ペアレンズモードでキーフレーム選択を実行: rig_type={rig_type}")
+        elif is_stereo:
             logger.info("ステレオモード（OSV）でキーフレーム選択を実行")
-
-        # ビデオパスを取得（独立キャプチャ用）
-        if is_stereo:
-            # DualVideoLoader の場合は左目ストリームを使用
-            video_path = video_loader.left_path
-        else:
-            video_path = video_loader._video_path
-
-        if video_path is None:
-            raise RuntimeError("ビデオパスが取得できません")
 
         total_frames = metadata.frame_count
         logger.info(f"キーフレーム選択開始: {total_frames}フレーム")
@@ -368,7 +393,7 @@ class KeyframeSelector:
         # ===== Stage 1: 高速フィルタリング =====
         logger.info("Stage 1: 高速品質フィルタリング開始")
         stage1_candidates = self._stage1_fast_filter(
-            video_path, metadata, progress_callback
+            video_loader, metadata, progress_callback
         )
         logger.info(
             f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
@@ -382,7 +407,7 @@ class KeyframeSelector:
         # ===== Stage 2: 精密評価 =====
         logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
         stage2_candidates = self._stage2_precise_evaluation(
-            video_path, metadata, stage1_candidates, progress_callback
+            video_loader, metadata, stage1_candidates, progress_callback
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
 
@@ -396,7 +421,7 @@ class KeyframeSelector:
 
         return keyframes
 
-    def _stage1_fast_filter(self, video_path, metadata: VideoMetadata,
+    def _stage1_fast_filter(self, video_loader, metadata: VideoMetadata,
                            progress_callback: Optional[Callable[[int, int], None]]) -> List[Dict]:
         """
         Stage 1: 高速品質フィルタリング（全フレーム）
@@ -431,10 +456,34 @@ class KeyframeSelector:
 
         candidates = []
 
-        # 独立したVideoCaptureを開く（FFmpegスレッド安全性対策）
+        is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
+
+        # ペアレンズ: レンズ毎品質評価 + AND条件
+        if is_paired:
+            for idx, frame_idx in enumerate(frame_indices):
+                frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
+                if frame_a is None or frame_b is None:
+                    continue
+
+                quality_scores = self._compute_quality_score_pair(frame_a, frame_b)
+
+                if quality_scores['passes_threshold']:
+                    candidates.append({
+                        'frame_idx': frame_idx,
+                        'quality_scores': quality_scores
+                    })
+
+                if progress_callback:
+                    progress_callback(idx + 1, len(frame_indices))
+            return candidates
+
+        # 単眼: 独立キャプチャ + 並列品質計算
+        video_path = getattr(video_loader, "_video_path", None)
+        if video_path is None:
+            raise RuntimeError("単眼モードのビデオパスが取得できません")
+
         cap = self._open_independent_capture(video_path)
         try:
-            # バッチ処理
             num_batches = (len(frame_indices) + batch_size - 1) // batch_size
             last_read_idx = -1
 
@@ -443,17 +492,14 @@ class KeyframeSelector:
                 end_idx = min((batch_idx + 1) * batch_size, len(frame_indices))
                 batch_indices = frame_indices[start_idx:end_idx]
 
-                # バッチ内のフレームをシングルスレッドで順次読み込む
                 frames = []
                 valid_indices = []
                 for frame_idx in batch_indices:
-                    # シーケンシャル読み込みの場合はシーク不要
                     if frame_idx != last_read_idx + 1:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
 
                     ret, frame = cap.read()
                     last_read_idx = frame_idx
-
                     if ret and frame is not None:
                         frames.append(frame)
                         valid_indices.append(frame_idx)
@@ -461,29 +507,16 @@ class KeyframeSelector:
                 if not frames:
                     continue
 
-                # マルチスレッドで品質スコアを計算（CPU処理のみ並列化）
                 num_workers = min(self.accelerator.num_threads, len(frames))
                 with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                    quality_list = list(executor.map(
-                        self._compute_quality_score,
-                        frames
-                    ))
+                    quality_list = list(executor.map(self._compute_quality_score, frames))
 
-                # フィルタリング
                 for frame_idx, quality_scores in zip(valid_indices, quality_list):
-                    # 品質基準をチェック
                     if quality_scores['sharpness'] >= self.config['LAPLACIAN_THRESHOLD'] and \
-                       quality_scores['motion_blur'] <= self.config['MOTION_BLUR_THRESHOLD']:
-                        candidates.append({
-                            'frame_idx': frame_idx,
-                            'quality_scores': quality_scores
-                        })
-                        logger.debug(
-                            f"Stage1通過 Frame {frame_idx}: "
-                            f"sharpness={quality_scores['sharpness']:.1f}"
-                        )
+                       quality_scores['motion_blur'] <= self.config['MOTION_BLUR_THRESHOLD'] and \
+                       quality_scores['exposure'] >= self.config['EXPOSURE_THRESHOLD']:
+                        candidates.append({'frame_idx': frame_idx, 'quality_scores': quality_scores})
 
-                # 進捗コールバック
                 if progress_callback:
                     progress_callback(end_idx, len(frame_indices))
 
@@ -493,7 +526,7 @@ class KeyframeSelector:
 
         return candidates
 
-    def _stage2_precise_evaluation(self, video_path, metadata: VideoMetadata,
+    def _stage2_precise_evaluation(self, video_loader, metadata: VideoMetadata,
                                    stage1_candidates: List[Dict],
                                    progress_callback: Optional[Callable[[int, int], None]]
                                    ) -> List[KeyframeInfo]:
@@ -522,12 +555,19 @@ class KeyframeSelector:
         candidates = []
         last_keyframe_idx = -self.config['MIN_KEYFRAME_INTERVAL']
         last_keyframe = None
+        last_pair = None
 
         # フレームウィンドウ（カメラ加速度計算用）
         frame_window = deque(maxlen=5)
 
-        # 独立したVideoCaptureを開く（FFmpegスレッド安全性対策）
-        cap = self._open_independent_capture(video_path)
+        is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
+        cap = None
+        if not is_paired:
+            video_path = getattr(video_loader, "_video_path", None)
+            if video_path is None:
+                raise RuntimeError("単眼モードのビデオパスが取得できません")
+            cap = self._open_independent_capture(video_path)
+
         try:
             for idx, candidate_info in enumerate(stage1_candidates):
                 frame_idx = candidate_info['frame_idx']
@@ -536,44 +576,62 @@ class KeyframeSelector:
                 if progress_callback:
                     progress_callback(idx, len(stage1_candidates))
 
-                # 最小間隔制約をチェック
                 if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
                     continue
 
-                # 独立キャプチャからフレームを読み込む
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, current_frame = cap.read()
-                if not ret or current_frame is None:
-                    continue
+                current_frame = None
+                current_pair = None
+                if is_paired:
+                    frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
+                    if frame_a is None or frame_b is None:
+                        continue
+                    current_pair = (frame_a, frame_b)
+                    current_frame = frame_a
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, current_frame = cap.read()
+                    if not ret or current_frame is None:
+                        continue
 
-                # フレームウィンドウを更新
                 frame_window.append(current_frame)
-
-                # 露出変化を検知（混合環境モード）
                 exposure_changed = self._detect_exposure_change(current_frame)
 
-                # 幾何学的・適応的スコアを計算
                 geometric_scores = {}
                 adaptive_scores = {}
-                force_insert = False  # 強制挿入フラグ
+                force_insert = False
 
                 if last_keyframe is not None:
-                    # 前キーフレームとの幾何学的評価
-                    # GRIC例外ハンドリング付き
                     geometric_failed = False
+
+                    geom_ref = last_keyframe
+                    geom_cur = current_frame
+                    if is_paired and self.config.get('ENABLE_RIG_STITCHING', True):
+                        calibration = getattr(metadata, 'rig_calibration', None)
+                        out_w = int(self.config.get('EQUIRECT_WIDTH', 4096))
+                        out_h = int(self.config.get('EQUIRECT_HEIGHT', 2048))
+                        last_pan, last_seam = self.rig_processor.stitch_to_equirect(
+                            last_pair[0], last_pair[1], calibration, (out_w, out_h)
+                        )
+                        cur_pan, cur_seam = self.rig_processor.stitch_to_equirect(
+                            current_pair[0], current_pair[1], calibration, (out_w, out_h)
+                        )
+                        method = self.config.get('RIG_FEATURE_METHOD', 'orb')
+                        f_prev = self.rig_processor.extract_360_features(last_pan, last_seam, method=method)
+                        f_cur = self.rig_processor.extract_360_features(cur_pan, cur_seam, method=method)
+                        quality_scores['seam_features_prev'] = float(f_prev.seam_keypoint_count)
+                        quality_scores['seam_features_cur'] = float(f_cur.seam_keypoint_count)
+                        geom_ref, geom_cur = last_pan, cur_pan
+
                     try:
                         geometric_scores = self.geometric_evaluator.evaluate(
-                            last_keyframe, current_frame,
+                            geom_ref, geom_cur,
                             frame1_idx=last_keyframe_idx,
                             frame2_idx=frame_idx
                         )
                     except GeometricDegeneracyError as e:
-                        # 回転のみ/平面シーン → スコアを強制的に下げて続行
-                        logger.debug(
-                            f"フレーム {frame_idx}: 幾何学的縮退 - {e}"
-                        )
+                        logger.debug(f"フレーム {frame_idx}: 幾何学的縮退 - {e}")
                         geometric_scores = {
-                            'gric': 0.1,  # 低スコア
+                            'gric': 0.1,
                             'feature_distribution_1': 0.0,
                             'feature_distribution_2': 0.0,
                             'feature_match_count': 0,
@@ -581,22 +639,9 @@ class KeyframeSelector:
                         }
                         geometric_failed = True
                     except (EstimationFailureError, InsufficientFeaturesError) as e:
-                        # 推定失敗/特徴点不足
-                        logger.debug(
-                            f"フレーム {frame_idx}: 幾何学的評価失敗 - {e}"
-                        )
-
-                        # レスキューモード判定（特徴点数=0として記録）
+                        logger.debug(f"フレーム {frame_idx}: 幾何学的評価失敗 - {e}")
                         self.is_rescue_mode = self._check_rescue_mode(0)
-
-                        # レスキューモード中かつ最小間隔を超えている場合は強制採用を検討
-                        if self.is_rescue_mode and \
-                           frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
-                            logger.warning(
-                                f"レスキューモード: フレーム {frame_idx} を "
-                                f"特徴点不足にもかかわらず強制採用を検討"
-                            )
-                            # 極端に低いスコアでも採用
+                        if self.is_rescue_mode and frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
                             geometric_scores = {
                                 'gric': 0.05,
                                 'feature_distribution_1': 0.0,
@@ -609,45 +654,36 @@ class KeyframeSelector:
                         else:
                             continue
 
-                    # 特徴点マッチング数でレスキューモードを更新
                     if not geometric_failed and 'feature_match_count' in geometric_scores:
-                        self.is_rescue_mode = self._check_rescue_mode(
-                            geometric_scores['feature_match_count']
-                        )
+                        self.is_rescue_mode = self._check_rescue_mode(geometric_scores['feature_match_count'])
 
-                    # 適応的スコア計算
                     adaptive_scores = self.adaptive_selector.evaluate(
-                        last_keyframe, current_frame,
-                        frames_window=list(frame_window)
+                        last_keyframe, current_frame, frames_window=list(frame_window)
                     )
 
-                    # SSIM変化が小さすぎる場合はスキップ（ただし強制挿入や露出変化時は除く）
+                    if is_paired and last_pair is not None and current_pair is not None:
+                        flow_a = self.adaptive_selector.compute_optical_flow_magnitude(last_pair[0], current_pair[0])
+                        flow_b = self.adaptive_selector.compute_optical_flow_magnitude(last_pair[1], current_pair[1])
+                        if self.config.get('PAIR_MOTION_AGGREGATION', 'max') == 'max':
+                            adaptive_scores['optical_flow'] = max(flow_a, flow_b)
+                        else:
+                            adaptive_scores['optical_flow'] = (flow_a + flow_b) * 0.5
+                        adaptive_scores['optical_flow_lens_a'] = flow_a
+                        adaptive_scores['optical_flow_lens_b'] = flow_b
+
                     ssim = adaptive_scores.get('ssim', 1.0)
-                    if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and \
-                       not force_insert and not exposure_changed:
-                        logger.debug(f"フレーム {frame_idx}: 変化不足 (SSIM: {ssim:.3f})")
+                    if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and not force_insert and not exposure_changed:
                         continue
 
-                    # 露出変化による強制挿入
-                    if exposure_changed and \
-                       frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
+                    if exposure_changed and frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
                         force_insert = True
-                        logger.info(
-                            f"露出変化検知: フレーム {frame_idx} を強制挿入 "
-                            f"(MIN_KEYFRAME_INTERVAL無視)"
-                        )
-
                 else:
-                    # 最初のキーフレーム
                     geometric_failed = False
-                    logger.debug(f"最初のキーフレーム: {frame_idx}")
 
-                # 統合スコアを計算
                 combined_score = self._compute_combined_score(
                     quality_scores, geometric_scores, adaptive_scores
                 )
 
-                # キーフレーム候補を作成（サムネイルはまだ生成しない）
                 candidate = KeyframeInfo(
                     frame_index=frame_idx,
                     timestamp=frame_idx / metadata.fps,
@@ -655,32 +691,23 @@ class KeyframeSelector:
                     geometric_scores=geometric_scores,
                     adaptive_scores=adaptive_scores,
                     combined_score=combined_score,
-                    thumbnail=None,  # 遅延生成
+                    thumbnail=None,
                     is_rescue_mode=self.is_rescue_mode,
                     is_force_inserted=force_insert or exposure_changed
                 )
-
                 candidates.append(candidate)
 
-                # レスキューモードで選択されたフレームを記録
                 if self.is_rescue_mode:
                     self.rescue_mode_keyframes.append(frame_idx)
 
                 last_keyframe_idx = frame_idx
                 last_keyframe = current_frame
-
-                log_msg = f"候補フレーム {frame_idx}: 品質={combined_score:.3f}"
-                if adaptive_scores:
-                    log_msg += f", SSIM={adaptive_scores.get('ssim', 0):.3f}"
-                if self.is_rescue_mode:
-                    log_msg += " [RESCUE]"
-                if force_insert or exposure_changed:
-                    log_msg += " [FORCE]"
-                logger.debug(log_msg)
+                last_pair = current_pair
 
         finally:
-            cap.release()
-            logger.debug("Stage 2: 独立キャプチャを解放")
+            if cap is not None:
+                cap.release()
+                logger.debug("Stage 2: 独立キャプチャを解放")
 
         return candidates
 
@@ -703,58 +730,44 @@ class KeyframeSelector:
             beta=self.config['SOFTMAX_BETA']
         )
 
-    def _compute_quality_score_stereo(self, frame_l: np.ndarray,
-                                     frame_r: np.ndarray) -> Dict[str, float]:
+    def _compute_quality_score_pair(self, frame_a: np.ndarray,
+                                    frame_b: np.ndarray) -> Dict[str, float]:
         """
-        ステレオフレームペアの品質スコアを計算（Conservative: AND条件）
+        ペアレンズフレームの品質スコアを計算（Conservative AND条件）。
 
-        左右どちらか一方でもブレていたり暗すぎたりした場合、
-        そのフレームペアは3DGSのノイズになるため破棄する。
-
-        Parameters:
-        -----------
-        frame_l : np.ndarray
-            左目フレーム
-        frame_r : np.ndarray
-            右目フレーム
-
-        Returns:
-        --------
-        dict
-            統合品質スコア（悪い方に合わせる）
+        どちらか片方でも閾値未達なら除外する。
         """
-        # 左右それぞれの品質を評価
-        score_l = self.quality_evaluator.evaluate(
-            frame_l,
-            beta=self.config['SOFTMAX_BETA']
+        score_a = self.quality_evaluator.evaluate(frame_a, beta=self.config['SOFTMAX_BETA'])
+        score_b = self.quality_evaluator.evaluate(frame_b, beta=self.config['SOFTMAX_BETA'])
+
+        sharpness_ok = (
+            score_a.get('sharpness', 0.0) >= self.config['LAPLACIAN_THRESHOLD'] and
+            score_b.get('sharpness', 0.0) >= self.config['LAPLACIAN_THRESHOLD']
         )
-        score_r = self.quality_evaluator.evaluate(
-            frame_r,
-            beta=self.config['SOFTMAX_BETA']
+        motion_ok = (
+            score_a.get('motion_blur', 1.0) <= self.config['MOTION_BLUR_THRESHOLD'] and
+            score_b.get('motion_blur', 1.0) <= self.config['MOTION_BLUR_THRESHOLD']
+        )
+        exposure_ok = (
+            score_a.get('exposure', 0.0) >= self.config['EXPOSURE_THRESHOLD'] and
+            score_b.get('exposure', 0.0) >= self.config['EXPOSURE_THRESHOLD']
         )
 
-        # Conservative: 悪い方に合わせる（AND条件）
-        # 片方のレンズに汚れや直射日光が入った場合を厳しく除外
         combined_score = {
-            'sharpness': min(score_l.get('sharpness', 0),
-                           score_r.get('sharpness', 0)),
-            'exposure': min(score_l.get('exposure', 0),
-                          score_r.get('exposure', 0)),
-            'motion_blur': max(score_l.get('motion_blur', 1.0),
-                             score_r.get('motion_blur', 1.0)),  # ブラーは大きい方が悪い
-            'feature_count': min(score_l.get('feature_count', 0),
-                               score_r.get('feature_count', 0)),
+            'sharpness': min(score_a.get('sharpness', 0.0), score_b.get('sharpness', 0.0)),
+            'exposure': min(score_a.get('exposure', 0.0), score_b.get('exposure', 0.0)),
+            'motion_blur': max(score_a.get('motion_blur', 1.0), score_b.get('motion_blur', 1.0)),
+            'softmax_depth': min(score_a.get('softmax_depth', 0.0), score_b.get('softmax_depth', 0.0)),
+            'lens_a': score_a,
+            'lens_b': score_b,
+            'passes_threshold': bool(sharpness_ok and motion_ok and exposure_ok),
         }
-
-        logger.debug(
-            f"Stereo Quality - L: sharp={score_l.get('sharpness', 0):.1f} "
-            f"exp={score_l.get('exposure', 0):.2f} | "
-            f"R: sharp={score_r.get('sharpness', 0):.1f} "
-            f"exp={score_r.get('exposure', 0):.2f} | "
-            f"Combined: sharp={combined_score['sharpness']:.1f}"
-        )
-
         return combined_score
+
+    def _compute_quality_score_stereo(self, frame_l: np.ndarray,
+                                      frame_r: np.ndarray) -> Dict[str, float]:
+        """後方互換ラッパー。"""
+        return self._compute_quality_score_pair(frame_l, frame_r)
 
     def _compute_combined_score(self, quality_scores: Dict[str, float],
                                geometric_scores: Dict[str, float],

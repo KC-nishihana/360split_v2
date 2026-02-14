@@ -215,7 +215,9 @@ if processing_enabled:
 - ✅ `equirect_height` - 出力解像度（高さ）
 - ✅ `enable_polar_mask` - 天頂/天底マスク
 - ✅ `mask_polar_ratio` - マスク比率
-- ⚠️ `projection_mode`, `perspective_fov`, `stitching_mode` は未実装（将来の拡張用）
+- ⚠️ `projection_mode` は未実装（将来の拡張用）
+- ✅ `perspective_fov` は Perspective 出力で使用
+- ✅ `stitching_mode` はステレオエクスポート時の Fast/HQ/Depth-aware 切替に対応
 
 #### 3. マスク処理設定（タブ3）✨ **新規実装**
 - ✅ `enable_nadir_mask` - ナディアマスク

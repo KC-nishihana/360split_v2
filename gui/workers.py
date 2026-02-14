@@ -416,6 +416,8 @@ class ExportWorker(QThread):
                  enable_equirect: bool = False,
                  equirect_width: int = 4096,
                  equirect_height: int = 2048,
+                 enable_stereo_stitch: bool = False,
+                 stitching_mode: str = "Fast",
                  enable_polar_mask: bool = False,
                  mask_polar_ratio: float = 0.10,
                  # Cubemap 出力設定
@@ -445,6 +447,8 @@ class ExportWorker(QThread):
         self.enable_equirect = enable_equirect
         self.equirect_width = equirect_width
         self.equirect_height = equirect_height
+        self.enable_stereo_stitch = enable_stereo_stitch
+        self.stitching_mode = stitching_mode
         self.enable_polar_mask = enable_polar_mask
         self.mask_polar_ratio = mask_polar_ratio
 
@@ -530,6 +534,16 @@ class ExportWorker(QThread):
                     self.enable_nadir_mask = False
                     self.enable_equipment_detection = False
 
+            stitch_processor = None
+            if self.is_stereo and self.enable_stereo_stitch:
+                try:
+                    from processing.stitching import StitchingProcessor
+                    stitch_processor = StitchingProcessor()
+                    logger.info(f"ステレオステッチングを有効化しました: mode={self.stitching_mode}")
+                except ImportError as e:
+                    logger.warning(f"StitchingProcessor のインポートに失敗: {e}")
+                    self.enable_stereo_stitch = False
+
             total = len(self.frame_indices)
             exported = 0
 
@@ -549,7 +563,21 @@ class ExportWorker(QThread):
                         logger.warning(f"ステレオフレーム読み込み失敗: {frame_idx}")
                         continue
 
-                    frames_to_process = [(frame_l, '_L'), (frame_r, '_R')]
+                    if self.enable_stereo_stitch and stitch_processor is not None:
+                        try:
+                            mode = str(self.stitching_mode).lower()
+                            if mode == "high quality (hq)":
+                                stitched = stitch_processor.stitch_high_quality([frame_l, frame_r])
+                            elif mode == "depth-aware":
+                                stitched = stitch_processor.stitch_depth_aware([frame_l, frame_r])
+                            else:
+                                stitched = stitch_processor.stitch_fast([frame_l, frame_r], mode='horizontal')
+                            frames_to_process = [(stitched, '')]
+                        except Exception as e:
+                            logger.warning(f"ステッチング失敗（フレーム {frame_idx}）: {e}")
+                            frames_to_process = [(frame_l, '_L'), (frame_r, '_R')]
+                    else:
+                        frames_to_process = [(frame_l, '_L'), (frame_r, '_R')]
                 else:
                     # 単眼読み込み
                     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -568,8 +596,8 @@ class ExportWorker(QThread):
                     # ファイル拡張子を決定（ステレオ/非ステレオ両方で使用）
                     ext = 'jpg' if self.format in ('jpg', 'jpeg') else self.format
 
-                    # ステレオの場合はスティッチ未処理のため分割処理をスキップ
-                    if self.is_stereo:
+                    # ステレオ・非ステッチ時は L/R を分離保存
+                    if self.is_stereo and (not self.enable_stereo_stitch or suffix):
                         # パノラマ画像のみを L/ または R/ フォルダに保存
                         output_subdir = output_path / suffix.strip('_')  # 'L' or 'R'
                         output_subdir.mkdir(parents=True, exist_ok=True)

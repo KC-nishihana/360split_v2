@@ -173,44 +173,14 @@ def load_config(config_path: str = None, preset_id: str = None) -> dict:
     dict
         マージされた設定辞書
     """
-    import config as default_config
     from core.config_loader import ConfigManager
 
-    settings = {
-        "laplacian_threshold": default_config.LAPLACIAN_THRESHOLD,
-        "brightness_min": default_config.BRIGHTNESS_MIN,
-        "brightness_max": default_config.BRIGHTNESS_MAX,
-        "motion_blur_threshold": default_config.MOTION_BLUR_THRESHOLD,
-        "softmax_beta": default_config.SOFTMAX_BETA,
-        "gric_ratio_threshold": default_config.GRIC_RATIO_THRESHOLD,
-        "gric_degeneracy_threshold": default_config.GRIC_RATIO_THRESHOLD,
-        "min_feature_matches": default_config.MIN_FEATURE_MATCHES,
-        "ssim_change_threshold": default_config.SSIM_CHANGE_THRESHOLD,
-        "ssim_threshold": default_config.SSIM_CHANGE_THRESHOLD,
-        "min_keyframe_interval": default_config.MIN_KEYFRAME_INTERVAL,
-        "max_keyframe_interval": default_config.MAX_KEYFRAME_INTERVAL,
-        "momentum_boost_factor": default_config.MOMENTUM_BOOST_FACTOR,
-        "weight_sharpness": default_config.WEIGHT_SHARPNESS,
-        "weight_exposure": default_config.WEIGHT_EXPOSURE,
-        "weight_geometric": default_config.WEIGHT_GEOMETRIC,
-        "weight_content": default_config.WEIGHT_CONTENT,
-        "exposure_threshold": 0.35,
-        "pair_motion_aggregation": "max",
-        "enable_rig_stitching": True,
-        "rig_feature_method": "orb",
-        "equirect_width": default_config.EQUIRECT_WIDTH,
-        "equirect_height": default_config.EQUIRECT_HEIGHT,
-        "cubemap_face_size": default_config.CUBEMAP_FACE_SIZE,
-        "perspective_fov": default_config.PERSPECTIVE_FOV,
-        "mask_dilation_kernel": default_config.MASK_DILATION_KERNEL,
-        "output_image_format": default_config.OUTPUT_IMAGE_FORMAT,
-        "output_jpeg_quality": default_config.OUTPUT_JPEG_QUALITY,
-    }
+    config_manager = ConfigManager()
+    settings = config_manager.default_config()
 
     # プリセット適用
     if preset_id:
         try:
-            config_manager = ConfigManager()
             preset_config = config_manager.load_preset(preset_id, settings)
             settings = preset_config
             logger.info(f"プリセット '{preset_id}' を適用しました")

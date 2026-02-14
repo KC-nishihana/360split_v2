@@ -8,6 +8,8 @@
 > - Visual Odometry（カメラ軌跡推定）モジュールの実験的実装を追加
 > - エクスポートダイアログUIの追加
 > - 画像I/Oユーティリティの拡張
+> - 設定デフォルトの定義を `ConfigManager.default_config()` に一本化
+> - ステレオエクスポート時のステッチングモード（Fast/HQ/Depth-aware）を実装
 
 
 ## 主な特徴
@@ -237,8 +239,8 @@ GUIモードでは、設定ダイアログの「キーフレーム選択」タ�
 │   ├── main_window.py       # メインウィンドウ、UI統合
 │   ├── video_player.py      # 動画プレビュー、フレームナビゲーション
 │   ├── timeline_widget.py   # タイムラインUI、pyqtgraphスコアグラフ
-│   ├── keyframe_panel.py    # キーフレーム詳細パネル
-│   ├── keyframe_list.py     # キーフレーム一覧、サムネイル表示
+│   ├── keyframe_panel.py    # キーフレーム一覧・詳細表示パネル（MainWindowで使用）
+│   ├── keyframe_list.py     # 旧キーフレーム一覧ウィジェット（互換用）
 │   ├── settings_dialog.py   # 設定ダイアログ（4タブ構成）
 │   ├── settings_panel.py    # 設定パネルコンポーネント
 │   ├── export_dialog.py     # エクスポートダイアログ（出力設定、フォーマット選択）
@@ -280,7 +282,7 @@ GUIモードでは、設定ダイアログの「キーフレーム選択」タ�
 
 ## 設定ファイル
 
-JSON形式の設定ファイルで各パラメータをカスタマイズできます。`config.py` にはデータクラスベースの設定が定義されており、JSON形式でオーバーライド可能です。
+JSON形式の設定ファイルで各パラメータをカスタマイズできます。デフォルト値は `core/config_loader.py` の `ConfigManager.default_config()` で一元管理され、JSON形式でオーバーライド可能です。
 
 ```json
 {
@@ -298,6 +300,8 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
   "weight_content": 0.25,
   "enable_polar_mask": true,
   "mask_polar_ratio": 0.10,
+  "enable_stereo_stitch": true,
+  "stitching_mode": "Fast",
   "output_image_format": "png",
   "output_jpeg_quality": 95
 }

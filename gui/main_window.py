@@ -31,7 +31,7 @@ from gui.video_player import VideoPlayerWidget
 from gui.timeline_widget import TimelineWidget
 from gui.settings_panel import SettingsPanel
 from gui.settings_dialog import SettingsDialog
-from gui.keyframe_list import KeyframeListWidget
+from gui.keyframe_panel import KeyframePanel
 from gui.export_dialog import ExportDialog
 from gui.workers import Stage1Worker, Stage2Worker, FullAnalysisWorker, ExportWorker, FrameScoreData
 
@@ -122,7 +122,7 @@ class MainWindow(QMainWindow):
         tab_widget.addTab(self.settings_panel, "⚙ 設定")
 
         # タブ 2: キーフレーム一覧
-        self.keyframe_list = KeyframeListWidget()
+        self.keyframe_list = KeyframePanel()
         tab_widget.addTab(self.keyframe_list, "📋 キーフレーム")
 
         dock.setWidget(tab_widget)
@@ -254,6 +254,16 @@ class MainWindow(QMainWindow):
 
     def _load_video(self, path: str):
         try:
+            # 進行中ワーカーを停止し、前回解析の反映競合を防ぐ
+            self._stop_workers()
+
+            # 前回解析結果を先にクリア
+            self._stage1_scores.clear()
+            self.keyframe_list.clear()
+            self.timeline.set_keyframes([], [])
+            self.timeline.set_score_data([], [])
+            self.video_player.set_keyframe_indices([])
+
             self.video_path = path
 
             # OSV ファイル判定
@@ -295,8 +305,6 @@ class MainWindow(QMainWindow):
 
             self.timeline.set_duration(metadata.frame_count, metadata.fps)
             self.keyframe_list.set_video_path(path)
-            self.keyframe_list.clear()
-            self._stage1_scores.clear()
 
             self.statusBar().showMessage(status_msg)
 
@@ -489,7 +497,10 @@ class MainWindow(QMainWindow):
         if frame_idx not in self.keyframe_list.keyframe_frames:
             self.keyframe_list.keyframe_frames.append(frame_idx)
             self.keyframe_list.keyframe_scores.append(0.5)
-            self.keyframe_list._load_thumbnails()
+            if hasattr(self.keyframe_list, "_load_thumbnail_images"):
+                self.keyframe_list._load_thumbnail_images()
+            elif hasattr(self.keyframe_list, "_load_thumbnails"):
+                self.keyframe_list._load_thumbnails()
             self.keyframe_list._update_display()
             self.timeline.set_keyframes(
                 self.keyframe_list.keyframe_frames,
@@ -568,6 +579,8 @@ class MainWindow(QMainWindow):
             enable_equirect=s["enable_equirect"],
             equirect_width=s["equirect_width"],
             equirect_height=s["equirect_height"],
+            enable_stereo_stitch=s["enable_stereo_stitch"],
+            stitching_mode=s["stitching_mode"],
             enable_polar_mask=s["enable_polar_mask"],
             mask_polar_ratio=s["mask_polar_ratio"],
             # Cubemap 出力

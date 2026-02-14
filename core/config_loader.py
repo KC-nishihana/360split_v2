@@ -60,6 +60,12 @@ class ConfigManager:
     50.0
     """
 
+    PRESET_MAPPING = {
+        'outdoor': 'outdoor_high_quality',
+        'indoor': 'indoor_robust_tracking',
+        'mixed': 'mixed_adaptive'
+    }
+
     def __init__(self, presets_dir: Optional[Path] = None):
         """
         初期化
@@ -78,6 +84,57 @@ class ConfigManager:
 
         self._preset_cache: Dict[str, PresetInfo] = {}
         self._scan_presets()
+
+    @staticmethod
+    def default_config() -> Dict:
+        """
+        単一のデフォルト設定を返す。
+
+        Notes:
+        ------
+        main.py / GUI / CLI のベース設定はここを唯一の定義源にする。
+        """
+        import config as default_config
+
+        return {
+            "laplacian_threshold": default_config.LAPLACIAN_THRESHOLD,
+            "brightness_min": default_config.BRIGHTNESS_MIN,
+            "brightness_max": default_config.BRIGHTNESS_MAX,
+            "motion_blur_threshold": default_config.MOTION_BLUR_THRESHOLD,
+            "exposure_threshold": 0.35,
+            "softmax_beta": default_config.SOFTMAX_BETA,
+            "gric_ratio_threshold": default_config.GRIC_RATIO_THRESHOLD,
+            "gric_degeneracy_threshold": default_config.GRIC_RATIO_THRESHOLD,
+            "min_feature_matches": default_config.MIN_FEATURE_MATCHES,
+            "ssim_change_threshold": default_config.SSIM_CHANGE_THRESHOLD,
+            "ssim_threshold": default_config.SSIM_CHANGE_THRESHOLD,
+            "min_keyframe_interval": default_config.MIN_KEYFRAME_INTERVAL,
+            "max_keyframe_interval": default_config.MAX_KEYFRAME_INTERVAL,
+            "momentum_boost_factor": default_config.MOMENTUM_BOOST_FACTOR,
+            "weight_sharpness": default_config.WEIGHT_SHARPNESS,
+            "weight_exposure": default_config.WEIGHT_EXPOSURE,
+            "weight_geometric": default_config.WEIGHT_GEOMETRIC,
+            "weight_content": default_config.WEIGHT_CONTENT,
+            "pair_motion_aggregation": "max",
+            "enable_rig_stitching": True,
+            "rig_feature_method": "orb",
+            "stitching_mode": "Fast",
+            "enable_stereo_stitch": True,
+            "equirect_width": default_config.EQUIRECT_WIDTH,
+            "equirect_height": default_config.EQUIRECT_HEIGHT,
+            "cubemap_face_size": default_config.CUBEMAP_FACE_SIZE,
+            "perspective_fov": default_config.PERSPECTIVE_FOV,
+            "mask_dilation_kernel": default_config.MASK_DILATION_KERNEL,
+            "output_image_format": default_config.OUTPUT_IMAGE_FORMAT,
+            "output_jpeg_quality": default_config.OUTPUT_JPEG_QUALITY,
+        }
+
+    @classmethod
+    def resolve_preset_id(cls, preset_id: str) -> str:
+        """短縮名(outdoor/indoor/mixed)を実ファイルIDに解決する。"""
+        if not preset_id:
+            return preset_id
+        return cls.PRESET_MAPPING.get(preset_id, preset_id)
 
     def _scan_presets(self):
         """
@@ -164,16 +221,7 @@ class ConfigManager:
         FileNotFoundError
             プリセットが存在しない場合
         """
-        # 短縮名からフル名への変換マッピング
-        preset_mapping = {
-            'outdoor': 'outdoor_high_quality',
-            'indoor': 'indoor_robust_tracking',
-            'mixed': 'mixed_adaptive'
-        }
-
-        # 短縮名を試す
-        if preset_id in preset_mapping:
-            preset_id = preset_mapping[preset_id]
+        preset_id = self.resolve_preset_id(preset_id)
 
         # プリセット取得
         preset_info = self.get_preset_info(preset_id)
@@ -296,31 +344,7 @@ class ConfigManager:
         dict
             最終的な設定辞書
         """
-        # デフォルト設定をインポート
-        import config as default_config
-
-        base_config = {
-            "laplacian_threshold": default_config.LAPLACIAN_THRESHOLD,
-            "brightness_min": default_config.BRIGHTNESS_MIN,
-            "brightness_max": default_config.BRIGHTNESS_MAX,
-            "motion_blur_threshold": default_config.MOTION_BLUR_THRESHOLD,
-            "exposure_threshold": 0.35,
-            "softmax_beta": default_config.SOFTMAX_BETA,
-            "gric_degeneracy_threshold": default_config.GRIC_RATIO_THRESHOLD,
-            "min_feature_matches": default_config.MIN_FEATURE_MATCHES,
-            "ssim_threshold": default_config.SSIM_CHANGE_THRESHOLD,
-            "min_keyframe_interval": default_config.MIN_KEYFRAME_INTERVAL,
-            "max_keyframe_interval": default_config.MAX_KEYFRAME_INTERVAL,
-            "weight_sharpness": default_config.WEIGHT_SHARPNESS,
-            "weight_exposure": default_config.WEIGHT_EXPOSURE,
-            "weight_geometric": default_config.WEIGHT_GEOMETRIC,
-            "weight_content": default_config.WEIGHT_CONTENT,
-            "pair_motion_aggregation": "max",
-            "enable_rig_stitching": True,
-            "rig_feature_method": "orb",
-            "output_image_format": default_config.OUTPUT_IMAGE_FORMAT,
-            "output_jpeg_quality": default_config.OUTPUT_JPEG_QUALITY,
-        }
+        base_config = self.default_config()
 
         # プリセット適用
         config = self.load_preset(preset_id, base_config)

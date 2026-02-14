@@ -246,6 +246,18 @@ class ExportDialog(QDialog):
 
         layout.addWidget(equirect_group)
 
+        # ステレオステッチング
+        stitch_group = QGroupBox("ステレオステッチング（OSV/LR入力時）")
+        stitch_group.setCheckable(True)
+        stitch_group.setChecked(True)
+        self.stereo_stitch_group = stitch_group
+        st_layout = QGridLayout(stitch_group)
+        st_layout.addWidget(QLabel("モード:"), 0, 0)
+        self.stitching_mode_combo = QComboBox()
+        self.stitching_mode_combo.addItems(["Fast", "High Quality (HQ)", "Depth-aware"])
+        st_layout.addWidget(self.stitching_mode_combo, 0, 1)
+        layout.addWidget(stitch_group)
+
         # ポーラーマスク
         polar_group = QGroupBox("ポーラーマスク（天頂/天底黒塗り）")
         polar_group.setCheckable(True)
@@ -361,6 +373,8 @@ class ExportDialog(QDialog):
             "enable_equirect": self.equirect_group.isChecked(),
             "equirect_width": self.equirect_w_spin.value(),
             "equirect_height": self.equirect_h_spin.value(),
+            "enable_stereo_stitch": self.stereo_stitch_group.isChecked(),
+            "stitching_mode": self.stitching_mode_combo.currentText(),
 
             # ポーラーマスク
             "enable_polar_mask": self.polar_group.isChecked(),
@@ -417,6 +431,8 @@ class ExportDialog(QDialog):
                     "enable_equirect": True,
                     "equirect_width": g.get("equirect_width", 4096),
                     "equirect_height": g.get("equirect_height", 2048),
+                    "enable_stereo_stitch": g.get("enable_stereo_stitch", True),
+                    "stitching_mode": g.get("stitching_mode", "Fast"),
                     "enable_polar_mask": g.get("enable_polar_mask", False),
                     "mask_polar_ratio": g.get("mask_polar_ratio", 0.10),
                     "enable_nadir_mask": g.get("enable_nadir_mask", False),
@@ -465,6 +481,11 @@ class ExportDialog(QDialog):
         self.equirect_group.setChecked(bool(s.get("enable_equirect", False)))
         self.equirect_w_spin.setValue(int(s.get("equirect_width", 4096)))
         self.equirect_h_spin.setValue(int(s.get("equirect_height", 2048)))
+        self.stereo_stitch_group.setChecked(bool(s.get("enable_stereo_stitch", True)))
+        stitch_mode = str(s.get("stitching_mode", "Fast"))
+        idx = self.stitching_mode_combo.findText(stitch_mode)
+        if idx >= 0:
+            self.stitching_mode_combo.setCurrentIndex(idx)
 
         # マスク
         self.polar_group.setChecked(bool(s.get("enable_polar_mask", False)))

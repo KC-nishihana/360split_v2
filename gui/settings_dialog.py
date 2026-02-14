@@ -540,36 +540,19 @@ class SettingsDialog(QDialog):
         dict
             設定辞書
         """
+        from core.config_loader import ConfigManager
+
         settings_file = Path.home() / ".360split" / "settings.json"
-        default_settings = {
-            'weight_sharpness': 0.30,
-            'weight_exposure': 0.15,
-            'weight_geometric': 0.30,
-            'weight_content': 0.25,
-            'ssim_threshold': 0.85,
-            'min_keyframe_interval': 5,
-            'max_keyframe_interval': 60,
-            'softmax_beta': 5.0,
-            'gric_lambda1': 2.0,
-            'gric_lambda2': 4.0,
-            'gric_sigma': 1.0,
-            'gric_degeneracy_threshold': 0.85,
-            'equirect_width': 4096,
-            'equirect_height': 2048,
+        default_settings = ConfigManager.default_config()
+        default_settings.update({
             'projection_mode': 'Equirectangular',
-            'perspective_fov': 90.0,
-            'enable_polar_mask': True,
-            'mask_polar_ratio': 0.10,
-            'stitching_mode': 'Fast',
             'enable_nadir_mask': False,
             'nadir_mask_radius': 100,
             'enable_equipment_detection': False,
             'mask_dilation_size': 15,
-            'output_image_format': 'png',
-            'output_jpeg_quality': 95,
             'output_directory': str(Path.home() / "360split_output"),
             'naming_prefix': 'keyframe',
-        }
+        })
 
         try:
             if settings_file.exists():
@@ -674,9 +657,7 @@ class SettingsDialog(QDialog):
             # ConfigManagerでプリセットをロード
             config_manager = ConfigManager()
             preset_info = config_manager.get_preset_info(
-                f"{preset_id}_high_quality" if preset_id == "outdoor" else
-                f"{preset_id}_robust_tracking" if preset_id == "indoor" else
-                f"{preset_id}_adaptive"
+                config_manager.resolve_preset_id(preset_id)
             )
 
             if preset_info is None:

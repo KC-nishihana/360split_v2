@@ -427,9 +427,7 @@ class SettingsPanel(QWidget):
             # ConfigManagerでプリセットをロード
             config_manager = ConfigManager()
             preset_info = config_manager.get_preset_info(
-                f"{preset_id}_high_quality" if preset_id == "outdoor" else
-                f"{preset_id}_robust_tracking" if preset_id == "indoor" else
-                f"{preset_id}_adaptive"
+                config_manager.resolve_preset_id(preset_id)
             )
 
             if preset_info is None:

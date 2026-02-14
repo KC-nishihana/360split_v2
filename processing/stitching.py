@@ -210,7 +210,7 @@ class StitchingProcessor:
         y_max = max(corners[:, 1].max() for corners in all_corners)
 
         canvas_width = int(x_max - x_min)
-        canvas_height = int(y_max - y_max)
+        canvas_height = int(y_max - y_min)
 
         # キャンバスは無限に大きくなる可能性があるため、制限
         canvas_width = min(canvas_width, 8000)

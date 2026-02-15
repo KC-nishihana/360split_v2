@@ -134,6 +134,56 @@ python main.py --cli input.mp4 -v
 | `--cubemap` | Cubemap形式でも出力 | `false` |
 | `--config FILE` | 設定ファイル（JSON） | — |
 | `-v, --verbose` | 詳細ログ出力 | `false` |
+| `--rerun-stream` | 抽出中にRerunへストリーミング | `false` |
+| `--rerun-spawn` | Rerun Viewerを自動起動（`--rerun-stream`時） | `false` |
+| `--rerun-save PATH` | Rerunログを`.rrd`で保存 | — |
+
+### Rerunログ（キーフレーム検証）
+
+抽出結果をRerunで可視化し、`metrics/*` の時系列と軌跡を同時に確認できます。
+
+GUIでは右側の`⚙ 設定`パネル（または設定ダイアログ）で
+`解析時にRerunログを有効化（GUI）` をONにすると、Stage 2 / フル解析時にRerunへ送信されます。
+
+```bash
+# オンラインストリーミング（Viewer起動）
+python main.py --cli input.mp4 --rerun-stream --rerun-spawn
+
+# ストリーミング + .rrd保存
+python main.py --cli input.mp4 --rerun-stream --rerun-spawn --rerun-save ./logs/keyframe_check.rrd
+```
+
+ログされる主なエンティティ:
+- `cam/image`
+- `world/cam`
+- `world/trajectory`
+- `world/keyframes`
+- `metrics/translation_delta`
+- `metrics/rotation_delta`
+- `metrics/laplacian_var`
+- `metrics/match_count`
+- `metrics/overlap_ratio`
+- `metrics/exposure_ratio`
+- `metrics/keyframe_flag`
+
+### オフライン再生（CSV/JSON -> .rrd）
+
+抽出後データ（CSVまたはJSON）を順番に再生して`.rrd`を生成できます。
+
+```bash
+python scripts/rerun_offline_replay.py \
+  --input ./logs/frame_metrics.json \
+  --rrd ./logs/keyframe_offline.rrd \
+  --spawn
+```
+
+入力レコードの主なキー:
+- `frame_index` または `frame_idx`
+- `image_path`（任意）
+- `t_xyz` / `q_wxyz`（任意、未指定時は既定値）
+- `is_keyframe` または `keyframe_flag`
+- `metrics`（辞書）または `translation_delta` などの列
+- `points_world` または `points_path`（`.npy`、任意）
 
 
 ## 環境プリセット機能

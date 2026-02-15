@@ -120,6 +120,7 @@ class ConfigManager:
             "rig_feature_method": "orb",
             "stitching_mode": "Fast",
             "enable_stereo_stitch": True,
+            "enable_rerun_logging": False,
             "equirect_width": default_config.EQUIRECT_WIDTH,
             "equirect_height": default_config.EQUIRECT_HEIGHT,
             "cubemap_face_size": default_config.CUBEMAP_FACE_SIZE,

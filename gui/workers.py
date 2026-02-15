@@ -21,6 +21,7 @@ from PySide6.QtCore import QThread, Signal, QObject
 
 from utils.logger import get_logger
 from utils.image_io import write_image
+from utils.rerun_logger import RerunKeyframeLogger
 logger = get_logger(__name__)
 
 
@@ -199,6 +200,14 @@ class Stage2Worker(QThread):
             loader.load(self.video_path)
 
             selector = KeyframeSelector(config=self.config)
+            rerun_logger = None
+            if bool(self.config.get("enable_rerun_logging", False)):
+                rerun_logger = RerunKeyframeLogger(
+                    app_id="keyframe_check_gui_stage2",
+                    spawn=bool(self.config.get("rerun_spawn", True)),
+                    save_path=self.config.get("rerun_save_path"),
+                    timeline_name="frame",
+                )
 
             def progress_cb(current, total, message=""):
                 if not self._is_running:
@@ -206,8 +215,23 @@ class Stage2Worker(QThread):
                 self.progress.emit(current, total,
                                    f"Stage 2: {current}/{total} {message}")
 
+            def frame_log_cb(payload: dict):
+                if not self._is_running or rerun_logger is None or not rerun_logger.enabled:
+                    return
+                rerun_logger.log_frame(
+                    frame_idx=int(payload.get("frame_index", 0)),
+                    img=payload.get("frame"),
+                    t_xyz=payload.get("t_xyz"),
+                    q_wxyz=payload.get("q_wxyz"),
+                    is_keyframe=bool(payload.get("is_keyframe", False)),
+                    metrics=payload.get("metrics", {}),
+                    points_world=payload.get("points_world"),
+                )
+
             keyframes = selector.select_keyframes(
-                loader, progress_callback=progress_cb
+                loader,
+                progress_callback=progress_cb,
+                frame_log_callback=frame_log_cb if rerun_logger is not None else None,
             )
 
             loader.close()
@@ -362,6 +386,14 @@ class FullAnalysisWorker(QThread):
             loader.load(self.video_path)
 
             selector = KeyframeSelector(config=self.config)
+            rerun_logger = None
+            if bool(self.config.get("enable_rerun_logging", False)):
+                rerun_logger = RerunKeyframeLogger(
+                    app_id="keyframe_check_gui_full",
+                    spawn=bool(self.config.get("rerun_spawn", True)),
+                    save_path=self.config.get("rerun_save_path"),
+                    timeline_name="frame",
+                )
 
             def progress_cb(current, total, message=""):
                 if not self._is_running:
@@ -370,8 +402,23 @@ class FullAnalysisWorker(QThread):
                 self.progress.emit(pct, 100,
                                    f"Stage 2: {current}/{total}")
 
+            def frame_log_cb(payload: dict):
+                if not self._is_running or rerun_logger is None or not rerun_logger.enabled:
+                    return
+                rerun_logger.log_frame(
+                    frame_idx=int(payload.get("frame_index", 0)),
+                    img=payload.get("frame"),
+                    t_xyz=payload.get("t_xyz"),
+                    q_wxyz=payload.get("q_wxyz"),
+                    is_keyframe=bool(payload.get("is_keyframe", False)),
+                    metrics=payload.get("metrics", {}),
+                    points_world=payload.get("points_world"),
+                )
+
             keyframes = selector.select_keyframes(
-                loader, progress_callback=progress_cb
+                loader,
+                progress_callback=progress_cb,
+                frame_log_callback=frame_log_cb if rerun_logger is not None else None,
             )
             loader.close()
 

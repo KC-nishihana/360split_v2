@@ -264,6 +264,18 @@ class SettingsPanel(QWidget):
 
         layout.addWidget(grp_360)
 
+        # ---------- Rerun ----------
+        grp_rerun = QGroupBox("Rerunログ")
+        grp_rerun.setStyleSheet(self._group_style())
+        rl = QVBoxLayout(grp_rerun)
+
+        self._enable_rerun_logging = QCheckBox("解析時にRerunログを有効化（GUI）")
+        self._enable_rerun_logging.setChecked(self._config.enable_rerun_logging)
+        self._enable_rerun_logging.toggled.connect(self._on_live_change)
+        rl.addWidget(self._enable_rerun_logging)
+
+        layout.addWidget(grp_rerun)
+
         # ---------- ボタン ----------
         btn_layout = QHBoxLayout()
 
@@ -311,6 +323,7 @@ class SettingsPanel(QWidget):
 
         c.equirect360.enable_polar_mask = self._use_mask.isChecked()
         c.equirect360.mask_polar_ratio = self._mask_ratio.value()
+        c.enable_rerun_logging = self._enable_rerun_logging.isChecked()
 
         return c
 
@@ -386,6 +399,7 @@ class SettingsPanel(QWidget):
         # 360度設定
         self._use_mask.setChecked(c.equirect360.enable_polar_mask)
         self._mask_ratio.setValue(c.equirect360.mask_polar_ratio)
+        self._enable_rerun_logging.setChecked(c.enable_rerun_logging)
 
         logger.info("settings_dialog からの設定を読み込みました")
 
@@ -506,6 +520,7 @@ class SettingsPanel(QWidget):
         self._ransac_th.setValue(d.gric.ransac_threshold)
         self._use_mask.setChecked(d.equirect360.enable_polar_mask)
         self._mask_ratio.setValue(d.equirect360.mask_polar_ratio)
+        self._enable_rerun_logging.setChecked(d.enable_rerun_logging)
 
     # ==================================================================
     # ユーティリティ

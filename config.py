@@ -105,6 +105,7 @@ class KeyframeConfig:
     sample_interval: int = 1           # フレームサンプリング間隔
     stage1_batch_size: int = 32        # Stage 1 バッチサイズ
     thumbnail_size: Tuple[int, int] = (192, 108)
+    enable_rerun_logging: bool = False  # GUI実行時のRerunログ有効化
 
     def to_selector_dict(self) -> dict:
         """
@@ -140,6 +141,7 @@ class KeyframeConfig:
             'THUMBNAIL_SIZE': self.thumbnail_size,
             'SAMPLE_INTERVAL': self.sample_interval,
             'STAGE1_BATCH_SIZE': self.stage1_batch_size,
+            'enable_rerun_logging': self.enable_rerun_logging,
         }
 
     @classmethod
@@ -179,6 +181,8 @@ class KeyframeConfig:
         # 360
         config.equirect360.enable_polar_mask = d.get('enable_polar_mask', config.equirect360.enable_polar_mask)
         config.equirect360.mask_polar_ratio = d.get('mask_polar_ratio', config.equirect360.mask_polar_ratio)
+        # Rerun
+        config.enable_rerun_logging = bool(d.get('enable_rerun_logging', config.enable_rerun_logging))
         return config
 
 

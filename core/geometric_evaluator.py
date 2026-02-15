@@ -260,24 +260,35 @@ class GeometricEvaluator:
             各点の対称転送誤差 (N,)
         """
         n = pts1.shape[0]
+        if n == 0:
+            return np.array([], dtype=np.float64)
+        if H is None or H.shape != (3, 3) or not np.all(np.isfinite(H)):
+            return np.full(n, np.inf, dtype=np.float64)
 
         # Forward: pts1 → H → pts2_pred
-        pts1_h = np.hstack([pts1, np.ones((n, 1))])
-        pts2_pred = (H @ pts1_h.T).T
-        w = pts2_pred[:, 2:3]
-        w = np.where(np.abs(w) < 1e-10, 1e-10, w)
-        pts2_pred = pts2_pred[:, :2] / w
-        err_forward = np.sum((pts2_pred - pts2) ** 2, axis=1)
+        pts1_h = np.hstack([pts1, np.ones((n, 1), dtype=pts1.dtype)])
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            pts2_pred = (H @ pts1_h.T).T
+            w = pts2_pred[:, 2:3]
+            w = np.where(np.abs(w) < 1e-10, 1e-10, w)
+            pts2_pred = pts2_pred[:, :2] / w
+            err_forward = np.sum((pts2_pred - pts2) ** 2, axis=1)
+        err_forward = np.where(np.isfinite(err_forward), err_forward, np.inf)
 
         # Backward: pts2 → H_inv → pts1_pred
         try:
             H_inv = np.linalg.inv(H)
-            pts2_h = np.hstack([pts2, np.ones((n, 1))])
-            pts1_pred = (H_inv @ pts2_h.T).T
-            w = pts1_pred[:, 2:3]
-            w = np.where(np.abs(w) < 1e-10, 1e-10, w)
-            pts1_pred = pts1_pred[:, :2] / w
-            err_backward = np.sum((pts1_pred - pts1) ** 2, axis=1)
+            if not np.all(np.isfinite(H_inv)):
+                err_backward = np.full(n, np.inf, dtype=np.float64)
+            else:
+                pts2_h = np.hstack([pts2, np.ones((n, 1), dtype=pts2.dtype)])
+                with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+                    pts1_pred = (H_inv @ pts2_h.T).T
+                    w = pts1_pred[:, 2:3]
+                    w = np.where(np.abs(w) < 1e-10, 1e-10, w)
+                    pts1_pred = pts1_pred[:, :2] / w
+                    err_backward = np.sum((pts1_pred - pts1) ** 2, axis=1)
+                err_backward = np.where(np.isfinite(err_backward), err_backward, np.inf)
         except np.linalg.LinAlgError:
             err_backward = err_forward
 
@@ -301,18 +312,24 @@ class GeometricEvaluator:
             各点のSampson距離 (N,)
         """
         n = pts1.shape[0]
-        pts1_h = np.hstack([pts1, np.ones((n, 1))])
-        pts2_h = np.hstack([pts2, np.ones((n, 1))])
+        if n == 0:
+            return np.array([], dtype=np.float64)
+        if F is None or F.shape != (3, 3) or not np.all(np.isfinite(F)):
+            return np.full(n, np.inf, dtype=np.float64)
+        pts1_h = np.hstack([pts1, np.ones((n, 1), dtype=pts1.dtype)])
+        pts2_h = np.hstack([pts2, np.ones((n, 1), dtype=pts2.dtype)])
 
-        Fx1 = (F @ pts1_h.T).T
-        Ftx2 = (F.T @ pts2_h.T).T
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            Fx1 = (F @ pts1_h.T).T
+            Ftx2 = (F.T @ pts2_h.T).T
 
-        x2tFx1 = np.sum(pts2_h * Fx1, axis=1)
+            x2tFx1 = np.sum(pts2_h * Fx1, axis=1)
 
-        denom = Fx1[:, 0]**2 + Fx1[:, 1]**2 + Ftx2[:, 0]**2 + Ftx2[:, 1]**2
-        denom = np.maximum(denom, 1e-10)
+            denom = Fx1[:, 0]**2 + Fx1[:, 1]**2 + Ftx2[:, 0]**2 + Ftx2[:, 1]**2
+            denom = np.maximum(denom, 1e-10)
+            sampson = x2tFx1**2 / denom
 
-        return x2tFx1**2 / denom
+        return np.where(np.isfinite(sampson), sampson, np.inf)
 
     def _compute_gric(self, residuals: np.ndarray, sigma: float,
                       d_model: int, k_model: int, n_points: int,

@@ -297,6 +297,15 @@ class SettingsDialog(QDialog):
         gric_group.setLayout(gric_layout)
         layout.addWidget(gric_group)
 
+        # === Rerunログ ===
+        rerun_group = QGroupBox("Rerunログ")
+        rerun_layout = QGridLayout()
+        self.enable_rerun_logging = QCheckBox("解析時にRerunログを有効化（GUI）")
+        self.enable_rerun_logging.setChecked(self.settings.get('enable_rerun_logging', False))
+        rerun_layout.addWidget(self.enable_rerun_logging, 0, 0, 1, 2)
+        rerun_group.setLayout(rerun_layout)
+        layout.addWidget(rerun_group)
+
         layout.addStretch()
         return widget
 
@@ -598,6 +607,7 @@ class SettingsDialog(QDialog):
             'nadir_mask_radius': self.nadir_mask_radius.value(),
             'enable_equipment_detection': self.enable_equipment_detection.isChecked(),
             'mask_dilation_size': self.mask_dilation.value(),
+            'enable_rerun_logging': self.enable_rerun_logging.isChecked(),
             'output_image_format': self.output_format.currentText().lower(),
             'output_jpeg_quality': self.jpeg_quality.value(),
             'output_directory': self.output_dir_label.text(),
@@ -762,6 +772,7 @@ class SettingsDialog(QDialog):
             self.gric_lambda2.setValue(4.0)
             self.gric_sigma.setValue(1.0)
             self.gric_degeneracy_threshold.setValue(0.85)
+            self.enable_rerun_logging.setChecked(False)
             self.equirect_width.setValue(4096)
             self.equirect_height.setValue(2048)
             self.projection_mode.setCurrentText('Equirectangular')

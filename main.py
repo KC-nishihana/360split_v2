@@ -152,6 +152,25 @@ def parse_arguments():
         help="詳細ログ出力"
     )
 
+    parser.add_argument(
+        "--rerun-stream",
+        action="store_true",
+        default=False,
+        help="Rerun Viewerへフレーム指標をストリーミングする"
+    )
+    parser.add_argument(
+        "--rerun-spawn",
+        action="store_true",
+        default=False,
+        help="Rerun Viewerを自動起動する（--rerun-streamと併用）"
+    )
+    parser.add_argument(
+        "--rerun-save",
+        type=str,
+        default=None,
+        help="Rerunログを .rrd に保存するパス"
+    )
+
     return parser.parse_args()
 
 
@@ -209,6 +228,7 @@ def run_cli(args):
     from core.keyframe_selector import KeyframeSelector
     from processing.equirectangular import EquirectangularProcessor
     from processing.mask_processor import MaskProcessor
+    from utils.rerun_logger import RerunKeyframeLogger
 
     video_path = args.cli
     is_front_rear = bool(args.front_video and args.rear_video)
@@ -298,6 +318,15 @@ def run_cli(args):
 
     # キーフレーム選択
     selector = KeyframeSelector(config)
+    rerun_enabled = bool(args.rerun_stream or args.rerun_save)
+    rerun_logger = None
+    if rerun_enabled:
+        rerun_logger = RerunKeyframeLogger(
+            app_id="keyframe_check",
+            spawn=bool(args.rerun_spawn),
+            save_path=args.rerun_save,
+            timeline_name="frame",
+        )
 
     _last_logged_pct = -1
 
@@ -310,9 +339,26 @@ def run_cli(args):
             logger.info(f"進捗: {pct}% {message}")
 
     logger.info("キーフレーム解析を開始...")
+    def frame_log_callback(payload: dict):
+        if rerun_logger is None or not rerun_logger.enabled:
+            return
+        frame_idx = int(payload.get("frame_index", 0))
+        frame = payload.get("frame")
+        metrics = payload.get("metrics", {})
+        rerun_logger.log_frame(
+            frame_idx=frame_idx,
+            img=frame,
+            t_xyz=payload.get("t_xyz"),
+            q_wxyz=payload.get("q_wxyz"),
+            is_keyframe=bool(payload.get("is_keyframe", False)),
+            metrics=metrics,
+            points_world=payload.get("points_world"),
+        )
+
     keyframes = selector.select_keyframes(
         loader,
-        progress_callback=progress_callback
+        progress_callback=progress_callback,
+        frame_log_callback=frame_log_callback if rerun_enabled else None,
     )
 
     if not keyframes:

@@ -57,10 +57,11 @@ class StitchingProcessor:
 
             for i, image in enumerate(images):
                 img_h, img_w = image.shape[:2]
+                use_h = min(height, img_h)
 
                 if i == 0:
                     # 最初の画像をそのまま配置
-                    result[:, :img_w, :] = image
+                    result[:use_h, :img_w, :] = image[:use_h, :, :]
                     x_offset = img_w
                 else:
                     # オーバーラップ領域を計算
@@ -73,18 +74,20 @@ class StitchingProcessor:
                     weights = weights[np.newaxis, :, np.newaxis]  # (1, blend_width, 1)
 
                     # オーバーラップ領域
-                    prev_overlap = result[:, blend_start:x_offset, :]
-                    curr_overlap = image[:, :overlap_width, :]
+                    prev_overlap = result[:use_h, blend_start:x_offset, :]
+                    curr_overlap = image[:use_h, :overlap_width, :]
 
                     # ブレンド
-                    result[:, blend_start:x_offset, :] = (1 - weights) * prev_overlap + weights * curr_overlap
+                    result[:use_h, blend_start:x_offset, :] = (1 - weights) * prev_overlap + weights * curr_overlap
 
                     # 残りの部分を配置
                     remaining_width = img_w - overlap_width
-                    if blend_end <= total_width:
-                        result[:, x_offset:blend_end, :] = image[:, overlap_width:, :]
-                    else:
-                        result[:, x_offset:, :] = image[:, overlap_width:total_width - x_offset, :]
+                    if remaining_width > 0 and x_offset < total_width:
+                        write_width = min(remaining_width, total_width - x_offset)
+                        if write_width > 0:
+                            result[:use_h, x_offset:x_offset + write_width, :] = image[
+                                :use_h, overlap_width:overlap_width + write_width, :
+                            ]
 
                     x_offset = blend_end - overlap_width
 
@@ -102,9 +105,10 @@ class StitchingProcessor:
 
             for i, image in enumerate(images):
                 img_h, img_w = image.shape[:2]
+                use_w = min(width, img_w)
 
                 if i == 0:
-                    result[:img_h, :, :] = image
+                    result[:img_h, :use_w, :] = image[:, :use_w, :]
                     y_offset = img_h
                 else:
                     blend_start = y_offset - overlap_height
@@ -114,16 +118,18 @@ class StitchingProcessor:
                     weights = np.linspace(0, 1, blend_height)
                     weights = weights[:, np.newaxis, np.newaxis]  # (blend_height, 1, 1)
 
-                    prev_overlap = result[blend_start:y_offset, :, :]
-                    curr_overlap = image[:overlap_height, :, :]
+                    prev_overlap = result[blend_start:y_offset, :use_w, :]
+                    curr_overlap = image[:overlap_height, :use_w, :]
 
-                    result[blend_start:y_offset, :, :] = (1 - weights) * prev_overlap + weights * curr_overlap
+                    result[blend_start:y_offset, :use_w, :] = (1 - weights) * prev_overlap + weights * curr_overlap
 
                     remaining_height = img_h - overlap_height
-                    if blend_end <= total_height:
-                        result[y_offset:blend_end, :, :] = image[overlap_height:, :, :]
-                    else:
-                        result[y_offset:, :, :] = image[overlap_height:total_height - y_offset, :, :]
+                    if remaining_height > 0 and y_offset < total_height:
+                        write_height = min(remaining_height, total_height - y_offset)
+                        if write_height > 0:
+                            result[y_offset:y_offset + write_height, :use_w, :] = image[
+                                overlap_height:overlap_height + write_height, :use_w, :
+                            ]
 
                     y_offset = blend_end - overlap_height
 
@@ -305,20 +311,22 @@ class StitchingProcessor:
 
         for i, image in enumerate(images):
             depth = normalized_depths[i]
+            img_h, img_w = image.shape[:2]
+            use_h = min(h, img_h)
 
             if i == 0:
-                result[:, :w, :] = image
-                x_offset = w
+                result[:use_h, :img_w, :] = image[:use_h, :, :]
+                x_offset = img_w
             else:
                 # 視差を考慮したオーバーラップブレンディング
                 parallax = parallax_offsets[i - 1]
 
                 blend_start = x_offset - overlap_width
-                blend_end = x_offset + w
+                blend_end = x_offset + img_w
 
                 # 深度ベースの重み付け
-                prev_depth = depth_maps[i - 1][:, -overlap_width:]
-                curr_depth = depth[:, :overlap_width]
+                prev_depth = depth_maps[i - 1][:use_h, -overlap_width:]
+                curr_depth = depth[:use_h, :overlap_width]
 
                 # 深度が浅い（カメラに近い）ほど重みが高い
                 prev_weight = prev_depth / (prev_depth + curr_depth + 1e-6)
@@ -327,16 +335,18 @@ class StitchingProcessor:
 
                 # ブレンディング
                 for c in range(3):
-                    result[:, blend_start:x_offset, c] = \
-                        result[:, blend_start:x_offset, c] * (1 - curr_weight) + \
-                        image[:, :overlap_width, c] * curr_weight
+                    result[:use_h, blend_start:x_offset, c] = \
+                        result[:use_h, blend_start:x_offset, c] * (1 - curr_weight) + \
+                        image[:use_h, :overlap_width, c] * curr_weight
 
                 # 残りの部分を配置
-                remaining_width = w - overlap_width
-                if blend_end <= total_width:
-                    result[:, x_offset:blend_end, :] = image[:, overlap_width:, :]
-                else:
-                    result[:, x_offset:, :] = image[:, overlap_width:total_width - x_offset, :]
+                remaining_width = img_w - overlap_width
+                if remaining_width > 0 and x_offset < total_width:
+                    write_width = min(remaining_width, total_width - x_offset)
+                    if write_width > 0:
+                        result[:use_h, x_offset:x_offset + write_width, :] = image[
+                            :use_h, overlap_width:overlap_width + write_width, :
+                        ]
 
                 x_offset = blend_end - overlap_width
 

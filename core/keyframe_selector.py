@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
@@ -236,6 +236,32 @@ class KeyframeSelector:
             raise RuntimeError(f"分析用ビデオキャプチャを開けません: {video_path}")
         return cap
 
+    def _open_independent_pair_captures(self, video_loader):
+        """
+        ペア入力（stereo_lr / front_rear）向けに独立キャプチャを開く。
+
+        解析中にGUI再生側の VideoCapture と競合しないよう、
+        video_loader が保持するパスから別インスタンスを作成する。
+        パス情報が取得できない場合は (None, None) を返し、
+        呼び出し側で get_frame_pair() フォールバックを使う。
+        """
+        path_a = None
+        path_b = None
+
+        if hasattr(video_loader, "left_path") and hasattr(video_loader, "right_path"):
+            path_a = getattr(video_loader, "left_path", None)
+            path_b = getattr(video_loader, "right_path", None)
+        elif hasattr(video_loader, "front_path") and hasattr(video_loader, "rear_path"):
+            path_a = getattr(video_loader, "front_path", None)
+            path_b = getattr(video_loader, "rear_path", None)
+
+        if not path_a or not path_b:
+            return None, None
+
+        cap_a = self._open_independent_capture(path_a)
+        cap_b = self._open_independent_capture(path_b)
+        return cap_a, cap_b
+
     def _check_rescue_mode(self, feature_count: int) -> bool:
         """
         レスキューモード判定
@@ -340,9 +366,12 @@ class KeyframeSelector:
 
         return base_threshold
 
-    def select_keyframes(self, video_loader,
-                        progress_callback: Optional[Callable[[int, int], None]] = None
-                        ) -> List[KeyframeInfo]:
+    def select_keyframes(
+        self,
+        video_loader,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        frame_log_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> List[KeyframeInfo]:
         """
         ビデオからキーフレームを自動選択（2段階パイプライン）
 
@@ -407,7 +436,7 @@ class KeyframeSelector:
         # ===== Stage 2: 精密評価 =====
         logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
         stage2_candidates = self._stage2_precise_evaluation(
-            video_loader, metadata, stage1_candidates, progress_callback
+            video_loader, metadata, stage1_candidates, progress_callback, frame_log_callback
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
 
@@ -460,21 +489,37 @@ class KeyframeSelector:
 
         # ペアレンズ: レンズ毎品質評価 + AND条件
         if is_paired:
-            for idx, frame_idx in enumerate(frame_indices):
-                frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
-                if frame_a is None or frame_b is None:
-                    continue
+            cap_a, cap_b = self._open_independent_pair_captures(video_loader)
+            try:
+                for idx, frame_idx in enumerate(frame_indices):
+                    if cap_a is not None and cap_b is not None:
+                        cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret_a, frame_a = cap_a.read()
+                        ret_b, frame_b = cap_b.read()
+                        if not ret_a or not ret_b or frame_a is None or frame_b is None:
+                            continue
+                    else:
+                        # テストダミーローダー等のフォールバック
+                        frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
+                        if frame_a is None or frame_b is None:
+                            continue
 
-                quality_scores = self._compute_quality_score_pair(frame_a, frame_b)
+                    quality_scores = self._compute_quality_score_pair(frame_a, frame_b)
 
-                if quality_scores['passes_threshold']:
-                    candidates.append({
-                        'frame_idx': frame_idx,
-                        'quality_scores': quality_scores
-                    })
+                    if quality_scores['passes_threshold']:
+                        candidates.append({
+                            'frame_idx': frame_idx,
+                            'quality_scores': quality_scores
+                        })
 
-                if progress_callback:
-                    progress_callback(idx + 1, len(frame_indices))
+                    if progress_callback:
+                        progress_callback(idx + 1, len(frame_indices))
+            finally:
+                if cap_a is not None:
+                    cap_a.release()
+                if cap_b is not None:
+                    cap_b.release()
             return candidates
 
         # 単眼: 独立キャプチャ + 並列品質計算
@@ -526,10 +571,14 @@ class KeyframeSelector:
 
         return candidates
 
-    def _stage2_precise_evaluation(self, video_loader, metadata: VideoMetadata,
-                                   stage1_candidates: List[Dict],
-                                   progress_callback: Optional[Callable[[int, int], None]]
-                                   ) -> List[KeyframeInfo]:
+    def _stage2_precise_evaluation(
+        self,
+        video_loader,
+        metadata: VideoMetadata,
+        stage1_candidates: List[Dict],
+        progress_callback: Optional[Callable[[int, int], None]],
+        frame_log_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> List[KeyframeInfo]:
         """
         Stage 2: 精密評価（候補フレームのみ）
 
@@ -562,11 +611,15 @@ class KeyframeSelector:
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
         cap = None
+        cap_a = None
+        cap_b = None
         if not is_paired:
             video_path = getattr(video_loader, "_video_path", None)
             if video_path is None:
                 raise RuntimeError("単眼モードのビデオパスが取得できません")
             cap = self._open_independent_capture(video_path)
+        else:
+            cap_a, cap_b = self._open_independent_pair_captures(video_loader)
 
         try:
             for idx, candidate_info in enumerate(stage1_candidates):
@@ -576,15 +629,21 @@ class KeyframeSelector:
                 if progress_callback:
                     progress_callback(idx, len(stage1_candidates))
 
-                if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
-                    continue
-
                 current_frame = None
                 current_pair = None
                 if is_paired:
-                    frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
-                    if frame_a is None or frame_b is None:
-                        continue
+                    if cap_a is not None and cap_b is not None:
+                        cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret_a, frame_a = cap_a.read()
+                        ret_b, frame_b = cap_b.read()
+                        if not ret_a or not ret_b or frame_a is None or frame_b is None:
+                            continue
+                    else:
+                        # テストダミーローダー等のフォールバック
+                        frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
+                        if frame_a is None or frame_b is None:
+                            continue
                     current_pair = (frame_a, frame_b)
                     current_frame = frame_a
                 else:
@@ -593,12 +652,40 @@ class KeyframeSelector:
                     if not ret or current_frame is None:
                         continue
 
-                frame_window.append(current_frame)
-                exposure_changed = self._detect_exposure_change(current_frame)
-
                 geometric_scores = {}
                 adaptive_scores = {}
                 force_insert = False
+                exposure_changed = False
+                is_selected = False
+
+                if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
+                    if frame_log_callback:
+                        metrics = {
+                            "translation_delta": 0.0,
+                            "rotation_delta": 0.0,
+                            "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
+                            "match_count": float(quality_scores.get("seam_features_cur", 0.0)),
+                            "overlap_ratio": 0.0,
+                            "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
+                            "keyframe_flag": 0.0,
+                            "combined_score": float(self._compute_combined_score(quality_scores, {}, {})),
+                        }
+                        try:
+                            frame_log_callback({
+                                "frame_index": frame_idx,
+                                "frame": current_frame,
+                                "is_keyframe": False,
+                                "metrics": metrics,
+                                "quality_scores": quality_scores,
+                                "geometric_scores": geometric_scores,
+                                "adaptive_scores": adaptive_scores,
+                            })
+                        except Exception as e:
+                            logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
+                    continue
+
+                frame_window.append(current_frame)
+                exposure_changed = self._detect_exposure_change(current_frame)
 
                 if last_keyframe is not None:
                     geometric_failed = False
@@ -652,6 +739,29 @@ class KeyframeSelector:
                             geometric_failed = True
                             force_insert = True
                         else:
+                            if frame_log_callback:
+                                metrics = {
+                                    "translation_delta": 0.0,
+                                    "rotation_delta": 0.0,
+                                    "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
+                                    "match_count": 0.0,
+                                    "overlap_ratio": 0.0,
+                                    "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
+                                    "keyframe_flag": 0.0,
+                                    "combined_score": float(self._compute_combined_score(quality_scores, {}, {})),
+                                }
+                                try:
+                                    frame_log_callback({
+                                        "frame_index": frame_idx,
+                                        "frame": current_frame,
+                                        "is_keyframe": False,
+                                        "metrics": metrics,
+                                        "quality_scores": quality_scores,
+                                        "geometric_scores": geometric_scores,
+                                        "adaptive_scores": adaptive_scores,
+                                    })
+                                except Exception as e:
+                                    logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
                             continue
 
                     if not geometric_failed and 'feature_match_count' in geometric_scores:
@@ -673,6 +783,29 @@ class KeyframeSelector:
 
                     ssim = adaptive_scores.get('ssim', 1.0)
                     if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and not force_insert and not exposure_changed:
+                        if frame_log_callback:
+                            metrics = {
+                                "translation_delta": float(adaptive_scores.get("optical_flow", 0.0)),
+                                "rotation_delta": float(max(0.0, 1.0 - ssim) * 180.0),
+                                "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
+                                "match_count": float(geometric_scores.get("feature_match_count", 0.0)),
+                                "overlap_ratio": float(geometric_scores.get("gric", 0.0)),
+                                "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
+                                "keyframe_flag": 0.0,
+                                "combined_score": float(self._compute_combined_score(quality_scores, geometric_scores, adaptive_scores)),
+                            }
+                            try:
+                                frame_log_callback({
+                                    "frame_index": frame_idx,
+                                    "frame": current_frame,
+                                    "is_keyframe": False,
+                                    "metrics": metrics,
+                                    "quality_scores": quality_scores,
+                                    "geometric_scores": geometric_scores,
+                                    "adaptive_scores": adaptive_scores,
+                                })
+                            except Exception as e:
+                                logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
                         continue
 
                     if exposure_changed and frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
@@ -696,6 +829,7 @@ class KeyframeSelector:
                     is_force_inserted=force_insert or exposure_changed
                 )
                 candidates.append(candidate)
+                is_selected = True
 
                 if self.is_rescue_mode:
                     self.rescue_mode_keyframes.append(frame_idx)
@@ -704,10 +838,39 @@ class KeyframeSelector:
                 last_keyframe = current_frame
                 last_pair = current_pair
 
+                if frame_log_callback:
+                    ssim = adaptive_scores.get("ssim", 1.0)
+                    metrics = {
+                        "translation_delta": float(adaptive_scores.get("optical_flow", 0.0)),
+                        "rotation_delta": float(max(0.0, 1.0 - ssim) * 180.0),
+                        "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
+                        "match_count": float(geometric_scores.get("feature_match_count", 0.0)),
+                        "overlap_ratio": float(geometric_scores.get("gric", 0.0)),
+                        "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
+                        "keyframe_flag": 1.0 if is_selected else 0.0,
+                        "combined_score": float(combined_score),
+                    }
+                    try:
+                        frame_log_callback({
+                            "frame_index": frame_idx,
+                            "frame": current_frame,
+                            "is_keyframe": bool(is_selected),
+                            "metrics": metrics,
+                            "quality_scores": quality_scores,
+                            "geometric_scores": geometric_scores,
+                            "adaptive_scores": adaptive_scores,
+                        })
+                    except Exception as e:
+                        logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
+
         finally:
             if cap is not None:
                 cap.release()
                 logger.debug("Stage 2: 独立キャプチャを解放")
+            if cap_a is not None:
+                cap_a.release()
+            if cap_b is not None:
+                cap_b.release()
 
         return candidates
 

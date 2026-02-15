@@ -14,7 +14,7 @@ ExportWorker:
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from dataclasses import dataclass
 
 from PySide6.QtCore import QThread, Signal, QObject
@@ -481,6 +481,17 @@ class ExportWorker(QThread):
                  nadir_mask_radius: int = 100,
                  enable_equipment_detection: bool = False,
                  mask_dilation_size: int = 15,
+                 # 対象検出マスク設定
+                 enable_target_mask_generation: bool = False,
+                 target_classes: Optional[List[str]] = None,
+                 yolo_model_path: str = "yolo26n-seg.pt",
+                 sam_model_path: str = "sam3_t.pt",
+                 confidence_threshold: float = 0.25,
+                 detection_device: str = "auto",
+                 mask_output_dirname: str = "masks",
+                 mask_add_suffix: bool = True,
+                 mask_suffix: str = "_mask",
+                 mask_output_format: str = "same",
                  parent: QObject = None):
         super().__init__(parent)
         self.video_path = video_path
@@ -515,6 +526,16 @@ class ExportWorker(QThread):
         self.nadir_mask_radius = nadir_mask_radius
         self.enable_equipment_detection = enable_equipment_detection
         self.mask_dilation_size = mask_dilation_size
+        self.enable_target_mask_generation = enable_target_mask_generation
+        self.target_classes = target_classes or []
+        self.yolo_model_path = yolo_model_path
+        self.sam_model_path = sam_model_path
+        self.confidence_threshold = confidence_threshold
+        self.detection_device = detection_device
+        self.mask_output_dirname = mask_output_dirname or "masks"
+        self.mask_add_suffix = mask_add_suffix
+        self.mask_suffix = mask_suffix or "_mask"
+        self.mask_output_format = (mask_output_format or "same").lower()
 
         # ステレオ（OSV）設定
         self.is_stereo = False
@@ -531,6 +552,39 @@ class ExportWorker(QThread):
 
     def stop(self):
         self._is_running = False
+
+    def _save_target_mask(
+        self,
+        images_root: Path,
+        image_path: Path,
+        frame: np.ndarray,
+        mask_generator,
+    ) -> bool:
+        from processing.target_mask_generator import TargetMaskGenerator
+
+        if mask_generator is None:
+            return False
+
+        masks_root = images_root / self.mask_output_dirname
+        mask_path = TargetMaskGenerator.build_mask_path(
+            image_path=image_path,
+            images_root=images_root,
+            masks_root=masks_root,
+            add_suffix=self.mask_add_suffix,
+            suffix=self.mask_suffix,
+            mask_ext=self.mask_output_format,
+        )
+        mask_path.parent.mkdir(parents=True, exist_ok=True)
+
+        binary_mask = mask_generator.generate_mask(frame, self.target_classes)
+        ext = mask_path.suffix.lower().lstrip(".")
+        if ext in ("jpg", "jpeg"):
+            return write_image(
+                mask_path,
+                binary_mask,
+                [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+            )
+        return write_image(mask_path, binary_mask)
 
     def run(self):
         try:
@@ -590,6 +644,25 @@ class ExportWorker(QThread):
                 except ImportError as e:
                     logger.warning(f"StitchingProcessor のインポートに失敗: {e}")
                     self.enable_stereo_stitch = False
+
+            target_mask_generator = None
+            if self.enable_target_mask_generation:
+                try:
+                    from processing.target_mask_generator import TargetMaskGenerator
+
+                    target_mask_generator = TargetMaskGenerator(
+                        yolo_model_path=self.yolo_model_path,
+                        sam_model_path=self.sam_model_path,
+                        confidence_threshold=self.confidence_threshold,
+                        device=self.detection_device,
+                    )
+                    logger.info(
+                        "対象マスク生成を有効化: "
+                        f"classes={self.target_classes}, yolo={self.yolo_model_path}, sam={self.sam_model_path}"
+                    )
+                except Exception as e:
+                    logger.warning(f"対象マスク生成の初期化に失敗したため無効化します: {e}")
+                    self.enable_target_mask_generation = False
 
             total = len(self.frame_indices)
             exported = 0
@@ -665,6 +738,15 @@ class ExportWorker(QThread):
                         if not saved:
                             logger.warning(f"保存失敗（フレーム {frame_idx}{suffix}）: {filepath}")
                             continue
+
+                        if self.enable_target_mask_generation:
+                            try:
+                                if not self._save_target_mask(
+                                    output_path, filepath, processed_frame, target_mask_generator
+                                ):
+                                    logger.warning(f"対象マスク保存失敗: {filepath}")
+                            except Exception as e:
+                                logger.warning(f"対象マスク生成エラー（フレーム {frame_idx}{suffix}）: {e}")
 
                         exported += 1
                         continue  # ステレオの場合はここで次のフレームへ
@@ -746,6 +828,15 @@ class ExportWorker(QThread):
                         logger.warning(f"保存失敗（フレーム {frame_idx}）: {filepath}")
                         continue
 
+                    if self.enable_target_mask_generation:
+                        try:
+                            if not self._save_target_mask(
+                                output_path, filepath, processed_frame, target_mask_generator
+                            ):
+                                logger.warning(f"対象マスク保存失敗: {filepath}")
+                        except Exception as e:
+                            logger.warning(f"対象マスク生成エラー（フレーム {frame_idx}{suffix}）: {e}")
+
                     exported += 1
 
                     # --- Cubemap 出力 ---
@@ -825,3 +916,97 @@ class ExportWorker(QThread):
         except Exception as e:
             logger.exception("エクスポートワーカーエラー")
             self.error.emit(f"エクスポートエラー: {e}")
+
+
+class GenerateMasksWorker(QThread):
+    """
+    既存画像群に対して対象マスクを生成するワーカー。
+
+    `ExportWorker` とは独立して、既に出力済みの images ディレクトリへ後処理適用できる。
+    """
+
+    progress = Signal(int, int, str)
+    finished = Signal(int)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        image_paths: List[str],
+        images_root: str,
+        target_classes: Optional[List[str]] = None,
+        yolo_model_path: str = "yolo26n-seg.pt",
+        sam_model_path: str = "sam3_t.pt",
+        confidence_threshold: float = 0.25,
+        detection_device: str = "auto",
+        mask_output_dirname: str = "masks",
+        mask_add_suffix: bool = True,
+        mask_suffix: str = "_mask",
+        mask_output_format: str = "same",
+        jpeg_quality: int = 95,
+        parent: QObject = None,
+    ):
+        super().__init__(parent)
+        self.image_paths = [Path(p) for p in image_paths]
+        self.images_root = Path(images_root)
+        self.target_classes = target_classes or []
+        self.yolo_model_path = yolo_model_path
+        self.sam_model_path = sam_model_path
+        self.confidence_threshold = confidence_threshold
+        self.detection_device = detection_device
+        self.mask_output_dirname = mask_output_dirname
+        self.mask_add_suffix = mask_add_suffix
+        self.mask_suffix = mask_suffix
+        self.mask_output_format = mask_output_format
+        self.jpeg_quality = jpeg_quality
+        self._is_running = True
+
+    def stop(self):
+        self._is_running = False
+
+    def run(self):
+        try:
+            from processing.target_mask_generator import TargetMaskGenerator
+
+            generator = TargetMaskGenerator(
+                yolo_model_path=self.yolo_model_path,
+                sam_model_path=self.sam_model_path,
+                confidence_threshold=self.confidence_threshold,
+                device=self.detection_device,
+            )
+            masks_root = self.images_root / self.mask_output_dirname
+            total = len(self.image_paths)
+            count = 0
+
+            for i, img_path in enumerate(self.image_paths):
+                if not self._is_running:
+                    break
+                frame = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+
+                mask = generator.generate_mask(frame, self.target_classes)
+                out_path = generator.build_mask_path(
+                    image_path=img_path,
+                    images_root=self.images_root,
+                    masks_root=masks_root,
+                    add_suffix=self.mask_add_suffix,
+                    suffix=self.mask_suffix,
+                    mask_ext=self.mask_output_format,
+                )
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                ext = out_path.suffix.lower().lstrip(".")
+                if ext in ("jpg", "jpeg"):
+                    saved = write_image(
+                        out_path, mask, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+                    )
+                else:
+                    saved = write_image(out_path, mask)
+
+                if saved:
+                    count += 1
+                self.progress.emit(i + 1, total, f"マスク生成: {i+1}/{total}")
+
+            self.finished.emit(count)
+        except Exception as e:
+            logger.exception("GenerateMasksWorker エラー")
+            self.error.emit(f"マスク生成エラー: {e}")

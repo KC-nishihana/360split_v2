@@ -596,7 +596,18 @@ class MainWindow(QMainWindow):
             enable_nadir_mask=s["enable_nadir_mask"],
             nadir_mask_radius=s["nadir_mask_radius"],
             enable_equipment_detection=s["enable_equipment_detection"],
-            mask_dilation_size=s["mask_dilation_size"]
+            mask_dilation_size=s["mask_dilation_size"],
+            # 対象検出マスク
+            enable_target_mask_generation=s["enable_target_mask_generation"],
+            target_classes=s["target_classes"],
+            yolo_model_path=s["yolo_model_path"],
+            sam_model_path=s["sam_model_path"],
+            confidence_threshold=s["confidence_threshold"],
+            detection_device=s["detection_device"],
+            mask_output_dirname=s["mask_output_dirname"],
+            mask_add_suffix=s["mask_add_suffix"],
+            mask_suffix=s["mask_suffix"],
+            mask_output_format=s["mask_output_format"],
         )
 
         # ステレオ（OSV）対応: 左右ストリームパスを設定

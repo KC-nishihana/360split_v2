@@ -128,6 +128,17 @@ class ConfigManager:
             "mask_dilation_kernel": default_config.MASK_DILATION_KERNEL,
             "output_image_format": default_config.OUTPUT_IMAGE_FORMAT,
             "output_jpeg_quality": default_config.OUTPUT_JPEG_QUALITY,
+            # 対象マスク生成
+            "enable_target_mask_generation": False,
+            "target_classes": ["人物", "人", "自転車", "バイク", "車両", "動物"],
+            "yolo_model_path": "yolo26n-seg.pt",
+            "sam_model_path": "sam3_t.pt",
+            "confidence_threshold": 0.25,
+            "detection_device": "auto",
+            "mask_output_dirname": "masks",
+            "mask_add_suffix": True,
+            "mask_suffix": "_mask",
+            "mask_output_format": "same",
         }
 
     @classmethod

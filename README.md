@@ -10,12 +10,15 @@
 > - 画像I/Oユーティリティの拡張
 > - 設定デフォルトの定義を `ConfigManager.default_config()` に一本化
 > - ステレオエクスポート時のステッチングモード（Fast/HQ/Depth-aware）を実装
+> - 評価済みキーフレーム向けの対象マスク生成（YOLO + SAM）を追加
+> - 設定ダイアログに「対象マスク」タブを追加（キーフレーム設定から分離）
 
 
 ## 主な特徴
 
 - **2段階キーフレーム選択パイプライン** — Stage 1で品質ベースの高速フィルタリング（60〜70%除外）、Stage 2で幾何学的・適応的精密評価を行う効率的なアーキテクチャ
 - **360度映像ネイティブ対応** — Equirectangular / Cubemap / Perspective投影変換をサポート
+- **対象マスク生成** — 選択済みキーフレームに対して人物・車両など指定対象の二値マスク（対象=黒/背景=白）を生成
 - **GPU高速化** — Apple Silicon (MPS) / NVIDIA CUDA の自動検出と活用
 - **GUIモード** — PySide6ベースの直感的なインタフェースで動画プレビュー、タイムライン操作、リアルタイム分析が可能
 - **CLIモード** — スクリプト連携やバッチ処理に対応したコマンドラインインタフェース
@@ -78,6 +81,14 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```bash
 pip uninstall opencv-python
 pip install opencv-contrib-python
+```
+
+### 5. 対象マスク生成（オプション）
+
+対象マスク生成（YOLO + SAM）を利用する場合は `ultralytics` を追加インストールしてください。
+
+```bash
+pip install ultralytics
 ```
 
 
@@ -246,6 +257,13 @@ GUIモードでは、設定ダイアログの「キーフレーム選択」タ�
 2. プリセット適用後も、個別のパラメータを微調整可能です
 3. 「Custom (手動設定)」を選択すると、プリセット非適用状態になります
 
+設定ダイアログのタブ構成:
+- `キーフレーム選択`: 評価・選択パラメータ
+- `360度処理`: 投影・解像度・ステッチング設定
+- `マスク処理`: ナディア/装備マスク設定
+- `出力設定`: 出力形式・品質・ディレクトリ
+- `対象マスク`: 対象クラス、YOLO/SAMモデル、信頼度閾値、マスク命名規則
+
 ### レスキューモード
 
 **Indoor**および**Mixed**プリセットでは、特徴点不足時の「レスキューモード」が有効化されています。
@@ -281,17 +299,20 @@ GUIモードでは、設定ダイアログの「キーフレーム選択」タ�
 │   ├── adaptive_selector.py # 適応的選択（SSIM、オプティカルフロー、カメラ運動量）
 │   ├── keyframe_selector.py # 2段階パイプライン統合（メインエンジン）
 │   └── exceptions.py        # カスタム例外定義
-├── processing/              # 360度画像処理
+├── processing/              # 360度画像処理 / 対象マスク処理
 │   ├── equirectangular.py   # Equirectangular ↔ Cubemap / Perspective変換
 │   ├── mask_processor.py    # 天底/天頂マスク、撮影機材マスク生成
-│   └── stitching.py         # 画像スティッチング（Fast/HQS/DMS 3モード）
+│   ├── stitching.py         # 画像スティッチング（Fast/HQS/DMS 3モード）
+│   ├── object_detector.py   # YOLOベース物体検出
+│   ├── instance_segmentor.py # SAMベースインスタンスセグメンテーション
+│   └── target_mask_generator.py # 対象マスク生成（OR合成、二値化、保存パス生成）
 ├── gui/                     # PySide6 GUI
 │   ├── main_window.py       # メインウィンドウ、UI統合
 │   ├── video_player.py      # 動画プレビュー、フレームナビゲーション
 │   ├── timeline_widget.py   # タイムラインUI、pyqtgraphスコアグラフ
 │   ├── keyframe_panel.py    # キーフレーム一覧・詳細表示パネル（MainWindowで使用）
 │   ├── keyframe_list.py     # 旧キーフレーム一覧ウィジェット（互換用）
-│   ├── settings_dialog.py   # 設定ダイアログ（4タブ構成）
+│   ├── settings_dialog.py   # 設定ダイアログ（5タブ構成）
 │   ├── settings_panel.py    # 設定パネルコンポーネント
 │   ├── export_dialog.py     # エクスポートダイアログ（出力設定、フォーマット選択）
 │   └── workers.py           # バックグラウンド処理ワーカー（Stage1/2/Export）
@@ -353,7 +374,17 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
   "enable_stereo_stitch": true,
   "stitching_mode": "Fast",
   "output_image_format": "png",
-  "output_jpeg_quality": 95
+  "output_jpeg_quality": 95,
+  "enable_target_mask_generation": false,
+  "target_classes": ["人物", "人", "自転車", "バイク", "車両", "動物"],
+  "yolo_model_path": "yolo26n-seg.pt",
+  "sam_model_path": "sam3_t.pt",
+  "confidence_threshold": 0.25,
+  "detection_device": "auto",
+  "mask_output_dirname": "masks",
+  "mask_add_suffix": true,
+  "mask_suffix": "_mask",
+  "mask_output_format": "same"
 }
 ```
 
@@ -373,6 +404,16 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
 | `gric_degeneracy_threshold` | GRIC縮退判定閾値。高いほど回転のみシーンを除外しやすい | 0.85 |
 | `enable_polar_mask` | 360度動画の天頂/天底マスク有効化 | true |
 | `mask_polar_ratio` | 天頂/天底マスク比率（上下の何%をマスクするか） | 0.10 |
+| `enable_target_mask_generation` | キーフレーム出力後に対象マスクを生成 | false |
+| `target_classes` | 検出対象ラベル（複数選択可） | `["人物","人","自転車","バイク","車両","動物"]` |
+| `yolo_model_path` | YOLOモデル名/パス | `yolo26n-seg.pt` |
+| `sam_model_path` | SAMモデル名/パス | `sam3_t.pt` |
+| `confidence_threshold` | 検出信頼度閾値 | 0.25 |
+| `detection_device` | 推論デバイス（`auto/cpu/mps/cuda/0`） | `auto` |
+| `mask_output_dirname` | マスク出力ディレクトリ名 | `masks` |
+| `mask_add_suffix` | マスクファイル名に接尾辞を付与 | true |
+| `mask_suffix` | マスクファイル接尾辞 | `_mask` |
+| `mask_output_format` | マスク拡張子（`same/png/jpg/tiff`） | `same` |
 
 
 ## 出力
@@ -398,6 +439,31 @@ output/
     │   └── bottom.png
     └── ...
 ```
+
+### 対象マスク画像（有効時）
+
+対象検出を有効化した場合、キーフレームと同じ相対構造で `masks/` 配下へ保存されます。
+
+```
+output/
+├── L/
+│   ├── keyframe_000150_L.png
+│   └── ...
+├── R/
+│   ├── keyframe_000150_R.png
+│   └── ...
+└── masks/
+    ├── L/
+    │   ├── keyframe_000150_L_mask.png
+    │   └── ...
+    └── R/
+        ├── keyframe_000150_R_mask.png
+        └── ...
+```
+
+- 画素値: 対象領域 `0`（黒）、背景 `255`（白）
+- 対象未検出フレーム: 全白マスク
+- 命名規則: `mask_add_suffix` / `mask_suffix` / `mask_output_format` で変更可能
 
 ### メタデータ (keyframe_metadata.json)
 

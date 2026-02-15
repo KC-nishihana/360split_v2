@@ -12,10 +12,12 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
     QFileDialog, QMessageBox, QGroupBox, QGridLayout
 )
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt
 
 from utils.logger import get_logger
 logger = get_logger(__name__)
+
+TARGET_CLASS_LABELS = ["人物", "人", "自転車", "バイク", "車両", "動物", "その他"]
 
 
 class SettingsDialog(QDialog):
@@ -76,6 +78,10 @@ class SettingsDialog(QDialog):
         # Tab 4: 出力設定
         output_tab = self._create_output_tab()
         tab_widget.addTab(output_tab, "出力設定")
+
+        # Tab 5: 対象マスク
+        target_mask_tab = self._create_target_mask_tab()
+        tab_widget.addTab(target_mask_tab, "対象マスク")
 
         layout.addWidget(tab_widget)
 
@@ -540,6 +546,113 @@ class SettingsDialog(QDialog):
         layout.addStretch()
         return widget
 
+    def _create_target_mask_tab(self) -> QWidget:
+        """
+        対象マスクタブを作成
+
+        Returns:
+        --------
+        QWidget
+            タブウィジェット
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        # === 対象検出 ===
+        detection_group = QGroupBox("対象検出")
+        detection_layout = QGridLayout()
+
+        self.enable_target_mask_generation = QCheckBox("キーフレーム出力後に対象マスクを生成")
+        self.enable_target_mask_generation.setChecked(
+            self.settings.get("enable_target_mask_generation", False)
+        )
+        detection_layout.addWidget(self.enable_target_mask_generation, 0, 0, 1, 3)
+
+        detection_layout.addWidget(QLabel("検出対象:"), 1, 0)
+        self.target_class_checks = {}
+        selected_targets = set(self.settings.get("target_classes", []))
+        cls_col = 1
+        cls_row = 1
+        for label in TARGET_CLASS_LABELS:
+            cb = QCheckBox(label)
+            cb.setChecked(label in selected_targets)
+            self.target_class_checks[label] = cb
+            detection_layout.addWidget(cb, cls_row, cls_col)
+            cls_col += 1
+            if cls_col > 2:
+                cls_col = 1
+                cls_row += 1
+
+        base_row = cls_row + 1
+        detection_layout.addWidget(QLabel("YOLOモデル:"), base_row, 0)
+        self.yolo_model_path = QComboBox()
+        self.yolo_model_path.setEditable(True)
+        self.yolo_model_path.addItems([
+            "yolo26n-seg.pt", "yolo26s-seg.pt", "yolo26m-seg.pt", "yolo26l-seg.pt", "yolo26x-seg.pt"
+        ])
+        self.yolo_model_path.setCurrentText(self.settings.get("yolo_model_path", "yolo26n-seg.pt"))
+        detection_layout.addWidget(self.yolo_model_path, base_row, 1, 1, 2)
+
+        detection_layout.addWidget(QLabel("SAMモデル:"), base_row + 1, 0)
+        self.sam_model_path = QComboBox()
+        self.sam_model_path.setEditable(True)
+        self.sam_model_path.addItems(["sam3_t.pt", "sam3_s.pt", "sam3_b.pt", "sam3_l.pt"])
+        self.sam_model_path.setCurrentText(self.settings.get("sam_model_path", "sam3_t.pt"))
+        detection_layout.addWidget(self.sam_model_path, base_row + 1, 1, 1, 2)
+
+        detection_layout.addWidget(QLabel("信頼度閾値:"), base_row + 2, 0)
+        self.confidence_threshold = QDoubleSpinBox()
+        self.confidence_threshold.setMinimum(0.01)
+        self.confidence_threshold.setMaximum(1.0)
+        self.confidence_threshold.setSingleStep(0.01)
+        self.confidence_threshold.setDecimals(2)
+        self.confidence_threshold.setValue(self.settings.get("confidence_threshold", 0.25))
+        detection_layout.addWidget(self.confidence_threshold, base_row + 2, 1)
+
+        detection_layout.addWidget(QLabel("推論デバイス:"), base_row + 3, 0)
+        self.detection_device = QComboBox()
+        self.detection_device.addItems(["auto", "cpu", "mps", "cuda", "0"])
+        self.detection_device.setCurrentText(self.settings.get("detection_device", "auto"))
+        detection_layout.addWidget(self.detection_device, base_row + 3, 1, 1, 2)
+
+        detection_group.setLayout(detection_layout)
+        layout.addWidget(detection_group)
+
+        # === 対象マスク出力 ===
+        mask_output_group = QGroupBox("対象マスク出力")
+        mask_output_layout = QGridLayout()
+
+        mask_output_layout.addWidget(QLabel("マスクフォルダ名:"), 0, 0)
+        self.mask_output_dirname = QComboBox()
+        self.mask_output_dirname.setEditable(True)
+        self.mask_output_dirname.addItems(["masks", "mask"])
+        self.mask_output_dirname.setCurrentText(self.settings.get("mask_output_dirname", "masks"))
+        mask_output_layout.addWidget(self.mask_output_dirname, 0, 1)
+
+        self.mask_add_suffix = QCheckBox("ファイル名に接尾辞を追加")
+        self.mask_add_suffix.setChecked(self.settings.get("mask_add_suffix", True))
+        mask_output_layout.addWidget(self.mask_add_suffix, 1, 0, 1, 2)
+
+        mask_output_layout.addWidget(QLabel("接尾辞:"), 2, 0)
+        self.mask_suffix = QComboBox()
+        self.mask_suffix.setEditable(True)
+        self.mask_suffix.addItems(["_mask", "_seg"])
+        self.mask_suffix.setCurrentText(self.settings.get("mask_suffix", "_mask"))
+        mask_output_layout.addWidget(self.mask_suffix, 2, 1)
+
+        mask_output_layout.addWidget(QLabel("マスク形式:"), 3, 0)
+        self.mask_output_format = QComboBox()
+        self.mask_output_format.addItems(["same", "png", "jpg", "tiff"])
+        self.mask_output_format.setCurrentText(self.settings.get("mask_output_format", "same"))
+        mask_output_layout.addWidget(self.mask_output_format, 3, 1)
+
+        mask_output_group.setLayout(mask_output_layout)
+        layout.addWidget(mask_output_group)
+
+        layout.addStretch()
+        return widget
+
     def _load_settings(self) -> dict:
         """
         設定ファイルから設定を読み込む
@@ -561,6 +674,16 @@ class SettingsDialog(QDialog):
             'mask_dilation_size': 15,
             'output_directory': str(Path.home() / "360split_output"),
             'naming_prefix': 'keyframe',
+            'enable_target_mask_generation': False,
+            'target_classes': ["人物", "人", "自転車", "バイク", "車両", "動物"],
+            'yolo_model_path': 'yolo26n-seg.pt',
+            'sam_model_path': 'sam3_t.pt',
+            'confidence_threshold': 0.25,
+            'detection_device': 'auto',
+            'mask_output_dirname': 'masks',
+            'mask_add_suffix': True,
+            'mask_suffix': '_mask',
+            'mask_output_format': 'same',
         })
 
         try:
@@ -608,10 +731,22 @@ class SettingsDialog(QDialog):
             'enable_equipment_detection': self.enable_equipment_detection.isChecked(),
             'mask_dilation_size': self.mask_dilation.value(),
             'enable_rerun_logging': self.enable_rerun_logging.isChecked(),
+            'enable_target_mask_generation': self.enable_target_mask_generation.isChecked(),
+            'target_classes': [
+                label for label, cb in self.target_class_checks.items() if cb.isChecked()
+            ],
+            'yolo_model_path': self.yolo_model_path.currentText().strip(),
+            'sam_model_path': self.sam_model_path.currentText().strip(),
+            'confidence_threshold': self.confidence_threshold.value(),
+            'detection_device': self.detection_device.currentText(),
             'output_image_format': self.output_format.currentText().lower(),
             'output_jpeg_quality': self.jpeg_quality.value(),
             'output_directory': self.output_dir_label.text(),
             'naming_prefix': self.naming_prefix.currentText(),
+            'mask_output_dirname': self.mask_output_dirname.currentText().strip(),
+            'mask_add_suffix': self.mask_add_suffix.isChecked(),
+            'mask_suffix': self.mask_suffix.currentText().strip(),
+            'mask_output_format': self.mask_output_format.currentText(),
         }
 
         try:

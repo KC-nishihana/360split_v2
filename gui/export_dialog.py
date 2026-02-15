@@ -48,6 +48,8 @@ _PERSPECTIVE_PRESETS = {
     "カスタム": (None, None),
 }
 
+TARGET_CLASS_LABELS = ["人物", "人", "自転車", "バイク", "車両", "動物", "その他"]
+
 
 class ExportDialog(QDialog):
     """
@@ -304,6 +306,73 @@ class ExportDialog(QDialog):
 
         layout.addWidget(equip_group)
 
+        # 対象検出マスク
+        target_group = QGroupBox("対象検出マスク（YOLO + SAM）")
+        target_group.setCheckable(True)
+        target_group.setChecked(False)
+        self.target_mask_group = target_group
+        tg_layout = QGridLayout(target_group)
+
+        tg_layout.addWidget(QLabel("検出対象:"), 0, 0)
+        self.target_class_checks = {}
+        row = 0
+        col = 1
+        for label in TARGET_CLASS_LABELS:
+            cb = QCheckBox(label)
+            self.target_class_checks[label] = cb
+            tg_layout.addWidget(cb, row, col)
+            col += 1
+            if col > 2:
+                col = 1
+                row += 1
+
+        base_row = row + 1
+        tg_layout.addWidget(QLabel("YOLOモデル:"), base_row, 0)
+        self.yolo_model_combo = QComboBox()
+        self.yolo_model_combo.setEditable(True)
+        self.yolo_model_combo.addItems([
+            "yolo26n-seg.pt", "yolo26s-seg.pt", "yolo26m-seg.pt", "yolo26l-seg.pt", "yolo26x-seg.pt"
+        ])
+        tg_layout.addWidget(self.yolo_model_combo, base_row, 1, 1, 2)
+
+        tg_layout.addWidget(QLabel("SAMモデル:"), base_row + 1, 0)
+        self.sam_model_combo = QComboBox()
+        self.sam_model_combo.setEditable(True)
+        self.sam_model_combo.addItems(["sam3_t.pt", "sam3_s.pt", "sam3_b.pt", "sam3_l.pt"])
+        tg_layout.addWidget(self.sam_model_combo, base_row + 1, 1, 1, 2)
+
+        tg_layout.addWidget(QLabel("信頼度閾値:"), base_row + 2, 0)
+        self.target_conf_spin = QDoubleSpinBox()
+        self.target_conf_spin.setRange(0.01, 1.0)
+        self.target_conf_spin.setSingleStep(0.01)
+        self.target_conf_spin.setDecimals(2)
+        self.target_conf_spin.setValue(0.25)
+        tg_layout.addWidget(self.target_conf_spin, base_row + 2, 1)
+
+        tg_layout.addWidget(QLabel("推論デバイス:"), base_row + 3, 0)
+        self.target_device_combo = QComboBox()
+        self.target_device_combo.addItems(["auto", "cpu", "mps", "cuda", "0"])
+        tg_layout.addWidget(self.target_device_combo, base_row + 3, 1, 1, 2)
+
+        tg_layout.addWidget(QLabel("マスクフォルダ名:"), base_row + 4, 0)
+        self.mask_dirname_edit = QLineEdit("masks")
+        tg_layout.addWidget(self.mask_dirname_edit, base_row + 4, 1, 1, 2)
+
+        self.mask_add_suffix_check = QCheckBox("ファイル名に接尾辞を追加")
+        self.mask_add_suffix_check.setChecked(True)
+        tg_layout.addWidget(self.mask_add_suffix_check, base_row + 5, 0, 1, 3)
+
+        tg_layout.addWidget(QLabel("接尾辞:"), base_row + 6, 0)
+        self.mask_suffix_edit = QLineEdit("_mask")
+        tg_layout.addWidget(self.mask_suffix_edit, base_row + 6, 1)
+
+        tg_layout.addWidget(QLabel("マスク形式:"), base_row + 7, 0)
+        self.mask_format_combo = QComboBox()
+        self.mask_format_combo.addItems(["same", "png", "jpg", "tiff"])
+        tg_layout.addWidget(self.mask_format_combo, base_row + 7, 1)
+
+        layout.addWidget(target_group)
+
         layout.addStretch()
         return widget
 
@@ -387,6 +456,20 @@ class ExportDialog(QDialog):
             # 装備検出
             "enable_equipment_detection": self.equip_group.isChecked(),
             "mask_dilation_size": self.equip_dilation_spin.value(),
+
+            # 対象検出マスク
+            "enable_target_mask_generation": self.target_mask_group.isChecked(),
+            "target_classes": [
+                label for label, cb in self.target_class_checks.items() if cb.isChecked()
+            ],
+            "yolo_model_path": self.yolo_model_combo.currentText().strip(),
+            "sam_model_path": self.sam_model_combo.currentText().strip(),
+            "confidence_threshold": self.target_conf_spin.value(),
+            "detection_device": self.target_device_combo.currentText(),
+            "mask_output_dirname": self.mask_dirname_edit.text().strip() or "masks",
+            "mask_add_suffix": self.mask_add_suffix_check.isChecked(),
+            "mask_suffix": self.mask_suffix_edit.text().strip() or "_mask",
+            "mask_output_format": self.mask_format_combo.currentText(),
         }
 
     def _on_accept(self):
@@ -439,6 +522,16 @@ class ExportDialog(QDialog):
                     "nadir_mask_radius": g.get("nadir_mask_radius", 100),
                     "enable_equipment_detection": g.get("enable_equipment_detection", False),
                     "mask_dilation_size": g.get("mask_dilation_size", 15),
+                    "enable_target_mask_generation": g.get("enable_target_mask_generation", False),
+                    "target_classes": g.get("target_classes", ["人物", "人", "自転車", "バイク", "車両", "動物"]),
+                    "yolo_model_path": g.get("yolo_model_path", "yolo26n-seg.pt"),
+                    "sam_model_path": g.get("sam_model_path", "sam3_t.pt"),
+                    "confidence_threshold": g.get("confidence_threshold", 0.25),
+                    "detection_device": g.get("detection_device", "auto"),
+                    "mask_output_dirname": g.get("mask_output_dirname", "masks"),
+                    "mask_add_suffix": g.get("mask_add_suffix", True),
+                    "mask_suffix": g.get("mask_suffix", "_mask"),
+                    "mask_output_format": g.get("mask_output_format", "same"),
                     "enable_cubemap": enable_cubemap,
                     "enable_perspective": enable_perspective,
                     "perspective_fov": g.get("perspective_fov", 90.0),
@@ -494,6 +587,22 @@ class ExportDialog(QDialog):
         self.nadir_radius_spin.setValue(int(s.get("nadir_mask_radius", 100)))
         self.equip_group.setChecked(bool(s.get("enable_equipment_detection", False)))
         self.equip_dilation_spin.setValue(int(s.get("mask_dilation_size", 15)))
+
+        # 対象検出
+        self.target_mask_group.setChecked(bool(s.get("enable_target_mask_generation", False)))
+        selected_targets = set(s.get("target_classes", []))
+        for label, cb in self.target_class_checks.items():
+            cb.setChecked(label in selected_targets)
+        self.yolo_model_combo.setCurrentText(str(s.get("yolo_model_path", "yolo26n-seg.pt")))
+        self.sam_model_combo.setCurrentText(str(s.get("sam_model_path", "sam3_t.pt")))
+        self.target_conf_spin.setValue(float(s.get("confidence_threshold", 0.25)))
+        self.target_device_combo.setCurrentText(str(s.get("detection_device", "auto")))
+        self.mask_dirname_edit.setText(str(s.get("mask_output_dirname", "masks")))
+        self.mask_add_suffix_check.setChecked(bool(s.get("mask_add_suffix", True)))
+        self.mask_suffix_edit.setText(str(s.get("mask_suffix", "_mask")))
+        idx = self.mask_format_combo.findText(str(s.get("mask_output_format", "same")).lower())
+        if idx >= 0:
+            self.mask_format_combo.setCurrentIndex(idx)
 
     # ------------------------------------------------------------------
     # ユーティリティ

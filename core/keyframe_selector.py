@@ -622,6 +622,8 @@ class KeyframeSelector:
             cap_a, cap_b = self._open_independent_pair_captures(video_loader)
 
         try:
+            last_read_idx = -1
+            last_read_idx_pair = -1
             for idx, candidate_info in enumerate(stage1_candidates):
                 frame_idx = candidate_info['frame_idx']
                 quality_scores = candidate_info['quality_scores']
@@ -633,10 +635,12 @@ class KeyframeSelector:
                 current_pair = None
                 if is_paired:
                     if cap_a is not None and cap_b is not None:
-                        cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        if frame_idx != last_read_idx_pair + 1:
+                            cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                         ret_a, frame_a = cap_a.read()
                         ret_b, frame_b = cap_b.read()
+                        last_read_idx_pair = frame_idx
                         if not ret_a or not ret_b or frame_a is None or frame_b is None:
                             continue
                     else:
@@ -647,8 +651,10 @@ class KeyframeSelector:
                     current_pair = (frame_a, frame_b)
                     current_frame = frame_a
                 else:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    if frame_idx != last_read_idx + 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                     ret, current_frame = cap.read()
+                    last_read_idx = frame_idx
                     if not ret or current_frame is None:
                         continue
 

@@ -34,6 +34,7 @@ class ObjectDetector:
         "自転車": {"bicycle"},
         "バイク": {"motorcycle"},
         "車両": {"car", "bus", "truck"},
+        "空": set(),
         "動物": {
             "bird", "cat", "dog", "horse", "sheep", "cow",
             "elephant", "bear", "zebra", "giraffe"

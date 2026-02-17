@@ -35,6 +35,7 @@ class _KeyframeThumbnail(QWidget):
     clicked = Signal(int)
     double_clicked = Signal(int)
     delete_requested = Signal(int)
+    selection_toggled = Signal(int, bool)
 
     THUMB_W = 200
     THUMB_H = 130
@@ -103,6 +104,7 @@ class _KeyframeThumbnail(QWidget):
 
     def _on_check(self, checked: bool):
         self.set_selected(checked)
+        self.selection_toggled.emit(self.frame_idx, checked)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -299,6 +301,7 @@ class KeyframeListWidget(QWidget):
             thumb.clicked.connect(self._on_click)
             thumb.double_clicked.connect(self._on_dbl_click)
             thumb.delete_requested.connect(self._on_delete_one)
+            thumb.selection_toggled.connect(self._on_selection_toggled)
 
             if fidx in self.selected_frames:
                 thumb.set_selected(True)
@@ -333,6 +336,12 @@ class KeyframeListWidget(QWidget):
             self.selected_frames.discard(fidx)
             self._update_display()
             self.keyframe_deleted.emit(fidx)
+
+    def _on_selection_toggled(self, fidx: int, checked: bool):
+        if checked:
+            self.selected_frames.add(fidx)
+        else:
+            self.selected_frames.discard(fidx)
 
     def _delete_selected(self):
         if not self.selected_frames:

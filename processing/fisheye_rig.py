@@ -8,6 +8,7 @@
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -32,6 +33,9 @@ class FisheyeRigProcessor:
 
     def __init__(self, equirect_config: Optional[Equirect360Config] = None):
         self.equirect_config = equirect_config or Equirect360Config()
+        # 魚眼→Equirect投影マップを解像度/内部パラメータごとに再利用する
+        self._projection_cache: "OrderedDict[Tuple, Tuple[np.ndarray, np.ndarray, np.ndarray]]" = OrderedDict()
+        self._projection_cache_max_entries = 16
 
     def calibrate_from_checkerboard(
         self,
@@ -229,23 +233,6 @@ class FisheyeRigProcessor:
         """魚眼画像を簡易Equirectへ展開。"""
         h, w = frame.shape[:2]
 
-        # 球面方向ベクトル
-        theta = np.linspace(-np.pi, np.pi, out_w, dtype=np.float32)
-        phi = np.linspace(np.pi / 2, -np.pi / 2, out_h, dtype=np.float32)
-        theta_v, phi_v = np.meshgrid(theta, phi)
-
-        x = np.cos(phi_v) * np.cos(theta_v)
-        y = np.sin(phi_v)
-        z = np.cos(phi_v) * np.sin(theta_v)
-
-        # 前方半球のみ使用
-        valid = x > 0
-        xn = z / np.maximum(x, 1e-8)
-        yn = y / np.maximum(x, 1e-8)
-
-        r = np.sqrt(xn * xn + yn * yn)
-        theta_f = np.arctan(r)
-
         if intrinsics is not None:
             fx = intrinsics.camera_matrix[0, 0]
             fy = intrinsics.camera_matrix[1, 1]
@@ -256,12 +243,42 @@ class FisheyeRigProcessor:
             cx = w * 0.5
             cy = h * 0.5
 
-        scale = np.where(r > 1e-8, theta_f / r, 0.0)
-        map_x = (fx * xn * scale + cx).astype(np.float32)
-        map_y = (fy * yn * scale + cy).astype(np.float32)
+        cache_key = (
+            int(h), int(w), int(out_w), int(out_h),
+            round(float(fx), 6), round(float(fy), 6),
+            round(float(cx), 6), round(float(cy), 6),
+        )
+        cached = self._projection_cache.get(cache_key)
+        if cached is None:
+            # 球面方向ベクトル
+            theta = np.linspace(-np.pi, np.pi, out_w, dtype=np.float32)
+            phi = np.linspace(np.pi / 2, -np.pi / 2, out_h, dtype=np.float32)
+            theta_v, phi_v = np.meshgrid(theta, phi)
 
-        map_x = np.clip(map_x, 0, w - 1).astype(np.float32)
-        map_y = np.clip(map_y, 0, h - 1).astype(np.float32)
+            x = np.cos(phi_v) * np.cos(theta_v)
+            y = np.sin(phi_v)
+            z = np.cos(phi_v) * np.sin(theta_v)
+
+            # 前方半球のみ使用
+            valid = x > 0
+            xn = z / np.maximum(x, 1e-8)
+            yn = y / np.maximum(x, 1e-8)
+
+            r = np.sqrt(xn * xn + yn * yn)
+            theta_f = np.arctan(r)
+            scale = np.where(r > 1e-8, theta_f / r, 0.0)
+            map_x = (fx * xn * scale + cx).astype(np.float32)
+            map_y = (fy * yn * scale + cy).astype(np.float32)
+
+            map_x = np.clip(map_x, 0, w - 1).astype(np.float32)
+            map_y = np.clip(map_y, 0, h - 1).astype(np.float32)
+
+            self._projection_cache[cache_key] = (map_x, map_y, valid)
+            if len(self._projection_cache) > self._projection_cache_max_entries:
+                self._projection_cache.popitem(last=False)
+        else:
+            self._projection_cache.move_to_end(cache_key)
+            map_x, map_y, valid = cached
 
         projected = cv2.remap(frame, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         projected[~valid] = 0

@@ -192,6 +192,7 @@ class KeyframeThumbnailWidget(QWidget):
     clicked = Signal(int)  # フレームインデックス
     double_clicked = Signal(int)
     delete_requested = Signal(int)
+    selection_toggled = Signal(int, bool)
 
     def __init__(self, frame_idx: int, frame_image: np.ndarray,
                  score: float, video_path: str, parent=None):
@@ -316,6 +317,7 @@ class KeyframeThumbnailWidget(QWidget):
         チェックボックストグル時のコールバック
         """
         self.set_selected(checked)
+        self.selection_toggled.emit(self.frame_idx, checked)
 
     def _show_context_menu(self, global_pos: QPoint):
         """
@@ -535,6 +537,7 @@ class KeyframePanel(QWidget):
             widget.clicked.connect(self._on_thumbnail_clicked)
             widget.double_clicked.connect(self._on_thumbnail_double_clicked)
             widget.delete_requested.connect(self._on_thumbnail_delete_requested)
+            widget.selection_toggled.connect(self._on_thumbnail_selection_toggled)
 
             # 選択状態を復元
             if frame_idx in self.selected_frames:
@@ -622,6 +625,15 @@ class KeyframePanel(QWidget):
 
             self._update_display()
             self.keyframe_deleted.emit(frame_idx)
+
+    def _on_thumbnail_selection_toggled(self, frame_idx: int, checked: bool):
+        """
+        サムネイル内チェックボックスの選択状態変更を反映
+        """
+        if checked:
+            self.selected_frames.add(frame_idx)
+        else:
+            self.selected_frames.discard(frame_idx)
 
     def _on_delete_selected(self):
         """

@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt
 from utils.logger import get_logger
 logger = get_logger(__name__)
 
-TARGET_CLASS_LABELS = ["人物", "人", "自転車", "バイク", "車両", "動物", "その他"]
+TARGET_CLASS_LABELS = ["人物", "人", "自転車", "バイク", "車両", "空", "動物", "その他"]
 
 
 class SettingsDialog(QDialog):

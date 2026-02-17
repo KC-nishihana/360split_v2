@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QPushButton, QComboBox,
     QSpinBox, QDoubleSpinBox, QCheckBox,
     QLineEdit, QFileDialog, QDialogButtonBox,
-    QTabWidget, QWidget, QListWidget, QListWidgetItem
+    QTabWidget, QWidget
 )
 from PySide6.QtCore import Qt
 
@@ -48,7 +48,7 @@ _PERSPECTIVE_PRESETS = {
     "カスタム": (None, None),
 }
 
-TARGET_CLASS_LABELS = ["人物", "人", "自転車", "バイク", "車両", "動物", "その他"]
+TARGET_CLASS_LABELS = ["人物", "人", "自転車", "バイク", "車両", "空", "動物", "その他"]
 
 
 class ExportDialog(QDialog):
@@ -62,8 +62,8 @@ class ExportDialog(QDialog):
     def __init__(self, parent=None, num_keyframes: int = 0):
         super().__init__(parent)
         self.setWindowTitle("キーフレームエクスポート設定")
-        self.setMinimumWidth(520)
-        self.setMinimumHeight(600)
+        self.setMinimumWidth(680)
+        self.setMinimumHeight(760)
         self._num_keyframes = num_keyframes
 
         self._setup_ui()
@@ -83,6 +83,7 @@ class ExportDialog(QDialog):
         tabs.addTab(self._create_output_tab(), "📁 出力設定")
         tabs.addTab(self._create_projection_tab(), "🌐 投影変換")
         tabs.addTab(self._create_preprocess_tab(), "🔧 前処理")
+        tabs.addTab(self._create_target_mask_tab(), "🎯 対象マスク")
         layout.addWidget(tabs)
 
         # ボタン
@@ -306,6 +307,17 @@ class ExportDialog(QDialog):
 
         layout.addWidget(equip_group)
 
+        layout.addStretch()
+        return widget
+
+    # ------------------------------------------------------------------
+    # タブ 4: 対象マスク
+    # ------------------------------------------------------------------
+
+    def _create_target_mask_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
         # 対象検出マスク
         target_group = QGroupBox("対象検出マスク（YOLO + SAM）")
         target_group.setCheckable(True)
@@ -372,7 +384,6 @@ class ExportDialog(QDialog):
         tg_layout.addWidget(self.mask_format_combo, base_row + 7, 1)
 
         layout.addWidget(target_group)
-
         layout.addStretch()
         return widget
 

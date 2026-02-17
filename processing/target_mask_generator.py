@@ -93,29 +93,71 @@ class TargetMaskGenerator:
     def _detect_sky_mask(frame: np.ndarray) -> np.ndarray:
         """
         空領域の簡易推定マスク（0/1）。
-        上半分優先 + HSVしきい値で青空/曇天を拾う。
+        HSVしきい値 + 上端連結性で青空/曇天を拾う。
+        建物や地面などの孤立した高輝度領域を除去する。
         """
         import cv2
 
         h, w = frame.shape[:2]
+        if h == 0 or w == 0:
+            return np.zeros((h, w), dtype=np.uint8)
+
+        # 魚眼画像の黒縁を除外するため、有効画素領域を推定
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        valid_region = gray > 8
+        if not np.any(valid_region):
+            return np.zeros((h, w), dtype=np.uint8)
+
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         h_ch, s_ch, v_ch = cv2.split(hsv)
 
         # 青空（青系）と曇天（低彩度・高輝度）を候補化
-        blue_sky = (h_ch >= 85) & (h_ch <= 140) & (s_ch >= 25) & (v_ch >= 70)
-        cloudy_sky = (s_ch <= 50) & (v_ch >= 140)
-        sky = np.logical_or(blue_sky, cloudy_sky)
+        blue_sky = (h_ch >= 85) & (h_ch <= 140) & (s_ch >= 30) & (v_ch >= 65)
+
+        # 曇天判定は明るさに加えて、局所テクスチャが低いことを要求
+        local_var = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        local_var = cv2.GaussianBlur(np.abs(local_var), (5, 5), 0)
+        low_texture = local_var < 16.0
+        cloudy_sky = (s_ch <= 45) & (v_ch >= 145) & low_texture
 
         # 空は主に上側に現れる前提で重みづけ
         top_prior = np.zeros((h, w), dtype=bool)
-        top_prior[: int(h * 0.65), :] = True
-        sky = np.logical_and(sky, top_prior)
+        top_prior[: int(h * 0.72), :] = True
 
-        sky_u8 = sky.astype(np.uint8)
-        kernel = np.ones((5, 5), np.uint8)
+        candidate = np.logical_or(blue_sky, cloudy_sky)
+        candidate = np.logical_and(candidate, top_prior)
+        candidate = np.logical_and(candidate, valid_region)
+
+        sky_u8 = candidate.astype(np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
         sky_u8 = cv2.morphologyEx(sky_u8, cv2.MORPH_OPEN, kernel, iterations=1)
         sky_u8 = cv2.morphologyEx(sky_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
-        return sky_u8
+
+        # 上端に接続した連結成分のみを空として採用
+        anchor = np.zeros((h, w), dtype=np.uint8)
+        anchor_h = max(1, int(h * 0.10))
+        anchor[:anchor_h, :] = 1
+        seed = np.logical_and(sky_u8 > 0, anchor > 0).astype(np.uint8)
+        if not np.any(seed):
+            return np.zeros((h, w), dtype=np.uint8)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(sky_u8, connectivity=8)
+        keep = np.zeros(num_labels, dtype=bool)
+        keep[0] = False
+
+        seed_labels = np.unique(labels[seed > 0])
+        keep[seed_labels] = True
+
+        min_area = max(64, int(valid_region.sum() * 0.0008))
+        for label_id in range(1, num_labels):
+            if not keep[label_id]:
+                continue
+            if stats[label_id, cv2.CC_STAT_AREA] < min_area:
+                keep[label_id] = False
+
+        refined = keep[labels]
+        refined = np.logical_and(refined, valid_region)
+        return refined.astype(np.uint8)
 
     @staticmethod
     def build_mask_path(

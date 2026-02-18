@@ -220,6 +220,7 @@ class MainWindow(QMainWindow):
         # 設定パネル → Live Preview
         self.settings_panel.setting_changed.connect(self._on_live_preview)
         self.settings_panel.run_stage2_requested.connect(self._run_stage2)
+        self.settings_panel.open_settings_requested.connect(self._open_settings_dialog)
 
     # ==================================================================
     # ドラッグ＆ドロップ

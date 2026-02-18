@@ -107,6 +107,7 @@ class SettingsPanel(QWidget):
 
     setting_changed = Signal(dict)
     run_stage2_requested = Signal()
+    open_settings_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -122,6 +123,14 @@ class SettingsPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(0)
+
+        notice = QLabel("このパネルは確認専用です。設定変更は「設定ダイアログ」で行ってください。")
+        notice.setWordWrap(True)
+        notice.setStyleSheet(
+            "color: #ffcc66; background: #2a2a2a; border: 1px solid #4a4a4a; "
+            "border-radius: 4px; padding: 8px;"
+        )
+        outer.addWidget(notice)
 
         # スクロール可能領域
         scroll = QScrollArea()
@@ -279,17 +288,9 @@ class SettingsPanel(QWidget):
         # ---------- ボタン ----------
         btn_layout = QHBoxLayout()
 
-        self._btn_stage2 = QPushButton("▶ 詳細解析 (Stage 2)")
-        self._btn_stage2.setStyleSheet(
-            "QPushButton { background: #cc4400; font-weight: bold; padding: 8px; }"
-            "QPushButton:hover { background: #ff5500; }"
-        )
-        self._btn_stage2.clicked.connect(self.run_stage2_requested.emit)
-        btn_layout.addWidget(self._btn_stage2)
-
-        self._btn_reset = QPushButton("デフォルトに戻す")
-        self._btn_reset.clicked.connect(self._reset_defaults)
-        btn_layout.addWidget(self._btn_reset)
+        self._btn_open_settings = QPushButton("⚙ 設定ダイアログを開く")
+        self._btn_open_settings.clicked.connect(self.open_settings_requested.emit)
+        btn_layout.addWidget(self._btn_open_settings)
 
         layout.addLayout(btn_layout)
 
@@ -297,6 +298,29 @@ class SettingsPanel(QWidget):
 
         scroll.setWidget(container)
         outer.addWidget(scroll)
+        self._set_read_only_mode()
+
+    def _set_read_only_mode(self):
+        """確認専用モード: パネル上の編集UIを無効化"""
+        readonly_widgets = [
+            self._preset_combo,
+            self._w_sharpness,
+            self._w_geometric,
+            self._w_content,
+            self._w_exposure,
+            self._laplacian_th,
+            self._ssim_th,
+            self._motion_blur_th,
+            self._min_interval,
+            self._max_interval,
+            self._gric_ratio,
+            self._ransac_th,
+            self._use_mask,
+            self._mask_ratio,
+            self._enable_rerun_logging,
+        ]
+        for w in readonly_widgets:
+            w.setEnabled(False)
 
     # ==================================================================
     # 設定の読み書き

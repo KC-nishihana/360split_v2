@@ -1,42 +1,23 @@
 """
 エクスポートダイアログ - 360Split v2
 
-キーフレーム画像のエクスポート設定を行うモーダルダイアログ。
-出力投影モード（Original / Cubemap / Perspective）、画像フォーマット、
-360度処理、マスク処理の設定を一画面で行える。
-
-出力ディレクトリ構造:
-  <export_dir>/
-  ├── keyframe_000123.png        # 元画像（常に出力）
-  ├── cubemap/
-  │   └── frame_000123/
-  │       ├── front.png
-  │       ├── back.png
-  │       ├── left.png
-  │       ├── right.png
-  │       ├── up.png
-  │       └── down.png
-  └── perspective/
-      └── frame_000123/
-          ├── y+0_p+0.png
-          ├── y+90_p+0.png
-          └── ...
+実行時に必要な設定のみを扱い、共通パラメータは settings_dialog で一元管理する。
 """
 
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QPushButton, QComboBox,
-    QSpinBox, QDoubleSpinBox, QCheckBox,
-    QLineEdit, QFileDialog, QDialogButtonBox,
-    QTabWidget, QWidget
+    QSpinBox, QDoubleSpinBox, QLineEdit, QFileDialog,
+    QDialogButtonBox, QTabWidget, QWidget
 )
-from PySide6.QtCore import Qt
 
+from gui.settings_dialog import SettingsDialog
 from utils.logger import get_logger
+
 logger = get_logger(__name__)
 
 # デフォルトの Perspective ヨー角プリセット
@@ -48,15 +29,19 @@ _PERSPECTIVE_PRESETS = {
     "カスタム": (None, None),
 }
 
-TARGET_CLASS_LABELS = ["人物", "人", "自転車", "バイク", "車両", "空", "動物", "その他"]
-
 
 class ExportDialog(QDialog):
     """
     エクスポート設定ダイアログ
 
-    キーフレーム画像の出力形式・投影モード・前処理を設定する。
-    OK を押すと get_settings() で全設定を dict で取得できる。
+    変更可能:
+    - 出力先
+    - Cubemap/Perspective 追加出力
+
+    共通設定:
+    - 形式/品質/命名
+    - 前処理/マスク/対象検出
+    これらは settings_dialog で一元管理する。
     """
 
     def __init__(self, parent=None, num_keyframes: int = 0):
@@ -65,28 +50,25 @@ class ExportDialog(QDialog):
         self.setMinimumWidth(680)
         self.setMinimumHeight(760)
         self._num_keyframes = num_keyframes
+        self._global_settings: Dict[str, Any] = {}
 
         self._setup_ui()
         self._load_last_settings()
+        self._load_global_settings()
         self._update_ui_state()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # ヘッダー情報
         info = QLabel(f"エクスポート対象: {self._num_keyframes} キーフレーム")
         info.setStyleSheet("font-weight: bold; font-size: 13px; padding: 4px;")
         layout.addWidget(info)
 
-        # タブウィジェット
         tabs = QTabWidget()
-        tabs.addTab(self._create_output_tab(), "📁 出力設定")
-        tabs.addTab(self._create_projection_tab(), "🌐 投影変換")
-        tabs.addTab(self._create_preprocess_tab(), "🔧 前処理")
-        tabs.addTab(self._create_target_mask_tab(), "🎯 対象マスク")
+        tabs.addTab(self._create_output_tab(), "📁 実行設定")
+        tabs.addTab(self._create_projection_tab(), "🌐 追加出力")
         layout.addWidget(tabs)
 
-        # ボタン
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
@@ -94,15 +76,10 @@ class ExportDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    # ------------------------------------------------------------------
-    # タブ 1: 出力設定
-    # ------------------------------------------------------------------
-
     def _create_output_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # 出力ディレクトリ
         dir_group = QGroupBox("出力先")
         dir_layout = QHBoxLayout(dir_group)
         self.dir_edit = QLineEdit(str(Path.home() / "360split_output"))
@@ -112,39 +89,32 @@ class ExportDialog(QDialog):
         dir_layout.addWidget(browse_btn)
         layout.addWidget(dir_group)
 
-        # 画像フォーマット
-        fmt_group = QGroupBox("画像設定")
-        fmt_layout = QGridLayout(fmt_group)
+        global_group = QGroupBox("共通設定（設定ダイアログで管理）")
+        global_layout = QVBoxLayout(global_group)
+        note = QLabel(
+            "形式・品質・命名・前処理・マスク設定は、"
+            "「編集 > 設定...」で変更してください。"
+        )
+        note.setWordWrap(True)
+        global_layout.addWidget(note)
 
-        fmt_layout.addWidget(QLabel("フォーマット:"), 0, 0)
-        self.format_combo = QComboBox()
-        self.format_combo.addItems(["png", "jpg", "tiff"])
-        self.format_combo.currentTextChanged.connect(self._update_ui_state)
-        fmt_layout.addWidget(self.format_combo, 0, 1)
+        self.global_summary_label = QLabel("")
+        self.global_summary_label.setWordWrap(True)
+        self.global_summary_label.setStyleSheet("color: #dddddd;")
+        global_layout.addWidget(self.global_summary_label)
 
-        fmt_layout.addWidget(QLabel("JPEG品質:"), 1, 0)
-        self.jpeg_quality_spin = QSpinBox()
-        self.jpeg_quality_spin.setRange(1, 100)
-        self.jpeg_quality_spin.setValue(95)
-        fmt_layout.addWidget(self.jpeg_quality_spin, 1, 1)
+        open_settings_btn = QPushButton("設定ダイアログを開く...")
+        open_settings_btn.clicked.connect(self._open_global_settings)
+        global_layout.addWidget(open_settings_btn)
+        layout.addWidget(global_group)
 
-        fmt_layout.addWidget(QLabel("ファイル名接頭辞:"), 2, 0)
-        self.prefix_edit = QLineEdit("keyframe")
-        fmt_layout.addWidget(self.prefix_edit, 2, 1)
-
-        layout.addWidget(fmt_group)
         layout.addStretch()
         return widget
-
-    # ------------------------------------------------------------------
-    # タブ 2: 投影変換
-    # ------------------------------------------------------------------
 
     def _create_projection_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        # --- Cubemap ---
         cubemap_group = QGroupBox("Cubemap 出力")
         cubemap_group.setCheckable(True)
         cubemap_group.setChecked(False)
@@ -162,10 +132,8 @@ class ExportDialog(QDialog):
             "6面 (front/back/left/right/up/down) を\n"
             "フレームごとにサブフォルダへ出力します"
         ), 1, 0, 1, 2)
-
         layout.addWidget(cubemap_group)
 
-        # --- Perspective ---
         persp_group = QGroupBox("Perspective（透視投影）出力")
         persp_group.setCheckable(True)
         persp_group.setChecked(False)
@@ -193,7 +161,6 @@ class ExportDialog(QDialog):
         self.persp_preset_combo.currentTextChanged.connect(self._on_persp_preset)
         pe_layout.addWidget(self.persp_preset_combo, 2, 1)
 
-        # カスタムヨー/ピッチ入力
         pe_layout.addWidget(QLabel("ヨー角 (°):"), 3, 0)
         self.persp_yaw_edit = QLineEdit("0, 90, 180, -90")
         self.persp_yaw_edit.setToolTip("カンマ区切りで角度を指定（例: 0, 90, 180, -90）")
@@ -204,192 +171,16 @@ class ExportDialog(QDialog):
         self.persp_pitch_edit.setToolTip("カンマ区切りで角度を指定（例: 0, 30, -30）")
         pe_layout.addWidget(self.persp_pitch_edit, 4, 1)
 
-        # 出力概算
         self.persp_count_label = QLabel("")
         self.persp_count_label.setStyleSheet("color: #88aaff; font-style: italic;")
         pe_layout.addWidget(self.persp_count_label, 5, 0, 1, 2)
 
-        # 入力変更時に概算を更新
         self.persp_yaw_edit.textChanged.connect(self._update_persp_count)
         self.persp_pitch_edit.textChanged.connect(self._update_persp_count)
 
         layout.addWidget(persp_group)
-
         layout.addStretch()
         return widget
-
-    # ------------------------------------------------------------------
-    # タブ 3: 前処理
-    # ------------------------------------------------------------------
-
-    def _create_preprocess_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        # Equirectangular リサイズ
-        equirect_group = QGroupBox("Equirectangular リサイズ")
-        equirect_group.setCheckable(True)
-        equirect_group.setChecked(False)
-        self.equirect_group = equirect_group
-        eq_layout = QGridLayout(equirect_group)
-
-        eq_layout.addWidget(QLabel("幅 (px):"), 0, 0)
-        self.equirect_w_spin = QSpinBox()
-        self.equirect_w_spin.setRange(512, 16384)
-        self.equirect_w_spin.setSingleStep(256)
-        self.equirect_w_spin.setValue(4096)
-        eq_layout.addWidget(self.equirect_w_spin, 0, 1)
-
-        eq_layout.addWidget(QLabel("高さ (px):"), 1, 0)
-        self.equirect_h_spin = QSpinBox()
-        self.equirect_h_spin.setRange(256, 8192)
-        self.equirect_h_spin.setSingleStep(128)
-        self.equirect_h_spin.setValue(2048)
-        eq_layout.addWidget(self.equirect_h_spin, 1, 1)
-
-        layout.addWidget(equirect_group)
-
-        # ステレオステッチング
-        stitch_group = QGroupBox("ステレオステッチング（OSV/LR入力時）")
-        stitch_group.setCheckable(True)
-        stitch_group.setChecked(True)
-        self.stereo_stitch_group = stitch_group
-        st_layout = QGridLayout(stitch_group)
-        st_layout.addWidget(QLabel("モード:"), 0, 0)
-        self.stitching_mode_combo = QComboBox()
-        self.stitching_mode_combo.addItems(["Fast", "High Quality (HQ)", "Depth-aware"])
-        st_layout.addWidget(self.stitching_mode_combo, 0, 1)
-        layout.addWidget(stitch_group)
-
-        # ポーラーマスク
-        polar_group = QGroupBox("ポーラーマスク（天頂/天底黒塗り）")
-        polar_group.setCheckable(True)
-        polar_group.setChecked(False)
-        self.polar_group = polar_group
-        pl_layout = QGridLayout(polar_group)
-
-        pl_layout.addWidget(QLabel("マスク比率:"), 0, 0)
-        self.polar_ratio_spin = QDoubleSpinBox()
-        self.polar_ratio_spin.setRange(0.01, 0.50)
-        self.polar_ratio_spin.setSingleStep(0.01)
-        self.polar_ratio_spin.setValue(0.10)
-        pl_layout.addWidget(self.polar_ratio_spin, 0, 1)
-
-        layout.addWidget(polar_group)
-
-        # ナディアマスク
-        nadir_group = QGroupBox("ナディアマスク（円形マスク）")
-        nadir_group.setCheckable(True)
-        nadir_group.setChecked(False)
-        self.nadir_group = nadir_group
-        nd_layout = QGridLayout(nadir_group)
-
-        nd_layout.addWidget(QLabel("半径 (px):"), 0, 0)
-        self.nadir_radius_spin = QSpinBox()
-        self.nadir_radius_spin.setRange(10, 1000)
-        self.nadir_radius_spin.setValue(100)
-        nd_layout.addWidget(self.nadir_radius_spin, 0, 1)
-
-        layout.addWidget(nadir_group)
-
-        # 装備検出マスク
-        equip_group = QGroupBox("装備検出マスク（下部領域）")
-        equip_group.setCheckable(True)
-        equip_group.setChecked(False)
-        self.equip_group = equip_group
-        ep_layout = QGridLayout(equip_group)
-
-        ep_layout.addWidget(QLabel("膨張サイズ (px):"), 0, 0)
-        self.equip_dilation_spin = QSpinBox()
-        self.equip_dilation_spin.setRange(0, 100)
-        self.equip_dilation_spin.setValue(15)
-        ep_layout.addWidget(self.equip_dilation_spin, 0, 1)
-
-        layout.addWidget(equip_group)
-
-        layout.addStretch()
-        return widget
-
-    # ------------------------------------------------------------------
-    # タブ 4: 対象マスク
-    # ------------------------------------------------------------------
-
-    def _create_target_mask_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-
-        # 対象検出マスク
-        target_group = QGroupBox("対象検出マスク（YOLO + SAM）")
-        target_group.setCheckable(True)
-        target_group.setChecked(False)
-        self.target_mask_group = target_group
-        tg_layout = QGridLayout(target_group)
-
-        tg_layout.addWidget(QLabel("検出対象:"), 0, 0)
-        self.target_class_checks = {}
-        row = 0
-        col = 1
-        for label in TARGET_CLASS_LABELS:
-            cb = QCheckBox(label)
-            self.target_class_checks[label] = cb
-            tg_layout.addWidget(cb, row, col)
-            col += 1
-            if col > 2:
-                col = 1
-                row += 1
-
-        base_row = row + 1
-        tg_layout.addWidget(QLabel("YOLOモデル:"), base_row, 0)
-        self.yolo_model_combo = QComboBox()
-        self.yolo_model_combo.setEditable(True)
-        self.yolo_model_combo.addItems([
-            "yolo26n-seg.pt", "yolo26s-seg.pt", "yolo26m-seg.pt", "yolo26l-seg.pt", "yolo26x-seg.pt"
-        ])
-        tg_layout.addWidget(self.yolo_model_combo, base_row, 1, 1, 2)
-
-        tg_layout.addWidget(QLabel("SAMモデル:"), base_row + 1, 0)
-        self.sam_model_combo = QComboBox()
-        self.sam_model_combo.setEditable(True)
-        self.sam_model_combo.addItems(["sam3_t.pt", "sam3_s.pt", "sam3_b.pt", "sam3_l.pt"])
-        tg_layout.addWidget(self.sam_model_combo, base_row + 1, 1, 1, 2)
-
-        tg_layout.addWidget(QLabel("信頼度閾値:"), base_row + 2, 0)
-        self.target_conf_spin = QDoubleSpinBox()
-        self.target_conf_spin.setRange(0.01, 1.0)
-        self.target_conf_spin.setSingleStep(0.01)
-        self.target_conf_spin.setDecimals(2)
-        self.target_conf_spin.setValue(0.25)
-        tg_layout.addWidget(self.target_conf_spin, base_row + 2, 1)
-
-        tg_layout.addWidget(QLabel("推論デバイス:"), base_row + 3, 0)
-        self.target_device_combo = QComboBox()
-        self.target_device_combo.addItems(["auto", "cpu", "mps", "cuda", "0"])
-        tg_layout.addWidget(self.target_device_combo, base_row + 3, 1, 1, 2)
-
-        tg_layout.addWidget(QLabel("マスクフォルダ名:"), base_row + 4, 0)
-        self.mask_dirname_edit = QLineEdit("masks")
-        tg_layout.addWidget(self.mask_dirname_edit, base_row + 4, 1, 1, 2)
-
-        self.mask_add_suffix_check = QCheckBox("ファイル名に接尾辞を追加")
-        self.mask_add_suffix_check.setChecked(True)
-        tg_layout.addWidget(self.mask_add_suffix_check, base_row + 5, 0, 1, 3)
-
-        tg_layout.addWidget(QLabel("接尾辞:"), base_row + 6, 0)
-        self.mask_suffix_edit = QLineEdit("_mask")
-        tg_layout.addWidget(self.mask_suffix_edit, base_row + 6, 1)
-
-        tg_layout.addWidget(QLabel("マスク形式:"), base_row + 7, 0)
-        self.mask_format_combo = QComboBox()
-        self.mask_format_combo.addItems(["same", "png", "jpg", "tiff"])
-        tg_layout.addWidget(self.mask_format_combo, base_row + 7, 1)
-
-        layout.addWidget(target_group)
-        layout.addStretch()
-        return widget
-
-    # ------------------------------------------------------------------
-    # イベントハンドラ
-    # ------------------------------------------------------------------
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "出力先を選択", self.dir_edit.text())
@@ -397,8 +188,6 @@ class ExportDialog(QDialog):
             self.dir_edit.setText(d)
 
     def _update_ui_state(self):
-        is_jpg = self.format_combo.currentText() in ('jpg', 'jpeg')
-        self.jpeg_quality_spin.setEnabled(is_jpg)
         self._update_persp_count()
 
     def _on_persp_preset(self, name: str):
@@ -421,77 +210,66 @@ class ExportDialog(QDialog):
             f"{self._num_keyframes} KF = {n} 画像"
         )
 
-    # ------------------------------------------------------------------
-    # 設定の取得 / 保存
-    # ------------------------------------------------------------------
-
     def get_settings(self) -> Dict[str, Any]:
         """ダイアログの全設定を辞書で返す"""
+        self._load_global_settings()
+
         yaws = self._parse_float_list(self.persp_yaw_edit.text())
         pitches = self._parse_float_list(self.persp_pitch_edit.text())
         sz = self.persp_size_spin.value()
+        g = self._global_settings
 
         return {
-            # 出力先
             "output_dir": self.dir_edit.text(),
-            "output_format": self.format_combo.currentText(),
-            "jpeg_quality": self.jpeg_quality_spin.value(),
-            "prefix": self.prefix_edit.text(),
-
-            # Cubemap
+            "output_format": str(g.get("output_image_format", "png")).lower(),
+            "jpeg_quality": int(g.get("output_jpeg_quality", 95)),
+            "prefix": str(g.get("naming_prefix", "keyframe")),
             "enable_cubemap": self.cubemap_group.isChecked(),
             "cubemap_face_size": self.cubemap_face_spin.value(),
-
-            # Perspective
             "enable_perspective": self.persp_group.isChecked(),
             "perspective_fov": self.persp_fov_spin.value(),
             "perspective_yaw_list": yaws,
             "perspective_pitch_list": pitches,
             "perspective_size": (sz, sz),
-
-            # Equirectangular リサイズ
-            "enable_equirect": self.equirect_group.isChecked(),
-            "equirect_width": self.equirect_w_spin.value(),
-            "equirect_height": self.equirect_h_spin.value(),
-            "enable_stereo_stitch": self.stereo_stitch_group.isChecked(),
-            "stitching_mode": self.stitching_mode_combo.currentText(),
-
-            # ポーラーマスク
-            "enable_polar_mask": self.polar_group.isChecked(),
-            "mask_polar_ratio": self.polar_ratio_spin.value(),
-
-            # ナディアマスク
-            "enable_nadir_mask": self.nadir_group.isChecked(),
-            "nadir_mask_radius": self.nadir_radius_spin.value(),
-
-            # 装備検出
-            "enable_equipment_detection": self.equip_group.isChecked(),
-            "mask_dilation_size": self.equip_dilation_spin.value(),
-
-            # 対象検出マスク
-            "enable_target_mask_generation": self.target_mask_group.isChecked(),
-            "target_classes": [
-                label for label, cb in self.target_class_checks.items() if cb.isChecked()
-            ],
-            "yolo_model_path": self.yolo_model_combo.currentText().strip(),
-            "sam_model_path": self.sam_model_combo.currentText().strip(),
-            "confidence_threshold": self.target_conf_spin.value(),
-            "detection_device": self.target_device_combo.currentText(),
-            "mask_output_dirname": self.mask_dirname_edit.text().strip() or "masks",
-            "mask_add_suffix": self.mask_add_suffix_check.isChecked(),
-            "mask_suffix": self.mask_suffix_edit.text().strip() or "_mask",
-            "mask_output_format": self.mask_format_combo.currentText(),
+            "enable_equirect": True,
+            "equirect_width": int(g.get("equirect_width", 4096)),
+            "equirect_height": int(g.get("equirect_height", 2048)),
+            "enable_stereo_stitch": bool(g.get("enable_stereo_stitch", True)),
+            "stitching_mode": str(g.get("stitching_mode", "Fast")),
+            "enable_polar_mask": bool(g.get("enable_polar_mask", False)),
+            "mask_polar_ratio": float(g.get("mask_polar_ratio", 0.10)),
+            "enable_nadir_mask": bool(g.get("enable_nadir_mask", False)),
+            "nadir_mask_radius": int(g.get("nadir_mask_radius", 100)),
+            "enable_equipment_detection": bool(g.get("enable_equipment_detection", False)),
+            "mask_dilation_size": int(g.get("mask_dilation_size", 15)),
+            "enable_target_mask_generation": bool(g.get("enable_target_mask_generation", False)),
+            "target_classes": list(g.get("target_classes", ["人物", "人", "自転車", "バイク", "車両", "動物"])),
+            "yolo_model_path": str(g.get("yolo_model_path", "yolo26n-seg.pt")),
+            "sam_model_path": str(g.get("sam_model_path", "sam3_t.pt")),
+            "confidence_threshold": float(g.get("confidence_threshold", 0.25)),
+            "detection_device": str(g.get("detection_device", "auto")),
+            "mask_output_dirname": str(g.get("mask_output_dirname", "masks")),
+            "mask_add_suffix": bool(g.get("mask_add_suffix", True)),
+            "mask_suffix": str(g.get("mask_suffix", "_mask")),
+            "mask_output_format": str(g.get("mask_output_format", "same")),
         }
 
     def _on_accept(self):
-        """OK 時に設定を永続化"""
         self._save_last_settings()
         self.accept()
 
     def _save_last_settings(self):
-        settings = self.get_settings()
-        # perspective_size はタプルなので JSON 化のためリストに変換
-        settings["perspective_size"] = list(settings["perspective_size"])
+        """エクスポート画面固有の値のみ永続化"""
+        settings = {
+            "output_dir": self.dir_edit.text(),
+            "enable_cubemap": self.cubemap_group.isChecked(),
+            "cubemap_face_size": self.cubemap_face_spin.value(),
+            "enable_perspective": self.persp_group.isChecked(),
+            "perspective_fov": self.persp_fov_spin.value(),
+            "perspective_yaw_list": self._parse_float_list(self.persp_yaw_edit.text()),
+            "perspective_pitch_list": self._parse_float_list(self.persp_pitch_edit.text()),
+            "perspective_size": [self.persp_size_spin.value(), self.persp_size_spin.value()],
+        }
         save_dir = Path.home() / ".360split"
         save_dir.mkdir(exist_ok=True)
         path = save_dir / "export_settings.json"
@@ -502,8 +280,6 @@ class ExportDialog(QDialog):
             logger.warning(f"エクスポート設定保存失敗: {e}")
 
     def _load_last_settings(self):
-        # 1) グローバル設定（settings_dialog の保存先）をベースに適用
-        # 2) 直近エクスポート設定があれば上書き
         settings_dir = Path.home() / ".360split"
         global_path = settings_dir / "settings.json"
         export_path = settings_dir / "export_settings.json"
@@ -514,63 +290,24 @@ class ExportDialog(QDialog):
                     g = json.load(f)
 
                 projection_mode = str(g.get("projection_mode", "Equirectangular"))
-                enable_cubemap = projection_mode == "Cubemap"
-                enable_perspective = projection_mode == "Perspective"
-
-                global_export_defaults = {
-                    "output_dir": g.get("output_directory", self.dir_edit.text()),
-                    "output_format": g.get("output_image_format", "png"),
-                    "jpeg_quality": g.get("output_jpeg_quality", 95),
-                    "prefix": g.get("naming_prefix", "keyframe"),
-                    "enable_equirect": True,
-                    "equirect_width": g.get("equirect_width", 4096),
-                    "equirect_height": g.get("equirect_height", 2048),
-                    "enable_stereo_stitch": g.get("enable_stereo_stitch", True),
-                    "stitching_mode": g.get("stitching_mode", "Fast"),
-                    "enable_polar_mask": g.get("enable_polar_mask", False),
-                    "mask_polar_ratio": g.get("mask_polar_ratio", 0.10),
-                    "enable_nadir_mask": g.get("enable_nadir_mask", False),
-                    "nadir_mask_radius": g.get("nadir_mask_radius", 100),
-                    "enable_equipment_detection": g.get("enable_equipment_detection", False),
-                    "mask_dilation_size": g.get("mask_dilation_size", 15),
-                    "enable_target_mask_generation": g.get("enable_target_mask_generation", False),
-                    "target_classes": g.get("target_classes", ["人物", "人", "自転車", "バイク", "車両", "動物"]),
-                    "yolo_model_path": g.get("yolo_model_path", "yolo26n-seg.pt"),
-                    "sam_model_path": g.get("sam_model_path", "sam3_t.pt"),
-                    "confidence_threshold": g.get("confidence_threshold", 0.25),
-                    "detection_device": g.get("detection_device", "auto"),
-                    "mask_output_dirname": g.get("mask_output_dirname", "masks"),
-                    "mask_add_suffix": g.get("mask_add_suffix", True),
-                    "mask_suffix": g.get("mask_suffix", "_mask"),
-                    "mask_output_format": g.get("mask_output_format", "same"),
-                    "enable_cubemap": enable_cubemap,
-                    "enable_perspective": enable_perspective,
-                    "perspective_fov": g.get("perspective_fov", 90.0),
-                }
-                self._apply_settings_dict(global_export_defaults)
+                self.dir_edit.setText(g.get("output_directory", self.dir_edit.text()))
+                self.cubemap_group.setChecked(projection_mode == "Cubemap")
+                self.persp_group.setChecked(projection_mode == "Perspective")
+                self.persp_fov_spin.setValue(float(g.get("perspective_fov", 90.0)))
 
             if export_path.exists():
                 with open(export_path, 'r', encoding='utf-8') as f:
                     s = json.load(f)
-                self._apply_settings_dict(s)
+                self._apply_export_only_settings(s)
 
         except Exception as e:
             logger.warning(f"エクスポート設定読み込み失敗: {e}")
 
-    def _apply_settings_dict(self, s: Dict[str, Any]):
-        """保存済み辞書を UI に反映する共通処理"""
+    def _apply_export_only_settings(self, s: Dict[str, Any]):
         self.dir_edit.setText(s.get("output_dir", self.dir_edit.text()))
-        idx = self.format_combo.findText(str(s.get("output_format", "png")).lower())
-        if idx >= 0:
-            self.format_combo.setCurrentIndex(idx)
-        self.jpeg_quality_spin.setValue(int(s.get("jpeg_quality", 95)))
-        self.prefix_edit.setText(s.get("prefix", "keyframe"))
-
-        # Cubemap
         self.cubemap_group.setChecked(bool(s.get("enable_cubemap", False)))
         self.cubemap_face_spin.setValue(int(s.get("cubemap_face_size", 1024)))
 
-        # Perspective
         self.persp_group.setChecked(bool(s.get("enable_perspective", False)))
         self.persp_fov_spin.setValue(float(s.get("perspective_fov", 90.0)))
         yaw_list = s.get("perspective_yaw_list", [0.0, 90.0, 180.0, -90.0])
@@ -581,43 +318,42 @@ class ExportDialog(QDialog):
         if isinstance(sz, (list, tuple)) and len(sz) >= 1:
             self.persp_size_spin.setValue(int(sz[0]))
 
-        # Equirect
-        self.equirect_group.setChecked(bool(s.get("enable_equirect", False)))
-        self.equirect_w_spin.setValue(int(s.get("equirect_width", 4096)))
-        self.equirect_h_spin.setValue(int(s.get("equirect_height", 2048)))
-        self.stereo_stitch_group.setChecked(bool(s.get("enable_stereo_stitch", True)))
-        stitch_mode = str(s.get("stitching_mode", "Fast"))
-        idx = self.stitching_mode_combo.findText(stitch_mode)
-        if idx >= 0:
-            self.stitching_mode_combo.setCurrentIndex(idx)
+    def _load_global_settings(self):
+        settings_file = Path.home() / ".360split" / "settings.json"
+        g: Dict[str, Any] = {}
+        try:
+            if settings_file.exists():
+                with open(settings_file, 'r', encoding='utf-8') as f:
+                    g = json.load(f)
+        except Exception as e:
+            logger.warning(f"共通設定の読み込み失敗: {e}")
 
-        # マスク
-        self.polar_group.setChecked(bool(s.get("enable_polar_mask", False)))
-        self.polar_ratio_spin.setValue(float(s.get("mask_polar_ratio", 0.10)))
-        self.nadir_group.setChecked(bool(s.get("enable_nadir_mask", False)))
-        self.nadir_radius_spin.setValue(int(s.get("nadir_mask_radius", 100)))
-        self.equip_group.setChecked(bool(s.get("enable_equipment_detection", False)))
-        self.equip_dilation_spin.setValue(int(s.get("mask_dilation_size", 15)))
+        self._global_settings = g
+        self._refresh_global_summary()
 
-        # 対象検出
-        self.target_mask_group.setChecked(bool(s.get("enable_target_mask_generation", False)))
-        selected_targets = set(s.get("target_classes", []))
-        for label, cb in self.target_class_checks.items():
-            cb.setChecked(label in selected_targets)
-        self.yolo_model_combo.setCurrentText(str(s.get("yolo_model_path", "yolo26n-seg.pt")))
-        self.sam_model_combo.setCurrentText(str(s.get("sam_model_path", "sam3_t.pt")))
-        self.target_conf_spin.setValue(float(s.get("confidence_threshold", 0.25)))
-        self.target_device_combo.setCurrentText(str(s.get("detection_device", "auto")))
-        self.mask_dirname_edit.setText(str(s.get("mask_output_dirname", "masks")))
-        self.mask_add_suffix_check.setChecked(bool(s.get("mask_add_suffix", True)))
-        self.mask_suffix_edit.setText(str(s.get("mask_suffix", "_mask")))
-        idx = self.mask_format_combo.findText(str(s.get("mask_output_format", "same")).lower())
-        if idx >= 0:
-            self.mask_format_combo.setCurrentIndex(idx)
+    def _refresh_global_summary(self):
+        g = self._global_settings
+        fmt = str(g.get("output_image_format", "png")).upper()
+        jpg = int(g.get("output_jpeg_quality", 95))
+        prefix = str(g.get("naming_prefix", "keyframe"))
 
-    # ------------------------------------------------------------------
-    # ユーティリティ
-    # ------------------------------------------------------------------
+        polar = "ON" if g.get("enable_polar_mask", False) else "OFF"
+        nadir = "ON" if g.get("enable_nadir_mask", False) else "OFF"
+        equip = "ON" if g.get("enable_equipment_detection", False) else "OFF"
+        target = "ON" if g.get("enable_target_mask_generation", False) else "OFF"
+        mask_dir = str(g.get("mask_output_dirname", "masks"))
+        mask_fmt = str(g.get("mask_output_format", "same"))
+
+        self.global_summary_label.setText(
+            f"形式: {fmt} / JPEG品質: {jpg} / 接頭辞: {prefix}\n"
+            f"ポーラーマスク: {polar}, ナディア: {nadir}, 装備検出: {equip}\n"
+            f"対象マスク生成: {target} (保存先: {mask_dir}, 形式: {mask_fmt})"
+        )
+
+    def _open_global_settings(self):
+        dialog = SettingsDialog(self)
+        if dialog.exec():
+            self._load_global_settings()
 
     @staticmethod
     def _parse_float_list(text: str) -> List[float]:

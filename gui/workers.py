@@ -170,14 +170,14 @@ class Stage2Worker(QThread):
         KeyframeInfo リスト
     frame_scores_updated : Signal(list)
         更新された FrameScoreData リスト
-    finished : Signal()
+    analysis_finished : Signal()
     error : Signal(str)
     """
 
     progress = Signal(int, int, str)
     keyframes_found = Signal(list)
     frame_scores_updated = Signal(list)
-    finished = Signal()
+    analysis_finished = Signal()
     error = Signal(str)
 
     def __init__(self, video_path: str, stage1_scores: List[FrameScoreData],
@@ -266,7 +266,7 @@ class Stage2Worker(QThread):
             self.frame_scores_updated.emit(updated_scores)
             self.keyframes_found.emit(keyframes)
             self.progress.emit(1, 1, "Stage 2 完了")
-            self.finished.emit()
+            self.analysis_finished.emit()
 
         except Exception as e:
             logger.exception("Stage 2 ワーカーエラー")
@@ -292,7 +292,7 @@ class FullAnalysisWorker(QThread):
         Stage1 完了 (FrameScoreData 全体)
     keyframes_found : Signal(list)
         KeyframeInfo リスト
-    finished : Signal()
+    analysis_finished : Signal()
     error : Signal(str)
     """
 
@@ -300,7 +300,7 @@ class FullAnalysisWorker(QThread):
     stage1_batch = Signal(list)
     stage1_finished = Signal(list)
     keyframes_found = Signal(list)
-    finished = Signal()
+    analysis_finished = Signal()
     error = Signal(str)
 
     def __init__(self, video_path: str, config: dict = None,
@@ -427,7 +427,7 @@ class FullAnalysisWorker(QThread):
 
             self.keyframes_found.emit(keyframes)
             self.progress.emit(100, 100, "解析完了")
-            self.finished.emit()
+            self.analysis_finished.emit()
 
         except Exception as e:
             logger.exception("解析ワーカーエラー")

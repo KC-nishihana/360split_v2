@@ -405,7 +405,7 @@ class MainWindow(QMainWindow):
         self._stage2_worker.progress.connect(self._on_progress)
         self._stage2_worker.keyframes_found.connect(self._on_keyframes_found)
         self._stage2_worker.frame_scores_updated.connect(self._on_scores_updated)
-        self._stage2_worker.finished.connect(self._on_stage2_finished)
+        self._stage2_worker.analysis_finished.connect(self._on_stage2_finished)
         self._stage2_worker.error.connect(self._on_error)
 
         self._progress_bar.setVisible(True)
@@ -455,7 +455,7 @@ class MainWindow(QMainWindow):
         self._full_worker.stage1_batch.connect(self._on_stage1_batch)
         self._full_worker.stage1_finished.connect(self._on_stage1_finished)
         self._full_worker.keyframes_found.connect(self._on_keyframes_found)
-        self._full_worker.finished.connect(self._on_full_finished)
+        self._full_worker.analysis_finished.connect(self._on_full_finished)
         self._full_worker.error.connect(self._on_error)
 
         self._progress_bar.setVisible(True)

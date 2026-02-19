@@ -11,7 +11,7 @@ from typing import Dict, Any, List
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QPushButton, QComboBox,
-    QSpinBox, QDoubleSpinBox, QLineEdit, QFileDialog,
+    QSpinBox, QDoubleSpinBox, QCheckBox, QLineEdit, QFileDialog,
     QDialogButtonBox, QTabWidget, QWidget
 )
 
@@ -107,6 +107,14 @@ class ExportDialog(QDialog):
         open_settings_btn.clicked.connect(self._open_global_settings)
         global_layout.addWidget(open_settings_btn)
         layout.addWidget(global_group)
+
+        stereo_group = QGroupBox("LR入力時の実行オプション")
+        stereo_layout = QVBoxLayout(stereo_group)
+        self.stereo_stitch_check = QCheckBox("L/R をステッチして1枚として出力する")
+        self.stereo_stitch_check.setChecked(True)
+        self.stereo_stitch_check.setToolTip("OFF時は L/ と R/ フォルダに分けて出力します")
+        stereo_layout.addWidget(self.stereo_stitch_check)
+        layout.addWidget(stereo_group)
 
         layout.addStretch()
         return widget
@@ -234,7 +242,7 @@ class ExportDialog(QDialog):
             "enable_equirect": True,
             "equirect_width": int(g.get("equirect_width", 4096)),
             "equirect_height": int(g.get("equirect_height", 2048)),
-            "enable_stereo_stitch": bool(g.get("enable_stereo_stitch", True)),
+            "enable_stereo_stitch": self.stereo_stitch_check.isChecked(),
             "stitching_mode": str(g.get("stitching_mode", "Fast")),
             "enable_polar_mask": bool(g.get("enable_polar_mask", False)),
             "mask_polar_ratio": float(g.get("mask_polar_ratio", 0.10)),
@@ -262,6 +270,7 @@ class ExportDialog(QDialog):
         """エクスポート画面固有の値のみ永続化"""
         settings = {
             "output_dir": self.dir_edit.text(),
+            "enable_stereo_stitch": self.stereo_stitch_check.isChecked(),
             "enable_cubemap": self.cubemap_group.isChecked(),
             "cubemap_face_size": self.cubemap_face_spin.value(),
             "enable_perspective": self.persp_group.isChecked(),
@@ -291,6 +300,7 @@ class ExportDialog(QDialog):
 
                 projection_mode = str(g.get("projection_mode", "Equirectangular"))
                 self.dir_edit.setText(g.get("output_directory", self.dir_edit.text()))
+                self.stereo_stitch_check.setChecked(bool(g.get("enable_stereo_stitch", True)))
                 self.cubemap_group.setChecked(projection_mode == "Cubemap")
                 self.persp_group.setChecked(projection_mode == "Perspective")
                 self.persp_fov_spin.setValue(float(g.get("perspective_fov", 90.0)))
@@ -305,6 +315,8 @@ class ExportDialog(QDialog):
 
     def _apply_export_only_settings(self, s: Dict[str, Any]):
         self.dir_edit.setText(s.get("output_dir", self.dir_edit.text()))
+        if "enable_stereo_stitch" in s:
+            self.stereo_stitch_check.setChecked(bool(s.get("enable_stereo_stitch", True)))
         self.cubemap_group.setChecked(bool(s.get("enable_cubemap", False)))
         self.cubemap_face_spin.setValue(int(s.get("cubemap_face_size", 1024)))
 
@@ -341,11 +353,13 @@ class ExportDialog(QDialog):
         nadir = "ON" if g.get("enable_nadir_mask", False) else "OFF"
         equip = "ON" if g.get("enable_equipment_detection", False) else "OFF"
         target = "ON" if g.get("enable_target_mask_generation", False) else "OFF"
+        stitch_mode = str(g.get("stitching_mode", "Fast"))
         mask_dir = str(g.get("mask_output_dirname", "masks"))
         mask_fmt = str(g.get("mask_output_format", "same"))
 
         self.global_summary_label.setText(
             f"形式: {fmt} / JPEG品質: {jpg} / 接頭辞: {prefix}\n"
+            f"ステッチモード(共通): {stitch_mode}\n"
             f"ポーラーマスク: {polar}, ナディア: {nadir}, 装備検出: {equip}\n"
             f"対象マスク生成: {target} (保存先: {mask_dir}, 形式: {mask_fmt})"
         )

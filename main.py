@@ -13,10 +13,10 @@ Usage:
 """
 
 import sys
-import os
 import argparse
 import json
 from pathlib import Path
+from typing import Tuple
 import cv2
 
 # プロジェクトルートをパスに追加
@@ -222,37 +222,26 @@ def load_config(config_path: str = None, preset_id: str = None) -> dict:
     return settings
 
 
-def run_cli(args):
-    """CLIモードでキーフレーム抽出を実行する。"""
-    from core.video_loader import VideoLoader, DualVideoLoader, FrontRearVideoLoader
-    from core.keyframe_selector import KeyframeSelector
-    from processing.equirectangular import EquirectangularProcessor
-    from processing.mask_processor import MaskProcessor
-    from utils.rerun_logger import RerunKeyframeLogger
-
+def resolve_cli_input(args) -> Tuple[str, bool, bool]:
+    """CLI入力パスとモード種別を解決する。"""
     video_path = args.cli
     is_front_rear = bool(args.front_video and args.rear_video)
+
     if is_front_rear:
         if not Path(args.front_video).exists() or not Path(args.rear_video).exists():
             logger.error(f"前後動画が見つかりません: front={args.front_video}, rear={args.rear_video}")
             sys.exit(1)
         video_path = args.front_video
-    else:
-        if not video_path or not Path(video_path).exists():
-            logger.error(f"動画ファイルが見つかりません: {video_path}")
-            sys.exit(1)
+    elif not video_path or not Path(video_path).exists():
+        logger.error(f"動画ファイルが見つかりません: {video_path}")
+        sys.exit(1)
 
-    # OSV ファイル判定
-    is_osv = (not is_front_rear) and video_path.lower().endswith('.osv')
-    if is_osv:
-        logger.info("OSV（ステレオ）ファイルを検出しました")
-    if is_front_rear:
-        logger.info("前後魚眼モードを検出しました")
+    is_osv = (not is_front_rear) and video_path.lower().endswith(".osv")
+    return video_path, is_front_rear, is_osv
 
-    # 設定ロード（プリセット → 設定ファイル → CLI引数の順で優先）
-    config = load_config(args.config, args.preset)
 
-    # コマンドライン引数で設定をオーバーライド（最優先）
+def apply_cli_overrides(config: dict, args) -> None:
+    """CLI引数で設定を上書きする。"""
     if args.min_interval is not None:
         config["min_keyframe_interval"] = args.min_interval
     if args.ssim_threshold is not None:
@@ -261,12 +250,128 @@ def run_cli(args):
     if args.format:
         config["output_image_format"] = args.format
 
-    # 出力ディレクトリ
-    if args.output:
-        output_dir = Path(args.output)
-    else:
-        output_dir = Path(video_path).parent / "keyframes"
+
+def resolve_output_dir(video_path: str, output_arg: str = None) -> Path:
+    """出力ディレクトリを決定して作成する。"""
+    output_dir = Path(output_arg) if output_arg else Path(video_path).parent / "keyframes"
     output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def create_loader(video_path: str, args, is_front_rear: bool, is_osv: bool):
+    """入力モードに応じてローダーを初期化する。"""
+    from core.video_loader import VideoLoader, DualVideoLoader, FrontRearVideoLoader
+
+    if is_front_rear:
+        loader = FrontRearVideoLoader()
+        try:
+            loader.load(args.front_video, args.rear_video)
+            logger.info(f"前後ストリームを読み込みました: F={args.front_video}, R={args.rear_video}")
+            return loader
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.error(f"前後魚眼ファイルの読み込みに失敗しました: {e}")
+            sys.exit(1)
+
+    if is_osv:
+        loader = DualVideoLoader()
+        try:
+            loader.load(video_path)
+            logger.info(f"ステレオストリームを分離しました: L={loader.left_path}, R={loader.right_path}")
+            return loader
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.error(f"OSVファイルの読み込みに失敗しました: {e}")
+            sys.exit(1)
+
+    loader = VideoLoader()
+    try:
+        loader.load(video_path)
+        return loader
+    except (FileNotFoundError, RuntimeError) as e:
+        logger.error(f"動画の読み込みに失敗しました: {e}")
+        sys.exit(1)
+
+
+def limit_keyframes(keyframes, max_keyframes: int):
+    """スコア上位のキーフレームに制限する。"""
+    if not max_keyframes or len(keyframes) <= max_keyframes:
+        return keyframes
+    keyframes.sort(key=lambda kf: kf.combined_score, reverse=True)
+    limited = keyframes[:max_keyframes]
+    limited.sort(key=lambda kf: kf.frame_index)
+    logger.info(f"上位 {max_keyframes} フレームに制限")
+    return limited
+
+
+def save_frame_image(frame, filepath: Path, fmt: str, jpeg_quality: int) -> bool:
+    """画像をフォーマットに応じて保存する。"""
+    if fmt == "jpg":
+        return write_image(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+    return write_image(filepath, frame)
+
+
+def serialize_rig_metadata(meta_obj):
+    """メタデータ用のリグ情報を辞書へ変換する。"""
+    rig = {"rig_type": getattr(meta_obj, "rig_type", "monocular")}
+
+    calib = getattr(meta_obj, "rig_calibration", None)
+    if calib is not None:
+        rig["calibration"] = {
+            "lens_a": {
+                "camera_matrix": calib.lens_a.camera_matrix.tolist(),
+                "distortion_coeffs": calib.lens_a.distortion_coeffs.tolist(),
+                "image_width": calib.lens_a.image_width,
+                "image_height": calib.lens_a.image_height,
+                "model": calib.lens_a.model,
+            },
+            "lens_b": {
+                "camera_matrix": calib.lens_b.camera_matrix.tolist(),
+                "distortion_coeffs": calib.lens_b.distortion_coeffs.tolist(),
+                "image_width": calib.lens_b.image_width,
+                "image_height": calib.lens_b.image_height,
+                "model": calib.lens_b.model,
+            },
+            "rotation_ab": calib.rotation_ab.tolist(),
+            "translation_ab": calib.translation_ab.tolist(),
+            "reprojection_error": float(calib.reprojection_error),
+        }
+
+    transforms = getattr(meta_obj, "rig_transforms", None)
+    if transforms is not None and getattr(transforms, "matrices", None):
+        rig["transforms"] = {k: v.tolist() for k, v in transforms.matrices.items()}
+
+    return rig
+
+
+def round_json_friendly(value):
+    """JSON化前に数値を丸めつつ、辞書/配列は再帰的に処理する。"""
+    if isinstance(value, dict):
+        return {k: round_json_friendly(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [round_json_friendly(v) for v in value]
+    if isinstance(value, float):
+        return round(value, 4)
+    return value
+
+
+def run_cli(args):
+    """CLIモードでキーフレーム抽出を実行する。"""
+    from core.keyframe_selector import KeyframeSelector
+    from processing.equirectangular import EquirectangularProcessor
+    from processing.mask_processor import MaskProcessor
+    from utils.rerun_logger import RerunKeyframeLogger
+
+    video_path, is_front_rear, is_osv = resolve_cli_input(args)
+    is_stereo_mode = is_osv or is_front_rear
+
+    if is_osv:
+        logger.info("OSV（ステレオ）ファイルを検出しました")
+    if is_front_rear:
+        logger.info("前後魚眼モードを検出しました")
+
+    # 設定ロード（プリセット → 設定ファイル → CLI引数の順で優先）
+    config = load_config(args.config, args.preset)
+    apply_cli_overrides(config, args)
+    output_dir = resolve_output_dir(video_path, args.output)
 
     logger.info("=" * 60)
     logger.info("360Split - CLIモード")
@@ -274,42 +379,17 @@ def run_cli(args):
     logger.info(f"入力動画: {video_path}")
     logger.info(f"出力先:   {output_dir}")
     logger.info(f"フォーマット: {config['output_image_format']}")
-    if is_front_rear:
-        loader = FrontRearVideoLoader()
-        try:
-            loader.load(args.front_video, args.rear_video)
-            logger.info(f"前後ストリームを読み込みました: F={args.front_video}, R={args.rear_video}")
-        except (FileNotFoundError, RuntimeError) as e:
-            logger.error(f"前後魚眼ファイルの読み込みに失敗しました: {e}")
-            sys.exit(1)
-    elif is_osv:
+    if is_osv:
         logger.info("ステレオモード（OSV）: 有効（L/Rペア出力）")
+    if is_front_rear:
+        logger.info("ステレオモード（Front/Rear）: 有効（F/Rペア出力）")
     if args.equirectangular:
         logger.info("360度 Equirectangular モード: 有効")
     if args.apply_mask:
         logger.info("マスク処理: 有効")
     logger.info("-" * 60)
 
-    # 動画読み込み
-    if is_osv:
-        # ステレオ（OSV）モード
-        loader = DualVideoLoader()
-        try:
-            loader.load(video_path)
-            stereo_left_path = loader.left_path
-            stereo_right_path = loader.right_path
-            logger.info(f"ステレオストリームを分離しました: L={stereo_left_path}, R={stereo_right_path}")
-        except (FileNotFoundError, RuntimeError) as e:
-            logger.error(f"OSVファイルの読み込みに失敗しました: {e}")
-            sys.exit(1)
-    else:
-        # 通常の単眼モード
-        loader = VideoLoader()
-        try:
-            loader.load(video_path)
-        except (FileNotFoundError, RuntimeError) as e:
-            logger.error(f"動画の読み込みに失敗しました: {e}")
-            sys.exit(1)
+    loader = create_loader(video_path, args, is_front_rear, is_osv)
 
     meta = loader.get_metadata()
     logger.info(f"動画情報: {meta.width}x{meta.height}, "
@@ -367,13 +447,7 @@ def run_cli(args):
         sys.exit(0)
 
     logger.info(f"検出キーフレーム数: {len(keyframes)}")
-
-    # 最大キーフレーム数で制限
-    if args.max_keyframes and len(keyframes) > args.max_keyframes:
-        keyframes.sort(key=lambda kf: kf.combined_score, reverse=True)
-        keyframes = keyframes[:args.max_keyframes]
-        keyframes.sort(key=lambda kf: kf.frame_index)
-        logger.info(f"上位 {args.max_keyframes} フレームに制限")
+    keyframes = limit_keyframes(keyframes, args.max_keyframes)
 
     # マスク処理
     mask_processor = MaskProcessor() if args.apply_mask else None
@@ -382,17 +456,17 @@ def run_cli(args):
     # キーフレーム出力
     logger.info("キーフレームを出力中...")
     fmt = config["output_image_format"]
+    stereo_suffixes = ("_F", "_R") if is_front_rear else ("_L", "_R")
 
     for i, kf in enumerate(keyframes):
         # ステレオ判定
-        if is_osv or is_front_rear:
+        if is_stereo_mode:
             # ステレオペア取得
             frame_l, frame_r = loader.get_frame_pair(kf.frame_index)
             if frame_l is None or frame_r is None:
                 logger.warning(f"ペアフレーム読み込み失敗: {kf.frame_index}")
                 continue
-            pair_suffix = ('_F', '_R') if is_front_rear else ('_L', '_R')
-            frames_to_process = [(frame_l, pair_suffix[0]), (frame_r, pair_suffix[1])]
+            frames_to_process = [(frame_l, stereo_suffixes[0]), (frame_r, stereo_suffixes[1])]
         else:
             # 単眼フレーム取得
             frame = loader.get_frame(kf.frame_index)
@@ -403,7 +477,7 @@ def run_cli(args):
         # 各フレーム（L/R または単眼）を処理
         for frame, suffix in frames_to_process:
             # ステレオの場合はスティッチ未処理のため分割処理をスキップ
-            if is_osv or is_front_rear:
+            if is_stereo_mode:
                 # パノラマ画像のみを L/ または R/ フォルダに保存
                 output_subdir = output_dir / suffix.strip('_')  # 'L' or 'R'
                 output_subdir.mkdir(parents=True, exist_ok=True)
@@ -412,14 +486,7 @@ def run_cli(args):
                 filename = f"keyframe_{kf.frame_index:06d}{suffix}.{fmt}"
                 filepath = output_subdir / filename
 
-                if fmt == "jpg":
-                    saved = write_image(
-                        filepath,
-                        frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, config["output_jpeg_quality"]]
-                    )
-                else:
-                    saved = write_image(filepath, frame)
+                saved = save_frame_image(frame, filepath, fmt, config["output_jpeg_quality"])
                 if not saved:
                     logger.warning(f"保存失敗（フレーム {kf.frame_index}{suffix}）: {filepath}")
                 continue  # ステレオの場合はここで次のフレームへ
@@ -434,14 +501,7 @@ def run_cli(args):
             filename = f"keyframe_{kf.frame_index:06d}.{fmt}"
             filepath = output_dir / filename
 
-            if fmt == "jpg":
-                saved = write_image(
-                    filepath,
-                    frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, config["output_jpeg_quality"]]
-                )
-            else:
-                saved = write_image(filepath, frame)
+            saved = save_frame_image(frame, filepath, fmt, config["output_jpeg_quality"])
             if not saved:
                 logger.warning(f"保存失敗（フレーム {kf.frame_index}）: {filepath}")
                 continue
@@ -465,43 +525,13 @@ def run_cli(args):
                     f"Time {kf.timestamp:7.2f}s | Score {kf.combined_score:.3f}")
 
     # メタデータ出力
-    def _serialize_rig_metadata(meta_obj):
-        rig = {
-            "rig_type": getattr(meta_obj, "rig_type", "monocular")
-        }
-        calib = getattr(meta_obj, "rig_calibration", None)
-        if calib is not None:
-            rig["calibration"] = {
-                "lens_a": {
-                    "camera_matrix": calib.lens_a.camera_matrix.tolist(),
-                    "distortion_coeffs": calib.lens_a.distortion_coeffs.tolist(),
-                    "image_width": calib.lens_a.image_width,
-                    "image_height": calib.lens_a.image_height,
-                    "model": calib.lens_a.model,
-                },
-                "lens_b": {
-                    "camera_matrix": calib.lens_b.camera_matrix.tolist(),
-                    "distortion_coeffs": calib.lens_b.distortion_coeffs.tolist(),
-                    "image_width": calib.lens_b.image_width,
-                    "image_height": calib.lens_b.image_height,
-                    "model": calib.lens_b.model,
-                },
-                "rotation_ab": calib.rotation_ab.tolist(),
-                "translation_ab": calib.translation_ab.tolist(),
-                "reprojection_error": float(calib.reprojection_error),
-            }
-        transforms = getattr(meta_obj, "rig_transforms", None)
-        if transforms is not None and getattr(transforms, "matrices", None):
-            rig["transforms"] = {k: v.tolist() for k, v in transforms.matrices.items()}
-        return rig
-
     metadata = {
         "video_path": str(Path(video_path).resolve()),
         "total_frames": meta.frame_count,
         "fps": meta.fps,
         "duration": meta.duration,
         "resolution": f"{meta.width}x{meta.height}",
-        "rig": _serialize_rig_metadata(meta),
+        "rig": serialize_rig_metadata(meta),
         "keyframe_count": len(keyframes),
         "settings": config,
         "keyframes": [
@@ -509,9 +539,9 @@ def run_cli(args):
                 "frame_index": kf.frame_index,
                 "timestamp": round(kf.timestamp, 3),
                 "combined_score": round(kf.combined_score, 4),
-                "quality_scores": {k: round(v, 4) for k, v in kf.quality_scores.items()} if kf.quality_scores else {},
-                "geometric_scores": {k: round(v, 4) for k, v in kf.geometric_scores.items()} if kf.geometric_scores else {},
-                "adaptive_scores": {k: round(v, 4) for k, v in kf.adaptive_scores.items()} if kf.adaptive_scores else {},
+                "quality_scores": round_json_friendly(kf.quality_scores) if kf.quality_scores else {},
+                "geometric_scores": round_json_friendly(kf.geometric_scores) if kf.geometric_scores else {},
+                "adaptive_scores": round_json_friendly(kf.adaptive_scores) if kf.adaptive_scores else {},
             }
             for kf in keyframes
         ]
@@ -533,7 +563,6 @@ def run_gui():
     """GUIモードでアプリケーションを起動する。"""
     try:
         from PySide6.QtWidgets import QApplication
-        from PySide6.QtCore import Qt
         from PySide6.QtGui import QFont
     except ImportError:
         logger.error(

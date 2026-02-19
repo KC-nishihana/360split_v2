@@ -89,6 +89,14 @@ class ExportDialog(QDialog):
         dir_layout.addWidget(browse_btn)
         layout.addWidget(dir_group)
 
+        naming_group = QGroupBox("ファイル名")
+        naming_layout = QGridLayout(naming_group)
+        naming_layout.addWidget(QLabel("接頭辞:"), 0, 0)
+        self.prefix_edit = QLineEdit("keyframe")
+        self.prefix_edit.setToolTip("例: keyframe -> keyframe_000123.png")
+        naming_layout.addWidget(self.prefix_edit, 0, 1)
+        layout.addWidget(naming_group)
+
         global_group = QGroupBox("共通設定（設定ダイアログで管理）")
         global_layout = QVBoxLayout(global_group)
         note = QLabel(
@@ -231,7 +239,7 @@ class ExportDialog(QDialog):
             "output_dir": self.dir_edit.text(),
             "output_format": str(g.get("output_image_format", "png")).lower(),
             "jpeg_quality": int(g.get("output_jpeg_quality", 95)),
-            "prefix": str(g.get("naming_prefix", "keyframe")),
+            "prefix": self.prefix_edit.text().strip() or str(g.get("naming_prefix", "keyframe")),
             "enable_cubemap": self.cubemap_group.isChecked(),
             "cubemap_face_size": self.cubemap_face_spin.value(),
             "enable_perspective": self.persp_group.isChecked(),
@@ -270,6 +278,7 @@ class ExportDialog(QDialog):
         """エクスポート画面固有の値のみ永続化"""
         settings = {
             "output_dir": self.dir_edit.text(),
+            "prefix": self.prefix_edit.text().strip(),
             "enable_stereo_stitch": self.stereo_stitch_check.isChecked(),
             "enable_cubemap": self.cubemap_group.isChecked(),
             "cubemap_face_size": self.cubemap_face_spin.value(),
@@ -300,6 +309,7 @@ class ExportDialog(QDialog):
 
                 projection_mode = str(g.get("projection_mode", "Equirectangular"))
                 self.dir_edit.setText(g.get("output_directory", self.dir_edit.text()))
+                self.prefix_edit.setText(str(g.get("naming_prefix", "keyframe")))
                 self.stereo_stitch_check.setChecked(bool(g.get("enable_stereo_stitch", True)))
                 self.cubemap_group.setChecked(projection_mode == "Cubemap")
                 self.persp_group.setChecked(projection_mode == "Perspective")
@@ -315,6 +325,8 @@ class ExportDialog(QDialog):
 
     def _apply_export_only_settings(self, s: Dict[str, Any]):
         self.dir_edit.setText(s.get("output_dir", self.dir_edit.text()))
+        if "prefix" in s:
+            self.prefix_edit.setText(str(s.get("prefix", "")))
         if "enable_stereo_stitch" in s:
             self.stereo_stitch_check.setChecked(bool(s.get("enable_stereo_stitch", True)))
         self.cubemap_group.setChecked(bool(s.get("enable_cubemap", False)))

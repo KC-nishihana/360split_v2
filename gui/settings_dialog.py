@@ -619,6 +619,73 @@ class SettingsDialog(QDialog):
         detection_group.setLayout(detection_layout)
         layout.addWidget(detection_group)
 
+        # === Stage2 動体除去 ===
+        dynamic_group = QGroupBox("Stage2 動体除去（幾何評価）")
+        dynamic_layout = QGridLayout()
+
+        self.enable_dynamic_mask_removal = QCheckBox("Stage2で動体領域を除外する")
+        self.enable_dynamic_mask_removal.setChecked(
+            self.settings.get("enable_dynamic_mask_removal", False)
+        )
+        dynamic_layout.addWidget(self.enable_dynamic_mask_removal, 0, 0, 1, 3)
+
+        self.dynamic_mask_use_yolo_sam = QCheckBox("YOLO/SAM検出領域を除外に使用")
+        self.dynamic_mask_use_yolo_sam.setChecked(
+            self.settings.get("dynamic_mask_use_yolo_sam", True)
+        )
+        dynamic_layout.addWidget(self.dynamic_mask_use_yolo_sam, 1, 0, 1, 3)
+
+        self.dynamic_mask_use_motion_diff = QCheckBox("背景差分の動体領域を除外に使用")
+        self.dynamic_mask_use_motion_diff.setChecked(
+            self.settings.get("dynamic_mask_use_motion_diff", True)
+        )
+        dynamic_layout.addWidget(self.dynamic_mask_use_motion_diff, 2, 0, 1, 3)
+
+        dynamic_layout.addWidget(QLabel("動体検出フレーム数:"), 3, 0)
+        self.dynamic_mask_motion_frames = QSpinBox()
+        self.dynamic_mask_motion_frames.setMinimum(2)
+        self.dynamic_mask_motion_frames.setMaximum(12)
+        self.dynamic_mask_motion_frames.setValue(
+            int(self.settings.get("dynamic_mask_motion_frames", 3))
+        )
+        dynamic_layout.addWidget(self.dynamic_mask_motion_frames, 3, 1)
+
+        dynamic_layout.addWidget(QLabel("差分しきい値:"), 4, 0)
+        self.dynamic_mask_motion_threshold = QSpinBox()
+        self.dynamic_mask_motion_threshold.setMinimum(1)
+        self.dynamic_mask_motion_threshold.setMaximum(255)
+        self.dynamic_mask_motion_threshold.setValue(
+            int(self.settings.get("dynamic_mask_motion_threshold", 30))
+        )
+        dynamic_layout.addWidget(self.dynamic_mask_motion_threshold, 4, 1)
+
+        dynamic_layout.addWidget(QLabel("マスク膨張サイズ:"), 5, 0)
+        self.dynamic_mask_dilation_size = QSpinBox()
+        self.dynamic_mask_dilation_size.setMinimum(0)
+        self.dynamic_mask_dilation_size.setMaximum(51)
+        self.dynamic_mask_dilation_size.setValue(
+            int(self.settings.get("dynamic_mask_dilation_size", 5))
+        )
+        dynamic_layout.addWidget(self.dynamic_mask_dilation_size, 5, 1)
+
+        self.dynamic_mask_inpaint_enabled = QCheckBox("インペイントフックを有効化")
+        self.dynamic_mask_inpaint_enabled.setChecked(
+            self.settings.get("dynamic_mask_inpaint_enabled", False)
+        )
+        dynamic_layout.addWidget(self.dynamic_mask_inpaint_enabled, 6, 0, 1, 3)
+
+        dynamic_layout.addWidget(QLabel("インペイントモジュール:"), 7, 0)
+        self.dynamic_mask_inpaint_module = QComboBox()
+        self.dynamic_mask_inpaint_module.setEditable(True)
+        self.dynamic_mask_inpaint_module.addItems(["", "processing.video_inpaint"])
+        self.dynamic_mask_inpaint_module.setCurrentText(
+            self.settings.get("dynamic_mask_inpaint_module", "")
+        )
+        dynamic_layout.addWidget(self.dynamic_mask_inpaint_module, 7, 1, 1, 2)
+
+        dynamic_group.setLayout(dynamic_layout)
+        layout.addWidget(dynamic_group)
+
         # === 対象マスク出力 ===
         mask_output_group = QGroupBox("対象マスク出力")
         mask_output_layout = QGridLayout()
@@ -684,6 +751,15 @@ class SettingsDialog(QDialog):
             'mask_add_suffix': True,
             'mask_suffix': '_mask',
             'mask_output_format': 'same',
+            'enable_dynamic_mask_removal': False,
+            'dynamic_mask_use_yolo_sam': True,
+            'dynamic_mask_use_motion_diff': True,
+            'dynamic_mask_motion_frames': 3,
+            'dynamic_mask_motion_threshold': 30,
+            'dynamic_mask_dilation_size': 5,
+            'dynamic_mask_target_classes': ["人物", "人", "自転車", "バイク", "車両", "動物"],
+            'dynamic_mask_inpaint_enabled': False,
+            'dynamic_mask_inpaint_module': '',
         })
 
         try:
@@ -747,6 +823,17 @@ class SettingsDialog(QDialog):
             'mask_add_suffix': self.mask_add_suffix.isChecked(),
             'mask_suffix': self.mask_suffix.currentText().strip(),
             'mask_output_format': self.mask_output_format.currentText(),
+            'enable_dynamic_mask_removal': self.enable_dynamic_mask_removal.isChecked(),
+            'dynamic_mask_use_yolo_sam': self.dynamic_mask_use_yolo_sam.isChecked(),
+            'dynamic_mask_use_motion_diff': self.dynamic_mask_use_motion_diff.isChecked(),
+            'dynamic_mask_motion_frames': self.dynamic_mask_motion_frames.value(),
+            'dynamic_mask_motion_threshold': self.dynamic_mask_motion_threshold.value(),
+            'dynamic_mask_dilation_size': self.dynamic_mask_dilation_size.value(),
+            'dynamic_mask_target_classes': [
+                label for label, cb in self.target_class_checks.items() if cb.isChecked()
+            ],
+            'dynamic_mask_inpaint_enabled': self.dynamic_mask_inpaint_enabled.isChecked(),
+            'dynamic_mask_inpaint_module': self.dynamic_mask_inpaint_module.currentText().strip(),
         }
 
         try:
@@ -923,6 +1010,14 @@ class SettingsDialog(QDialog):
             self.jpeg_quality.setValue(95)
             self.output_dir_label.setText(str(Path.home() / "360split_output"))
             self.naming_prefix.setCurrentText('keyframe')
+            self.enable_dynamic_mask_removal.setChecked(False)
+            self.dynamic_mask_use_yolo_sam.setChecked(True)
+            self.dynamic_mask_use_motion_diff.setChecked(True)
+            self.dynamic_mask_motion_frames.setValue(3)
+            self.dynamic_mask_motion_threshold.setValue(30)
+            self.dynamic_mask_dilation_size.setValue(5)
+            self.dynamic_mask_inpaint_enabled.setChecked(False)
+            self.dynamic_mask_inpaint_module.setCurrentText('')
 
             QMessageBox.information(self, "完了", "設定をデフォルト値にリセットしました")
 

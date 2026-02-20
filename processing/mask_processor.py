@@ -5,7 +5,7 @@
 
 import numpy as np
 import cv2
-from typing import List, Tuple, Optional, Union
+from typing import Callable, List, Tuple, Optional, Union
 
 
 class MaskProcessor:
@@ -284,6 +284,31 @@ class MaskProcessor:
         motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, kernel)
 
         return motion_mask
+
+    def apply_inpaint_hook(
+        self,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        inpaint_hook: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
+    ) -> np.ndarray:
+        """
+        将来の動画インペイント連携用フック。
+
+        Args:
+            frame: 入力フレーム (H x W x 3)
+            mask: インペイント対象マスク (H x W), 1=対象
+            inpaint_hook: 外部インペイント関数。未指定時はそのまま返す
+
+        Returns:
+            インペイント後フレーム（hook未設定時は入力フレーム）
+        """
+        if inpaint_hook is None:
+            return frame
+        try:
+            return inpaint_hook(frame, mask)
+        except Exception:
+            # フック失敗時も本処理を継続する
+            return frame
 
     # ===== マスク分析ユーティリティ =====
 

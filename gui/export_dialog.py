@@ -268,6 +268,12 @@ class ExportDialog(QDialog):
             "mask_add_suffix": bool(g.get("mask_add_suffix", True)),
             "mask_suffix": str(g.get("mask_suffix", "_mask")),
             "mask_output_format": str(g.get("mask_output_format", "same")),
+            "dynamic_mask_use_motion_diff": bool(g.get("dynamic_mask_use_motion_diff", True)),
+            "dynamic_mask_motion_frames": int(g.get("dynamic_mask_motion_frames", 3)),
+            "dynamic_mask_motion_threshold": int(g.get("dynamic_mask_motion_threshold", 30)),
+            "dynamic_mask_dilation_size": int(g.get("dynamic_mask_dilation_size", 5)),
+            "dynamic_mask_inpaint_enabled": bool(g.get("dynamic_mask_inpaint_enabled", False)),
+            "dynamic_mask_inpaint_module": str(g.get("dynamic_mask_inpaint_module", "")),
         }
 
     def _on_accept(self):
@@ -365,6 +371,7 @@ class ExportDialog(QDialog):
         nadir = "ON" if g.get("enable_nadir_mask", False) else "OFF"
         equip = "ON" if g.get("enable_equipment_detection", False) else "OFF"
         target = "ON" if g.get("enable_target_mask_generation", False) else "OFF"
+        motion = "ON" if g.get("dynamic_mask_use_motion_diff", True) else "OFF"
         stitch_mode = str(g.get("stitching_mode", "Fast"))
         mask_dir = str(g.get("mask_output_dirname", "masks"))
         mask_fmt = str(g.get("mask_output_format", "same"))
@@ -373,7 +380,7 @@ class ExportDialog(QDialog):
             f"形式: {fmt} / JPEG品質: {jpg} / 接頭辞: {prefix}\n"
             f"ステッチモード(共通): {stitch_mode}\n"
             f"ポーラーマスク: {polar}, ナディア: {nadir}, 装備検出: {equip}\n"
-            f"対象マスク生成: {target} (保存先: {mask_dir}, 形式: {mask_fmt})"
+            f"対象マスク生成: {target} (保存先: {mask_dir}, 形式: {mask_fmt}, MotionDiff: {motion})"
         )
 
     def _open_global_settings(self):

@@ -86,6 +86,19 @@ class Equirect360Config:
     """
     mask_polar_ratio: float = 0.10  # 天頂/天底マスク比率（上下10%をマスク）
     enable_polar_mask: bool = True  # 特徴点抽出時のポーラーマスク有効化
+    enable_dynamic_mask_removal: bool = False
+    dynamic_mask_use_yolo_sam: bool = True
+    dynamic_mask_use_motion_diff: bool = True
+    dynamic_mask_motion_frames: int = 3
+    dynamic_mask_motion_threshold: int = 30
+    dynamic_mask_dilation_size: int = 5
+    dynamic_mask_target_classes: Tuple[str, ...] = ("人物", "人", "自転車", "バイク", "車両", "動物")
+    dynamic_mask_inpaint_enabled: bool = False
+    dynamic_mask_inpaint_module: str = ""
+    yolo_model_path: str = "yolo26n-seg.pt"
+    sam_model_path: str = "sam3_t.pt"
+    confidence_threshold: float = 0.25
+    detection_device: str = "auto"
 
 
 @dataclass
@@ -138,6 +151,19 @@ class KeyframeConfig:
             'MIN_FEATURE_MATCHES': self.gric.min_matches,
             'ENABLE_POLAR_MASK': self.equirect360.enable_polar_mask,
             'MASK_POLAR_RATIO': self.equirect360.mask_polar_ratio,
+            'ENABLE_DYNAMIC_MASK_REMOVAL': self.equirect360.enable_dynamic_mask_removal,
+            'DYNAMIC_MASK_USE_YOLO_SAM': self.equirect360.dynamic_mask_use_yolo_sam,
+            'DYNAMIC_MASK_USE_MOTION_DIFF': self.equirect360.dynamic_mask_use_motion_diff,
+            'DYNAMIC_MASK_MOTION_FRAMES': self.equirect360.dynamic_mask_motion_frames,
+            'DYNAMIC_MASK_MOTION_THRESHOLD': self.equirect360.dynamic_mask_motion_threshold,
+            'DYNAMIC_MASK_DILATION_SIZE': self.equirect360.dynamic_mask_dilation_size,
+            'DYNAMIC_MASK_TARGET_CLASSES': list(self.equirect360.dynamic_mask_target_classes),
+            'DYNAMIC_MASK_INPAINT_ENABLED': self.equirect360.dynamic_mask_inpaint_enabled,
+            'DYNAMIC_MASK_INPAINT_MODULE': self.equirect360.dynamic_mask_inpaint_module,
+            'YOLO_MODEL_PATH': self.equirect360.yolo_model_path,
+            'SAM_MODEL_PATH': self.equirect360.sam_model_path,
+            'CONFIDENCE_THRESHOLD': self.equirect360.confidence_threshold,
+            'DETECTION_DEVICE': self.equirect360.detection_device,
             'THUMBNAIL_SIZE': self.thumbnail_size,
             'SAMPLE_INTERVAL': self.sample_interval,
             'STAGE1_BATCH_SIZE': self.stage1_batch_size,
@@ -181,6 +207,52 @@ class KeyframeConfig:
         # 360
         config.equirect360.enable_polar_mask = d.get('enable_polar_mask', config.equirect360.enable_polar_mask)
         config.equirect360.mask_polar_ratio = d.get('mask_polar_ratio', config.equirect360.mask_polar_ratio)
+        config.equirect360.enable_dynamic_mask_removal = d.get(
+            'enable_dynamic_mask_removal',
+            config.equirect360.enable_dynamic_mask_removal,
+        )
+        config.equirect360.dynamic_mask_use_yolo_sam = d.get(
+            'dynamic_mask_use_yolo_sam',
+            config.equirect360.dynamic_mask_use_yolo_sam,
+        )
+        config.equirect360.dynamic_mask_use_motion_diff = d.get(
+            'dynamic_mask_use_motion_diff',
+            config.equirect360.dynamic_mask_use_motion_diff,
+        )
+        config.equirect360.dynamic_mask_motion_frames = d.get(
+            'dynamic_mask_motion_frames',
+            config.equirect360.dynamic_mask_motion_frames,
+        )
+        config.equirect360.dynamic_mask_motion_threshold = d.get(
+            'dynamic_mask_motion_threshold',
+            config.equirect360.dynamic_mask_motion_threshold,
+        )
+        config.equirect360.dynamic_mask_dilation_size = d.get(
+            'dynamic_mask_dilation_size',
+            config.equirect360.dynamic_mask_dilation_size,
+        )
+        target_classes = d.get(
+            'dynamic_mask_target_classes',
+            d.get('target_classes', config.equirect360.dynamic_mask_target_classes),
+        )
+        if isinstance(target_classes, list):
+            config.equirect360.dynamic_mask_target_classes = tuple(target_classes)
+        elif isinstance(target_classes, tuple):
+            config.equirect360.dynamic_mask_target_classes = target_classes
+        config.equirect360.dynamic_mask_inpaint_enabled = d.get(
+            'dynamic_mask_inpaint_enabled',
+            config.equirect360.dynamic_mask_inpaint_enabled,
+        )
+        config.equirect360.dynamic_mask_inpaint_module = d.get(
+            'dynamic_mask_inpaint_module',
+            config.equirect360.dynamic_mask_inpaint_module,
+        )
+        config.equirect360.yolo_model_path = d.get('yolo_model_path', config.equirect360.yolo_model_path)
+        config.equirect360.sam_model_path = d.get('sam_model_path', config.equirect360.sam_model_path)
+        config.equirect360.confidence_threshold = d.get(
+            'confidence_threshold', config.equirect360.confidence_threshold
+        )
+        config.equirect360.detection_device = d.get('detection_device', config.equirect360.detection_device)
         # Rerun
         config.enable_rerun_logging = bool(d.get('enable_rerun_logging', config.enable_rerun_logging))
         return config

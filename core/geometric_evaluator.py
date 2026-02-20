@@ -164,7 +164,8 @@ class GeometricEvaluator:
 
     def _detect_and_compute_cached(self, frame: np.ndarray,
                                    frame_idx: Optional[int] = None,
-                                   use_polar_mask: bool = False) -> Tuple[List, Optional[np.ndarray]]:
+                                   use_polar_mask: bool = False,
+                                   external_mask: Optional[np.ndarray] = None) -> Tuple[List, Optional[np.ndarray]]:
         """
         特徴点を検出して記述子を計算（キャッシュ・ポーラーマスク対応）
 
@@ -182,8 +183,9 @@ class GeometricEvaluator:
         tuple
             (キーポイント, 記述子) のタプル
         """
+        use_cache = frame_idx is not None and external_mask is None
         # キャッシュをチェック
-        if frame_idx is not None:
+        if use_cache:
             cached = self.feature_cache.get(frame_idx)
             if cached is not None:
                 return cached
@@ -196,18 +198,48 @@ class GeometricEvaluator:
         if use_polar_mask and self.equirect_config.enable_polar_mask:
             h, w = gray.shape[:2]
             mask = self._create_polar_mask(h, w)
+        if external_mask is not None:
+            ext = self._normalize_external_feature_mask(external_mask, gray.shape[:2])
+            mask = ext if mask is None else cv2.bitwise_and(mask, ext)
 
         # 特徴点検出と記述子計算
         keypoints, descriptors = self.detector.detectAndCompute(gray, mask)
 
         # キャッシュに保存
-        if frame_idx is not None:
+        if use_cache:
             self.feature_cache.put(
                 frame_idx, keypoints,
                 descriptors if descriptors is not None else np.array([])
             )
 
         return keypoints, descriptors
+
+    @staticmethod
+    def _normalize_external_feature_mask(
+        external_mask: np.ndarray,
+        expected_shape: Tuple[int, int],
+    ) -> np.ndarray:
+        """
+        外部マスクを detectAndCompute 用に正規化する。
+        戻り値は 255=有効, 0=無効。
+        """
+        if external_mask is None:
+            return np.ones(expected_shape, dtype=np.uint8) * 255
+
+        mask = external_mask
+        if mask.ndim == 3:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        if mask.shape[:2] != expected_shape:
+            mask = cv2.resize(mask, (expected_shape[1], expected_shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        mask = mask.astype(np.uint8)
+        # 0/1 の場合は 1=除外領域として扱う
+        if np.max(mask) <= 1:
+            valid = (mask == 0).astype(np.uint8) * 255
+            return valid
+        # 0/255 の場合は 0=除外, 255=有効を想定
+        valid = np.where(mask > 0, 255, 0).astype(np.uint8)
+        return valid
 
     def _match_features(self, desc1: np.ndarray, desc2: np.ndarray,
                        kp1: List, kp2: List) -> List[Tuple[int, int]]:
@@ -377,7 +409,9 @@ class GeometricEvaluator:
 
     def compute_gric_score(self, frame1: np.ndarray, frame2: np.ndarray,
                            frame1_idx: Optional[int] = None,
-                           frame2_idx: Optional[int] = None) -> float:
+                           frame2_idx: Optional[int] = None,
+                           frame1_mask: Optional[np.ndarray] = None,
+                           frame2_mask: Optional[np.ndarray] = None) -> float:
         """
         GRICベースの視差スコアを計算
 
@@ -413,10 +447,10 @@ class GeometricEvaluator:
 
         # 特徴点検出（360°ポーラーマスク適用）
         kp1, desc1 = self._detect_and_compute_cached(
-            frame1, frame_idx=frame1_idx, use_polar_mask=True
+            frame1, frame_idx=frame1_idx, use_polar_mask=True, external_mask=frame1_mask
         )
         kp2, desc2 = self._detect_and_compute_cached(
-            frame2, frame_idx=frame2_idx, use_polar_mask=True
+            frame2, frame_idx=frame2_idx, use_polar_mask=True, external_mask=frame2_mask
         )
 
         # マッチング
@@ -538,7 +572,8 @@ class GeometricEvaluator:
         return score
 
     def compute_feature_distribution(self, frame: np.ndarray,
-                                     frame_idx: Optional[int] = None) -> float:
+                                     frame_idx: Optional[int] = None,
+                                     feature_mask: Optional[np.ndarray] = None) -> float:
         """
         特徴点分布スコア
 
@@ -559,7 +594,7 @@ class GeometricEvaluator:
             分布スコア（0-1、高いほど均等分布）
         """
         kp, _ = self._detect_and_compute_cached(
-            frame, frame_idx=frame_idx, use_polar_mask=True
+            frame, frame_idx=frame_idx, use_polar_mask=True, external_mask=feature_mask
         )
 
         if len(kp) == 0:
@@ -599,7 +634,9 @@ class GeometricEvaluator:
 
     def compute_feature_match_count(self, frame1: np.ndarray, frame2: np.ndarray,
                                     frame1_idx: Optional[int] = None,
-                                    frame2_idx: Optional[int] = None) -> int:
+                                    frame2_idx: Optional[int] = None,
+                                    frame1_mask: Optional[np.ndarray] = None,
+                                    frame2_mask: Optional[np.ndarray] = None) -> int:
         """
         フレーム間のロバスト特徴マッチ数を計算
 
@@ -616,10 +653,10 @@ class GeometricEvaluator:
             マッチした特徴点数
         """
         kp1, desc1 = self._detect_and_compute_cached(
-            frame1, frame_idx=frame1_idx, use_polar_mask=True
+            frame1, frame_idx=frame1_idx, use_polar_mask=True, external_mask=frame1_mask
         )
         kp2, desc2 = self._detect_and_compute_cached(
-            frame2, frame_idx=frame2_idx, use_polar_mask=True
+            frame2, frame_idx=frame2_idx, use_polar_mask=True, external_mask=frame2_mask
         )
 
         matches = self._match_features(desc1, desc2, kp1, kp2)
@@ -627,7 +664,8 @@ class GeometricEvaluator:
 
     def compute_ray_dispersion(self, frame: np.ndarray,
                               is_equirectangular: bool = False,
-                              frame_idx: Optional[int] = None) -> float:
+                              frame_idx: Optional[int] = None,
+                              feature_mask: Optional[np.ndarray] = None) -> float:
         """
         特徴点光線の分散スコア
 
@@ -649,7 +687,7 @@ class GeometricEvaluator:
             光線分散スコア（0-1）
         """
         kp, _ = self._detect_and_compute_cached(
-            frame, frame_idx=frame_idx, use_polar_mask=True
+            frame, frame_idx=frame_idx, use_polar_mask=True, external_mask=feature_mask
         )
 
         if len(kp) < 4:
@@ -699,7 +737,9 @@ class GeometricEvaluator:
                 frame1_idx: Optional[int] = None,
                 frame2_idx: Optional[int] = None,
                 min_matches: int = None,
-                gric_threshold: float = None) -> Dict[str, float]:
+                gric_threshold: float = None,
+                frame1_mask: Optional[np.ndarray] = None,
+                frame2_mask: Optional[np.ndarray] = None) -> Dict[str, float]:
         """
         フレーム間の幾何学的性質を総合評価
 
@@ -740,19 +780,29 @@ class GeometricEvaluator:
         gric_score = self.compute_gric_score(
             frame1, frame2,
             frame1_idx=frame1_idx,
-            frame2_idx=frame2_idx
+            frame2_idx=frame2_idx,
+            frame1_mask=frame1_mask,
+            frame2_mask=frame2_mask,
         )
 
         # 補助スコア計算（OpenCVエラーに対する安全ネット付き）
         try:
-            dist1 = self.compute_feature_distribution(frame1, frame_idx=frame1_idx)
-            dist2 = self.compute_feature_distribution(frame2, frame_idx=frame2_idx)
+            dist1 = self.compute_feature_distribution(
+                frame1, frame_idx=frame1_idx, feature_mask=frame1_mask
+            )
+            dist2 = self.compute_feature_distribution(
+                frame2, frame_idx=frame2_idx, feature_mask=frame2_mask
+            )
             match_count = self.compute_feature_match_count(
                 frame1, frame2,
                 frame1_idx=frame1_idx,
-                frame2_idx=frame2_idx
+                frame2_idx=frame2_idx,
+                frame1_mask=frame1_mask,
+                frame2_mask=frame2_mask,
             )
-            ray_disp = self.compute_ray_dispersion(frame1, frame_idx=frame1_idx)
+            ray_disp = self.compute_ray_dispersion(
+                frame1, frame_idx=frame1_idx, feature_mask=frame1_mask
+            )
         except cv2.error as e:
             logger.warning(f"補助スコア計算でOpenCVエラー（GRICスコアのみ使用）: {e}")
             dist1, dist2 = 0.5, 0.5

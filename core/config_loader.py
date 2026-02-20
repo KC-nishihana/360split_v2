@@ -139,6 +139,16 @@ class ConfigManager:
             "mask_add_suffix": True,
             "mask_suffix": "_mask",
             "mask_output_format": "same",
+            # Stage2 動体除去
+            "enable_dynamic_mask_removal": False,
+            "dynamic_mask_use_yolo_sam": True,
+            "dynamic_mask_use_motion_diff": True,
+            "dynamic_mask_motion_frames": 3,
+            "dynamic_mask_motion_threshold": 30,
+            "dynamic_mask_dilation_size": 5,
+            "dynamic_mask_target_classes": ["人物", "人", "自転車", "バイク", "車両", "動物"],
+            "dynamic_mask_inpaint_enabled": False,
+            "dynamic_mask_inpaint_module": "",
         }
 
     @classmethod

@@ -6,11 +6,12 @@ YOLO検出 + SAMセグメンテーション結果をOR結合し、
 """
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
 from processing.instance_segmentor import InstanceSegmentor
+from processing.mask_processor import MaskProcessor
 from processing.object_detector import Detection, ObjectDetector
 from utils.logger import get_logger
 
@@ -29,6 +30,12 @@ class TargetMaskGenerator:
         sam_model_path: str = "sam3.pt",
         confidence_threshold: float = 0.25,
         device: str = "auto",
+        enable_motion_detection: bool = False,
+        motion_history_frames: int = 3,
+        motion_threshold: int = 30,
+        motion_mask_dilation_size: int = 0,
+        enable_mask_inpaint: bool = False,
+        inpaint_hook: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
     ):
         self.detector = ObjectDetector(
             model_path=yolo_model_path,
@@ -39,6 +46,13 @@ class TargetMaskGenerator:
             model_path=sam_model_path,
             device=device,
         )
+        self.mask_processor = MaskProcessor()
+        self.enable_motion_detection = enable_motion_detection
+        self.motion_history_frames = max(2, int(motion_history_frames))
+        self.motion_threshold = int(motion_threshold)
+        self.motion_mask_dilation_size = max(0, int(motion_mask_dilation_size))
+        self.enable_mask_inpaint = bool(enable_mask_inpaint)
+        self.inpaint_hook = inpaint_hook
 
     @staticmethod
     def _detections_to_binary_mask(
@@ -58,12 +72,13 @@ class TargetMaskGenerator:
         self,
         frame: np.ndarray,
         target_classes: Optional[List[str]],
+        motion_frames: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
         """
         対象=黒(0), 背景=白(255)の2値マスクを生成する。
         """
-        # クラス未選択時は白マスク
-        if not target_classes:
+        target_classes = target_classes or []
+        if not target_classes and not self.enable_motion_detection:
             return np.full(frame.shape[:2], 255, dtype=np.uint8)
 
         target_set = set(target_classes)
@@ -85,9 +100,64 @@ class TargetMaskGenerator:
             sky_mask = self._detect_sky_mask(frame)
             combined = np.logical_or(combined, sky_mask > 0).astype(np.uint8)
 
+        if self.enable_motion_detection:
+            motion_mask = self._detect_motion_mask(frame, motion_frames)
+            if motion_mask is not None:
+                combined = np.logical_or(combined, motion_mask > 0).astype(np.uint8)
+
         if not np.any(combined):
             return np.full(frame.shape[:2], 255, dtype=np.uint8)
         return np.where(combined == 1, 0, 255).astype(np.uint8)
+
+    def run_inpaint_hook(self, frame: np.ndarray, binary_mask: np.ndarray) -> np.ndarray:
+        """
+        将来の動画インペイント連携用フック。
+        現時点では外部フック未接続時に入力フレームをそのまま返す。
+        """
+        if not self.enable_mask_inpaint:
+            return frame
+        mask_01 = (binary_mask == 0).astype(np.uint8)
+        return self.mask_processor.apply_inpaint_hook(
+            frame=frame,
+            mask=mask_01,
+            inpaint_hook=self.inpaint_hook,
+        )
+
+    def _detect_motion_mask(
+        self,
+        frame: np.ndarray,
+        motion_frames: Optional[List[np.ndarray]] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        背景差分ベースの動体マスク（1=マスク対象）を生成する。
+        """
+        frames = list(motion_frames or [])
+        if not frames:
+            return None
+
+        valid_frames = [f for f in frames if f is not None and f.shape[:2] == frame.shape[:2]]
+        if not valid_frames:
+            return None
+
+        if not np.array_equal(valid_frames[-1], frame):
+            valid_frames.append(frame)
+
+        if len(valid_frames) > self.motion_history_frames:
+            valid_frames = valid_frames[-self.motion_history_frames:]
+
+        if len(valid_frames) < 2:
+            return None
+
+        motion_mask = self.mask_processor.detect_moving_objects(
+            valid_frames,
+            threshold=self.motion_threshold,
+        ).astype(np.uint8)
+        if self.motion_mask_dilation_size > 0:
+            motion_mask = self.mask_processor.dilate_mask(
+                motion_mask,
+                kernel_size=self.motion_mask_dilation_size,
+            )
+        return motion_mask
 
     @staticmethod
     def _detect_sky_mask(frame: np.ndarray) -> np.ndarray:

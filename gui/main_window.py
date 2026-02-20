@@ -609,6 +609,12 @@ class MainWindow(QMainWindow):
             mask_add_suffix=s["mask_add_suffix"],
             mask_suffix=s["mask_suffix"],
             mask_output_format=s["mask_output_format"],
+            dynamic_mask_use_motion_diff=s["dynamic_mask_use_motion_diff"],
+            dynamic_mask_motion_frames=s["dynamic_mask_motion_frames"],
+            dynamic_mask_motion_threshold=s["dynamic_mask_motion_threshold"],
+            dynamic_mask_dilation_size=s["dynamic_mask_dilation_size"],
+            dynamic_mask_inpaint_enabled=s["dynamic_mask_inpaint_enabled"],
+            dynamic_mask_inpaint_module=s["dynamic_mask_inpaint_module"],
         )
 
         # ステレオ（OSV）対応: 左右ストリームパスを設定

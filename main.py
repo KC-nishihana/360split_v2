@@ -146,6 +146,43 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--remove-dynamic-objects",
+        action="store_true",
+        default=False,
+        help="Stage2で動体領域を除外して幾何評価を実行する"
+    )
+    parser.add_argument(
+        "--dynamic-mask-frames",
+        type=int,
+        default=None,
+        help="動体差分に使うフレーム数（2以上）"
+    )
+    parser.add_argument(
+        "--dynamic-mask-threshold",
+        type=int,
+        default=None,
+        help="動体差分しきい値（1-255）"
+    )
+    parser.add_argument(
+        "--dynamic-mask-dilation",
+        type=int,
+        default=None,
+        help="動体マスク膨張サイズ（0で無効）"
+    )
+    parser.add_argument(
+        "--dynamic-mask-inpaint",
+        action="store_true",
+        default=False,
+        help="動体マスクのインペイントフックを有効化する"
+    )
+    parser.add_argument(
+        "--dynamic-mask-inpaint-module",
+        type=str,
+        default=None,
+        help="インペイントフックモジュール（inpaint_frame(frame, mask) を実装）"
+    )
+
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         default=False,
@@ -249,6 +286,18 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["ssim_threshold"] = args.ssim_threshold
     if args.format:
         config["output_image_format"] = args.format
+    if args.remove_dynamic_objects:
+        config["enable_dynamic_mask_removal"] = True
+    if args.dynamic_mask_frames is not None:
+        config["dynamic_mask_motion_frames"] = max(2, args.dynamic_mask_frames)
+    if args.dynamic_mask_threshold is not None:
+        config["dynamic_mask_motion_threshold"] = max(1, min(255, args.dynamic_mask_threshold))
+    if args.dynamic_mask_dilation is not None:
+        config["dynamic_mask_dilation_size"] = max(0, args.dynamic_mask_dilation)
+    if args.dynamic_mask_inpaint:
+        config["dynamic_mask_inpaint_enabled"] = True
+    if args.dynamic_mask_inpaint_module:
+        config["dynamic_mask_inpaint_module"] = args.dynamic_mask_inpaint_module.strip()
 
 
 def resolve_output_dir(video_path: str, output_arg: str = None) -> Path:
@@ -387,6 +436,13 @@ def run_cli(args):
         logger.info("360度 Equirectangular モード: 有効")
     if args.apply_mask:
         logger.info("マスク処理: 有効")
+    if config.get("enable_dynamic_mask_removal", False):
+        logger.info(
+            "Stage2動体除去: 有効 "
+            f"(frames={config.get('dynamic_mask_motion_frames', 3)}, "
+            f"th={config.get('dynamic_mask_motion_threshold', 30)}, "
+            f"dilate={config.get('dynamic_mask_dilation_size', 5)})"
+        )
     logger.info("-" * 60)
 
     loader = create_loader(video_path, args, is_front_rear, is_osv)

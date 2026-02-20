@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 
@@ -28,6 +28,8 @@ from config import GRICConfig, Equirect360Config, NormalizationConfig
 from utils.logger import get_logger
 from utils.image_io import write_image
 logger = get_logger(__name__)
+
+DYNAMIC_MASK_DEFAULT_CLASSES = ["人物", "人", "自転車", "バイク", "車両", "動物"]
 
 
 @dataclass
@@ -122,6 +124,19 @@ class KeyframeSelector:
             'EQUIRECT_WIDTH': 4096,
             'EQUIRECT_HEIGHT': 2048,
             'RIG_FEATURE_METHOD': 'orb',
+            'ENABLE_DYNAMIC_MASK_REMOVAL': False,
+            'DYNAMIC_MASK_USE_YOLO_SAM': True,
+            'DYNAMIC_MASK_USE_MOTION_DIFF': True,
+            'DYNAMIC_MASK_MOTION_FRAMES': 3,
+            'DYNAMIC_MASK_MOTION_THRESHOLD': 30,
+            'DYNAMIC_MASK_DILATION_SIZE': 5,
+            'DYNAMIC_MASK_TARGET_CLASSES': list(DYNAMIC_MASK_DEFAULT_CLASSES),
+            'DYNAMIC_MASK_INPAINT_ENABLED': False,
+            'DYNAMIC_MASK_INPAINT_MODULE': '',
+            'YOLO_MODEL_PATH': 'yolo26n-seg.pt',
+            'SAM_MODEL_PATH': 'sam3_t.pt',
+            'CONFIDENCE_THRESHOLD': 0.25,
+            'DETECTION_DEVICE': 'auto',
             # レスキューモード設定
             'ENABLE_RESCUE_MODE': False,
             'RESCUE_FEATURE_THRESHOLD': 15,  # この値以下で特徴点不足と判定
@@ -155,6 +170,19 @@ class KeyframeSelector:
                 'equirect_width': 'EQUIRECT_WIDTH',
                 'equirect_height': 'EQUIRECT_HEIGHT',
                 'rig_feature_method': 'RIG_FEATURE_METHOD',
+                'enable_dynamic_mask_removal': 'ENABLE_DYNAMIC_MASK_REMOVAL',
+                'dynamic_mask_use_yolo_sam': 'DYNAMIC_MASK_USE_YOLO_SAM',
+                'dynamic_mask_use_motion_diff': 'DYNAMIC_MASK_USE_MOTION_DIFF',
+                'dynamic_mask_motion_frames': 'DYNAMIC_MASK_MOTION_FRAMES',
+                'dynamic_mask_motion_threshold': 'DYNAMIC_MASK_MOTION_THRESHOLD',
+                'dynamic_mask_dilation_size': 'DYNAMIC_MASK_DILATION_SIZE',
+                'dynamic_mask_target_classes': 'DYNAMIC_MASK_TARGET_CLASSES',
+                'dynamic_mask_inpaint_enabled': 'DYNAMIC_MASK_INPAINT_ENABLED',
+                'dynamic_mask_inpaint_module': 'DYNAMIC_MASK_INPAINT_MODULE',
+                'yolo_model_path': 'YOLO_MODEL_PATH',
+                'sam_model_path': 'SAM_MODEL_PATH',
+                'confidence_threshold': 'CONFIDENCE_THRESHOLD',
+                'detection_device': 'DETECTION_DEVICE',
             }
             for src, dst in alias_map.items():
                 if src in config:
@@ -208,6 +236,90 @@ class KeyframeSelector:
         self.feature_count_history = deque(maxlen=self.config['RESCUE_WINDOW_SIZE'])
         self.previous_brightness = None
         self.rescue_mode_keyframes = []  # レスキューモードで選択されたキーフレーム
+        self.target_mask_generator = self._build_target_mask_generator()
+
+    def _load_inpaint_hook(self):
+        module_name = str(self.config.get('DYNAMIC_MASK_INPAINT_MODULE', '') or '').strip()
+        if not module_name:
+            return None
+        try:
+            mod = __import__(module_name, fromlist=['inpaint_frame'])
+            hook = getattr(mod, 'inpaint_frame', None)
+            if callable(hook):
+                return hook
+            logger.warning(f"インペイントモジュールに inpaint_frame がありません: {module_name}")
+        except Exception as e:
+            logger.warning(f"インペイントモジュール読み込み失敗: {module_name}, err={e}")
+        return None
+
+    def _build_target_mask_generator(self):
+        if not self.config.get('ENABLE_DYNAMIC_MASK_REMOVAL', False):
+            return None
+
+        use_yolo_sam = bool(self.config.get('DYNAMIC_MASK_USE_YOLO_SAM', True))
+        use_motion = bool(self.config.get('DYNAMIC_MASK_USE_MOTION_DIFF', True))
+        if not use_yolo_sam and not use_motion:
+            logger.info("動体除去は有効だが、YOLO/SAM と MotionDiff が両方無効のためスキップ")
+            return None
+
+        try:
+            from processing.target_mask_generator import TargetMaskGenerator
+
+            inpaint_hook = self._load_inpaint_hook() if self.config.get('DYNAMIC_MASK_INPAINT_ENABLED', False) else None
+            return TargetMaskGenerator(
+                yolo_model_path=str(self.config.get('YOLO_MODEL_PATH', 'yolo26n-seg.pt')),
+                sam_model_path=str(self.config.get('SAM_MODEL_PATH', 'sam3_t.pt')),
+                confidence_threshold=float(self.config.get('CONFIDENCE_THRESHOLD', 0.25)),
+                device=str(self.config.get('DETECTION_DEVICE', 'auto')),
+                enable_motion_detection=use_motion,
+                motion_history_frames=int(self.config.get('DYNAMIC_MASK_MOTION_FRAMES', 3)),
+                motion_threshold=int(self.config.get('DYNAMIC_MASK_MOTION_THRESHOLD', 30)),
+                motion_mask_dilation_size=int(self.config.get('DYNAMIC_MASK_DILATION_SIZE', 5)),
+                enable_mask_inpaint=bool(self.config.get('DYNAMIC_MASK_INPAINT_ENABLED', False)),
+                inpaint_hook=inpaint_hook,
+            )
+        except Exception as e:
+            logger.warning(f"動体マスク生成器の初期化に失敗したため無効化: {e}")
+            return None
+
+    def _build_dynamic_masks(
+        self,
+        frame_prev: np.ndarray,
+        frame_cur: np.ndarray,
+        context_frames: List[np.ndarray],
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self.target_mask_generator is None:
+            return None, None
+
+        target_classes = self.config.get('DYNAMIC_MASK_TARGET_CLASSES', DYNAMIC_MASK_DEFAULT_CLASSES)
+        if not isinstance(target_classes, list):
+            target_classes = list(target_classes) if target_classes else list(DYNAMIC_MASK_DEFAULT_CLASSES)
+
+        use_yolo_sam = bool(self.config.get('DYNAMIC_MASK_USE_YOLO_SAM', True))
+        classes_for_detection = target_classes if use_yolo_sam else []
+
+        motion_window = int(self.config.get('DYNAMIC_MASK_MOTION_FRAMES', 3))
+        ctx = [f for f in context_frames if f is not None]
+        ctx.append(frame_prev)
+        ctx.append(frame_cur)
+        if len(ctx) > motion_window:
+            ctx = ctx[-motion_window:]
+
+        try:
+            mask_prev = self.target_mask_generator.generate_mask(
+                frame_prev,
+                classes_for_detection,
+                motion_frames=ctx,
+            )
+            mask_cur = self.target_mask_generator.generate_mask(
+                frame_cur,
+                classes_for_detection,
+                motion_frames=ctx,
+            )
+            return mask_prev, mask_cur
+        except Exception as e:
+            logger.debug(f"動体マスク生成失敗（無効化して継続）: {e}")
+            return None, None
 
     def _open_independent_capture(self, video_path) -> cv2.VideoCapture:
         """
@@ -608,6 +720,7 @@ class KeyframeSelector:
 
         # フレームウィンドウ（カメラ加速度計算用）
         frame_window = deque(maxlen=5)
+        geom_frame_window = deque(maxlen=max(2, int(self.config.get('DYNAMIC_MASK_MOTION_FRAMES', 3))))
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
         cap = None
@@ -715,11 +828,20 @@ class KeyframeSelector:
                         quality_scores['seam_features_cur'] = float(f_cur.seam_keypoint_count)
                         geom_ref, geom_cur = last_pan, cur_pan
 
+                    dynamic_mask_ref = None
+                    dynamic_mask_cur = None
+                    if self.config.get('ENABLE_DYNAMIC_MASK_REMOVAL', False):
+                        dynamic_mask_ref, dynamic_mask_cur = self._build_dynamic_masks(
+                            geom_ref, geom_cur, list(geom_frame_window)
+                        )
+
                     try:
                         geometric_scores = self.geometric_evaluator.evaluate(
                             geom_ref, geom_cur,
                             frame1_idx=last_keyframe_idx,
-                            frame2_idx=frame_idx
+                            frame2_idx=frame_idx,
+                            frame1_mask=dynamic_mask_ref,
+                            frame2_mask=dynamic_mask_cur,
                         )
                     except GeometricDegeneracyError as e:
                         logger.debug(f"フレーム {frame_idx}: 幾何学的縮退 - {e}")
@@ -769,6 +891,8 @@ class KeyframeSelector:
                                 except Exception as e:
                                     logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
                             continue
+
+                    geom_frame_window.append(geom_cur)
 
                     if not geometric_failed and 'feature_match_count' in geometric_scores:
                         self.is_rescue_mode = self._check_rescue_mode(geometric_scores['feature_match_count'])

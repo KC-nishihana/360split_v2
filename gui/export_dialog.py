@@ -260,6 +260,11 @@ class ExportDialog(QDialog):
             "mask_dilation_size": int(g.get("mask_dilation_size", 15)),
             "enable_target_mask_generation": bool(g.get("enable_target_mask_generation", False)),
             "target_classes": list(g.get("target_classes", ["人物", "人", "自転車", "バイク", "車両", "動物"])),
+            "enable_dynamic_mask_removal": bool(g.get("enable_dynamic_mask_removal", False)),
+            "dynamic_mask_use_yolo_sam": bool(g.get("dynamic_mask_use_yolo_sam", True)),
+            "dynamic_mask_target_classes": list(
+                g.get("dynamic_mask_target_classes", g.get("target_classes", ["人物", "人", "自転車", "バイク", "車両", "動物"]))
+            ),
             "yolo_model_path": str(g.get("yolo_model_path", "yolo26n-seg.pt")),
             "sam_model_path": str(g.get("sam_model_path", "sam3_t.pt")),
             "confidence_threshold": float(g.get("confidence_threshold", 0.25)),

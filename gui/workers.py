@@ -14,7 +14,7 @@ ExportWorker:
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from collections import deque
 
@@ -497,8 +497,12 @@ class ExportWorker(QThread):
                  dynamic_mask_motion_frames: int = 3,
                  dynamic_mask_motion_threshold: int = 30,
                  dynamic_mask_dilation_size: int = 5,
+                 dynamic_mask_use_yolo_sam: bool = True,
+                 dynamic_mask_target_classes: Optional[List[str]] = None,
                  dynamic_mask_inpaint_enabled: bool = False,
                  dynamic_mask_inpaint_module: str = "",
+                 precomputed_analysis_masks: Optional[Dict[int, np.ndarray]] = None,
+                 use_precomputed_analysis_masks: bool = False,
                  parent: QObject = None):
         super().__init__(parent)
         self.video_path = video_path
@@ -547,8 +551,12 @@ class ExportWorker(QThread):
         self.dynamic_mask_motion_frames = max(2, int(dynamic_mask_motion_frames))
         self.dynamic_mask_motion_threshold = int(dynamic_mask_motion_threshold)
         self.dynamic_mask_dilation_size = max(0, int(dynamic_mask_dilation_size))
+        self.dynamic_mask_use_yolo_sam = bool(dynamic_mask_use_yolo_sam)
+        self.dynamic_mask_target_classes = list(dynamic_mask_target_classes or [])
         self.dynamic_mask_inpaint_enabled = bool(dynamic_mask_inpaint_enabled)
         self.dynamic_mask_inpaint_module = str(dynamic_mask_inpaint_module or "").strip()
+        self.precomputed_analysis_masks = dict(precomputed_analysis_masks or {})
+        self.use_precomputed_analysis_masks = bool(use_precomputed_analysis_masks)
 
         # ステレオ（OSV）設定
         self.is_stereo = False
@@ -570,14 +578,13 @@ class ExportWorker(QThread):
         self,
         images_root: Path,
         image_path: Path,
+        frame_idx: int,
         frame: np.ndarray,
         mask_generator,
         motion_frames: Optional[List[np.ndarray]] = None,
+        force_mask_reanalysis: bool = False,
     ) -> bool:
         from processing.target_mask_generator import TargetMaskGenerator
-
-        if mask_generator is None:
-            return False
 
         masks_root = images_root / self.mask_output_dirname
         mask_path = TargetMaskGenerator.build_mask_path(
@@ -590,13 +597,34 @@ class ExportWorker(QThread):
         )
         mask_path.parent.mkdir(parents=True, exist_ok=True)
 
-        binary_mask = mask_generator.generate_mask(
-            frame,
-            self.target_classes,
-            motion_frames=motion_frames,
-        )
+        binary_mask = None
+        if self.use_precomputed_analysis_masks and not force_mask_reanalysis:
+            cached_mask = self.precomputed_analysis_masks.get(int(frame_idx))
+            if cached_mask is not None:
+                if cached_mask.shape[:2] != frame.shape[:2]:
+                    cached_mask = cv2.resize(
+                        cached_mask.astype(np.uint8),
+                        (frame.shape[1], frame.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                binary_mask = cached_mask.astype(np.uint8)
+
+        if binary_mask is None:
+            if mask_generator is None:
+                return False
+            classes_for_detection = (
+                self.dynamic_mask_target_classes or self.target_classes
+                if self.dynamic_mask_use_yolo_sam
+                else []
+            )
+            binary_mask = mask_generator.generate_mask(
+                frame,
+                classes_for_detection,
+                motion_frames=motion_frames,
+            )
         if self.dynamic_mask_inpaint_enabled:
-            _ = mask_generator.run_inpaint_hook(frame, binary_mask)
+            if mask_generator is not None:
+                _ = mask_generator.run_inpaint_hook(frame, binary_mask)
         ext = mask_path.suffix.lower().lstrip(".")
         if ext in ("jpg", "jpeg"):
             return write_image(
@@ -668,33 +696,42 @@ class ExportWorker(QThread):
             target_mask_generator = None
             if self.enable_target_mask_generation:
                 try:
-                    from processing.target_mask_generator import TargetMaskGenerator
-                    inpaint_hook = None
-                    if self.dynamic_mask_inpaint_enabled and self.dynamic_mask_inpaint_module:
-                        try:
-                            mod = __import__(self.dynamic_mask_inpaint_module, fromlist=['inpaint_frame'])
-                            hook = getattr(mod, 'inpaint_frame', None)
-                            if callable(hook):
-                                inpaint_hook = hook
-                        except Exception as e:
-                            logger.warning(f"インペイントモジュール読み込み失敗: {e}")
+                    needs_reanalysis = bool(self.enable_cubemap or self.enable_perspective or self.is_stereo)
+                    can_reuse_only = (
+                        self.use_precomputed_analysis_masks
+                        and not needs_reanalysis
+                        and all(int(idx) in self.precomputed_analysis_masks for idx in self.frame_indices)
+                    )
+                    if can_reuse_only:
+                        logger.info("対象マスク出力は解析時マスクを再利用（再解析なし）")
+                    else:
+                        from processing.target_mask_generator import TargetMaskGenerator
+                        inpaint_hook = None
+                        if self.dynamic_mask_inpaint_enabled and self.dynamic_mask_inpaint_module:
+                            try:
+                                mod = __import__(self.dynamic_mask_inpaint_module, fromlist=['inpaint_frame'])
+                                hook = getattr(mod, 'inpaint_frame', None)
+                                if callable(hook):
+                                    inpaint_hook = hook
+                            except Exception as e:
+                                logger.warning(f"インペイントモジュール読み込み失敗: {e}")
 
-                    target_mask_generator = TargetMaskGenerator(
-                        yolo_model_path=self.yolo_model_path,
-                        sam_model_path=self.sam_model_path,
-                        confidence_threshold=self.confidence_threshold,
-                        device=self.detection_device,
-                        enable_motion_detection=self.dynamic_mask_use_motion_diff,
-                        motion_history_frames=self.dynamic_mask_motion_frames,
-                        motion_threshold=self.dynamic_mask_motion_threshold,
-                        motion_mask_dilation_size=self.dynamic_mask_dilation_size,
-                        enable_mask_inpaint=self.dynamic_mask_inpaint_enabled,
-                        inpaint_hook=inpaint_hook,
-                    )
-                    logger.info(
-                        "対象マスク生成を有効化: "
-                        f"classes={self.target_classes}, yolo={self.yolo_model_path}, sam={self.sam_model_path}"
-                    )
+                        target_mask_generator = TargetMaskGenerator(
+                            yolo_model_path=self.yolo_model_path,
+                            sam_model_path=self.sam_model_path,
+                            confidence_threshold=self.confidence_threshold,
+                            device=self.detection_device,
+                            enable_motion_detection=self.dynamic_mask_use_motion_diff,
+                            motion_history_frames=self.dynamic_mask_motion_frames,
+                            motion_threshold=self.dynamic_mask_motion_threshold,
+                            motion_mask_dilation_size=self.dynamic_mask_dilation_size,
+                            enable_mask_inpaint=self.dynamic_mask_inpaint_enabled,
+                            inpaint_hook=inpaint_hook,
+                        )
+                        logger.info(
+                            "対象マスク生成を有効化: "
+                            f"classes={self.target_classes}, yolo={self.yolo_model_path}, sam={self.sam_model_path}"
+                        )
                 except Exception as e:
                     logger.warning(f"対象マスク生成の初期化に失敗したため無効化します: {e}")
                     self.enable_target_mask_generation = False
@@ -748,6 +785,9 @@ class ExportWorker(QThread):
                 # 各フレーム（L/R または単眼）を処理
                 for frame, suffix in frames_to_process:
                     processed_frame = frame
+                    force_mask_reanalysis = bool(
+                        self.enable_cubemap or self.enable_perspective or self.is_stereo
+                    )
 
                     # ファイル拡張子を決定（ステレオ/非ステレオ両方で使用）
                     ext = 'jpg' if self.format in ('jpg', 'jpeg') else self.format
@@ -785,7 +825,13 @@ class ExportWorker(QThread):
                                 motion_history.append(processed_frame.copy())
                                 motion_frames = list(motion_history)
                                 if not self._save_target_mask(
-                                    output_path, filepath, processed_frame, target_mask_generator, motion_frames
+                                    output_path,
+                                    filepath,
+                                    frame_idx,
+                                    processed_frame,
+                                    target_mask_generator,
+                                    motion_frames,
+                                    force_mask_reanalysis,
                                 ):
                                     logger.warning(f"対象マスク保存失敗: {filepath}")
                             except Exception as e:
@@ -881,7 +927,13 @@ class ExportWorker(QThread):
                             motion_history.append(processed_frame.copy())
                             motion_frames = list(motion_history)
                             if not self._save_target_mask(
-                                output_path, filepath, processed_frame, target_mask_generator, motion_frames
+                                output_path,
+                                filepath,
+                                frame_idx,
+                                processed_frame,
+                                target_mask_generator,
+                                motion_frames,
+                                force_mask_reanalysis,
                             ):
                                 logger.warning(f"対象マスク保存失敗: {filepath}")
                         except Exception as e:
@@ -997,6 +1049,8 @@ class GenerateMasksWorker(QThread):
         dynamic_mask_motion_frames: int = 3,
         dynamic_mask_motion_threshold: int = 30,
         dynamic_mask_dilation_size: int = 5,
+        dynamic_mask_use_yolo_sam: bool = True,
+        dynamic_mask_target_classes: Optional[List[str]] = None,
         dynamic_mask_inpaint_enabled: bool = False,
         dynamic_mask_inpaint_module: str = "",
         parent: QObject = None,
@@ -1018,6 +1072,8 @@ class GenerateMasksWorker(QThread):
         self.dynamic_mask_motion_frames = max(2, int(dynamic_mask_motion_frames))
         self.dynamic_mask_motion_threshold = int(dynamic_mask_motion_threshold)
         self.dynamic_mask_dilation_size = max(0, int(dynamic_mask_dilation_size))
+        self.dynamic_mask_use_yolo_sam = bool(dynamic_mask_use_yolo_sam)
+        self.dynamic_mask_target_classes = list(dynamic_mask_target_classes or [])
         self.dynamic_mask_inpaint_enabled = bool(dynamic_mask_inpaint_enabled)
         self.dynamic_mask_inpaint_module = str(dynamic_mask_inpaint_module or "").strip()
         self._is_running = True
@@ -1054,9 +1110,14 @@ class GenerateMasksWorker(QThread):
                     continue
                 frame_history.append(frame)
 
+                classes_for_detection = (
+                    self.dynamic_mask_target_classes or self.target_classes
+                    if self.dynamic_mask_use_yolo_sam
+                    else []
+                )
                 mask = generator.generate_mask(
                     frame,
-                    self.target_classes,
+                    classes_for_detection,
                     motion_frames=list(frame_history),
                 )
                 out_path = generator.build_mask_path(

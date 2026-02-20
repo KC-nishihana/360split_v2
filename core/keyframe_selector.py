@@ -67,6 +67,7 @@ class KeyframeInfo:
     thumbnail: Optional[np.ndarray] = None
     is_rescue_mode: bool = False
     is_force_inserted: bool = False
+    dynamic_mask: Optional[np.ndarray] = None
 
 
 class KeyframeSelector:
@@ -320,6 +321,25 @@ class KeyframeSelector:
         except Exception as e:
             logger.debug(f"動体マスク生成失敗（無効化して継続）: {e}")
             return None, None
+
+    def _build_single_frame_dynamic_mask(
+        self,
+        frame: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        if self.target_mask_generator is None:
+            return None
+        target_classes = self.config.get('DYNAMIC_MASK_TARGET_CLASSES', DYNAMIC_MASK_DEFAULT_CLASSES)
+        if not isinstance(target_classes, list):
+            target_classes = list(target_classes) if target_classes else list(DYNAMIC_MASK_DEFAULT_CLASSES)
+        classes_for_detection = target_classes if bool(self.config.get('DYNAMIC_MASK_USE_YOLO_SAM', True)) else []
+        try:
+            return self.target_mask_generator.generate_mask(
+                frame,
+                classes_for_detection,
+                motion_frames=[frame],
+            )
+        except Exception:
+            return None
 
     def _open_independent_capture(self, video_path) -> cv2.VideoCapture:
         """
@@ -776,6 +796,7 @@ class KeyframeSelector:
                 force_insert = False
                 exposure_changed = False
                 is_selected = False
+                dynamic_mask_cur = None
 
                 if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
                     if frame_log_callback:
@@ -946,6 +967,8 @@ class KeyframeSelector:
                 combined_score = self._compute_combined_score(
                     quality_scores, geometric_scores, adaptive_scores
                 )
+                if self.config.get('ENABLE_DYNAMIC_MASK_REMOVAL', False) and dynamic_mask_cur is None:
+                    dynamic_mask_cur = self._build_single_frame_dynamic_mask(current_frame)
 
                 candidate = KeyframeInfo(
                     frame_index=frame_idx,
@@ -956,7 +979,8 @@ class KeyframeSelector:
                     combined_score=combined_score,
                     thumbnail=None,
                     is_rescue_mode=self.is_rescue_mode,
-                    is_force_inserted=force_insert or exposure_changed
+                    is_force_inserted=force_insert or exposure_changed,
+                    dynamic_mask=dynamic_mask_cur.copy() if dynamic_mask_cur is not None else None,
                 )
                 candidates.append(candidate)
                 is_selected = True

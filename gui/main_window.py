@@ -16,7 +16,7 @@
 
 import json
 from pathlib import Path
-from typing import Optional, List
+from typing import Dict, Optional, List
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
         self._stage2_worker: Optional[Stage2Worker] = None
         self._full_worker: Optional[FullAnalysisWorker] = None
         self._export_worker: Optional[ExportWorker] = None
+        self._analysis_masks: Dict[int, object] = {}
 
         # ステレオ（OSV）対応
         self.is_stereo: bool = False
@@ -260,6 +261,7 @@ class MainWindow(QMainWindow):
 
             # 前回解析結果を先にクリア
             self._stage1_scores.clear()
+            self._analysis_masks.clear()
             self.keyframe_list.clear()
             self.timeline.set_keyframes([], [])
             self.timeline.set_score_data([], [])
@@ -351,6 +353,7 @@ class MainWindow(QMainWindow):
 
         self._stop_workers()
         self._stage1_scores.clear()
+        self._analysis_masks.clear()
 
         config = self.settings_panel.get_selector_dict()
         self._stage1_worker = Stage1Worker(self.video_path, config=config)
@@ -398,6 +401,7 @@ class MainWindow(QMainWindow):
             return
 
         self._stop_workers()
+        self._analysis_masks.clear()
 
         config = self.settings_panel.get_selector_dict()
         self._stage2_worker = Stage2Worker(
@@ -449,6 +453,7 @@ class MainWindow(QMainWindow):
 
         self._stop_workers()
         self._stage1_scores.clear()
+        self._analysis_masks.clear()
 
         config = self.settings_panel.get_selector_dict()
         self._full_worker = FullAnalysisWorker(self.video_path, config=config)
@@ -483,6 +488,11 @@ class MainWindow(QMainWindow):
         """キーフレーム検出結果を全ウィジェットに反映"""
         frames = [kf.frame_index for kf in keyframes]
         scores = [kf.combined_score for kf in keyframes]
+        self._analysis_masks = {
+            int(kf.frame_index): kf.dynamic_mask
+            for kf in keyframes
+            if getattr(kf, "dynamic_mask", None) is not None
+        }
 
         self.timeline.set_keyframes(frames, scores)
         self.keyframe_list.set_keyframes(frames, scores)
@@ -613,8 +623,16 @@ class MainWindow(QMainWindow):
             dynamic_mask_motion_frames=s["dynamic_mask_motion_frames"],
             dynamic_mask_motion_threshold=s["dynamic_mask_motion_threshold"],
             dynamic_mask_dilation_size=s["dynamic_mask_dilation_size"],
+            dynamic_mask_use_yolo_sam=s["dynamic_mask_use_yolo_sam"],
+            dynamic_mask_target_classes=s["dynamic_mask_target_classes"],
             dynamic_mask_inpaint_enabled=s["dynamic_mask_inpaint_enabled"],
             dynamic_mask_inpaint_module=s["dynamic_mask_inpaint_module"],
+            precomputed_analysis_masks={
+                idx: self._analysis_masks[idx]
+                for idx in selected
+                if idx in self._analysis_masks
+            },
+            use_precomputed_analysis_masks=bool(s.get("enable_dynamic_mask_removal", False)),
         )
 
         # ステレオ（OSV）対応: 左右ストリームパスを設定

@@ -171,6 +171,9 @@ class KeyframeSelector:
                 'equirect_width': 'EQUIRECT_WIDTH',
                 'equirect_height': 'EQUIRECT_HEIGHT',
                 'rig_feature_method': 'RIG_FEATURE_METHOD',
+                'gric_ratio_threshold': 'GRIC_RATIO_THRESHOLD',
+                'gric_degeneracy_threshold': 'GRIC_DEGENERACY_THRESHOLD',
+                'min_feature_matches': 'MIN_FEATURE_MATCHES',
                 'enable_dynamic_mask_removal': 'ENABLE_DYNAMIC_MASK_REMOVAL',
                 'dynamic_mask_use_yolo_sam': 'DYNAMIC_MASK_USE_YOLO_SAM',
                 'dynamic_mask_use_motion_diff': 'DYNAMIC_MASK_USE_MOTION_DIFF',
@@ -1230,15 +1233,12 @@ class KeyframeSelector:
 
             time_diff = current_kf.timestamp - last_kf.timestamp
 
-            if time_diff <= max_interval:
-                enforced_keyframes.append(current_kf)
-            else:
-                num_missing = int(np.ceil(time_diff / max_interval)) - 1
-
-                for j in range(1, num_missing + 1):
-                    enforced_keyframes.append(current_kf)
-
-                enforced_keyframes.append(current_kf)
+            if time_diff > max_interval:
+                logger.debug(
+                    f"最大間隔超過: frame {last_kf.frame_index} → {current_kf.frame_index} "
+                    f"(gap={time_diff:.2f}s > max={max_interval:.2f}s)"
+                )
+            enforced_keyframes.append(current_kf)
 
         return enforced_keyframes
 

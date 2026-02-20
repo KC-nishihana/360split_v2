@@ -508,10 +508,7 @@ class MainWindow(QMainWindow):
         if frame_idx not in self.keyframe_list.keyframe_frames:
             self.keyframe_list.keyframe_frames.append(frame_idx)
             self.keyframe_list.keyframe_scores.append(0.5)
-            if hasattr(self.keyframe_list, "_load_thumbnail_images"):
-                self.keyframe_list._load_thumbnail_images()
-            elif hasattr(self.keyframe_list, "_load_thumbnails"):
-                self.keyframe_list._load_thumbnails()
+            self.keyframe_list._load_thumbnail_images()
             self.keyframe_list._update_display()
             self.timeline.set_keyframes(
                 self.keyframe_list.keyframe_frames,

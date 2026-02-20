@@ -350,7 +350,7 @@ class KeyframeThumbnailWidget(QWidget):
         """
         # 品質スコア情報を取得
         from core.quality_evaluator import QualityEvaluator
-        quality_dict = QualityEvaluator.evaluate(self.frame_image)
+        quality_dict = QualityEvaluator.evaluate_frame(self.frame_image)
 
         dialog = KeyframeDetailDialog(self.frame_image, self.frame_idx, quality_dict, self.parent())
         dialog.exec()  # In PySide6, exec() is used instead of exec_()

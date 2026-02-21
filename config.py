@@ -86,6 +86,10 @@ class Equirect360Config:
     """
     mask_polar_ratio: float = 0.10  # 天頂/天底マスク比率（上下10%をマスク）
     enable_polar_mask: bool = True  # 特徴点抽出時のポーラーマスク有効化
+    enable_fisheye_border_mask: bool = True
+    fisheye_mask_radius_ratio: float = 0.94
+    fisheye_mask_center_offset_x: int = 0
+    fisheye_mask_center_offset_y: int = 0
     enable_dynamic_mask_removal: bool = False
     dynamic_mask_use_yolo_sam: bool = True
     dynamic_mask_use_motion_diff: bool = True
@@ -151,6 +155,10 @@ class KeyframeConfig:
             'MIN_FEATURE_MATCHES': self.gric.min_matches,
             'ENABLE_POLAR_MASK': self.equirect360.enable_polar_mask,
             'MASK_POLAR_RATIO': self.equirect360.mask_polar_ratio,
+            'ENABLE_FISHEYE_BORDER_MASK': self.equirect360.enable_fisheye_border_mask,
+            'FISHEYE_MASK_RADIUS_RATIO': self.equirect360.fisheye_mask_radius_ratio,
+            'FISHEYE_MASK_CENTER_OFFSET_X': self.equirect360.fisheye_mask_center_offset_x,
+            'FISHEYE_MASK_CENTER_OFFSET_Y': self.equirect360.fisheye_mask_center_offset_y,
             'ENABLE_DYNAMIC_MASK_REMOVAL': self.equirect360.enable_dynamic_mask_removal,
             'DYNAMIC_MASK_USE_YOLO_SAM': self.equirect360.dynamic_mask_use_yolo_sam,
             'DYNAMIC_MASK_USE_MOTION_DIFF': self.equirect360.dynamic_mask_use_motion_diff,
@@ -207,6 +215,22 @@ class KeyframeConfig:
         # 360
         config.equirect360.enable_polar_mask = d.get('enable_polar_mask', config.equirect360.enable_polar_mask)
         config.equirect360.mask_polar_ratio = d.get('mask_polar_ratio', config.equirect360.mask_polar_ratio)
+        config.equirect360.enable_fisheye_border_mask = d.get(
+            'enable_fisheye_border_mask',
+            config.equirect360.enable_fisheye_border_mask,
+        )
+        config.equirect360.fisheye_mask_radius_ratio = d.get(
+            'fisheye_mask_radius_ratio',
+            config.equirect360.fisheye_mask_radius_ratio,
+        )
+        config.equirect360.fisheye_mask_center_offset_x = int(d.get(
+            'fisheye_mask_center_offset_x',
+            config.equirect360.fisheye_mask_center_offset_x,
+        ))
+        config.equirect360.fisheye_mask_center_offset_y = int(d.get(
+            'fisheye_mask_center_offset_y',
+            config.equirect360.fisheye_mask_center_offset_y,
+        ))
         config.equirect360.enable_dynamic_mask_removal = d.get(
             'enable_dynamic_mask_removal',
             config.equirect360.enable_dynamic_mask_removal,

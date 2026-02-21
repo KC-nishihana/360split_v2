@@ -605,6 +605,10 @@ class MainWindow(QMainWindow):
             nadir_mask_radius=s["nadir_mask_radius"],
             enable_equipment_detection=s["enable_equipment_detection"],
             mask_dilation_size=s["mask_dilation_size"],
+            enable_fisheye_border_mask=s["enable_fisheye_border_mask"],
+            fisheye_mask_radius_ratio=s["fisheye_mask_radius_ratio"],
+            fisheye_mask_center_offset_x=s["fisheye_mask_center_offset_x"],
+            fisheye_mask_center_offset_y=s["fisheye_mask_center_offset_y"],
             # 対象検出マスク
             enable_target_mask_generation=s["enable_target_mask_generation"],
             target_classes=s["target_classes"],

@@ -18,6 +18,7 @@ from .geometric_evaluator import GeometricEvaluator
 from .adaptive_selector import AdaptiveSelector
 from .accelerator import get_accelerator
 from processing.fisheye_rig import FisheyeRigProcessor
+from processing.mask_processor import MaskProcessor
 from .exceptions import (
     GeometricDegeneracyError,
     EstimationFailureError,
@@ -126,6 +127,10 @@ class KeyframeSelector:
             'EQUIRECT_HEIGHT': 2048,
             'RIG_FEATURE_METHOD': 'orb',
             'ENABLE_DYNAMIC_MASK_REMOVAL': False,
+            'ENABLE_FISHEYE_BORDER_MASK': True,
+            'FISHEYE_MASK_RADIUS_RATIO': 0.94,
+            'FISHEYE_MASK_CENTER_OFFSET_X': 0,
+            'FISHEYE_MASK_CENTER_OFFSET_Y': 0,
             'DYNAMIC_MASK_USE_YOLO_SAM': True,
             'DYNAMIC_MASK_USE_MOTION_DIFF': True,
             'DYNAMIC_MASK_MOTION_FRAMES': 3,
@@ -175,6 +180,10 @@ class KeyframeSelector:
                 'gric_degeneracy_threshold': 'GRIC_DEGENERACY_THRESHOLD',
                 'min_feature_matches': 'MIN_FEATURE_MATCHES',
                 'enable_dynamic_mask_removal': 'ENABLE_DYNAMIC_MASK_REMOVAL',
+                'enable_fisheye_border_mask': 'ENABLE_FISHEYE_BORDER_MASK',
+                'fisheye_mask_radius_ratio': 'FISHEYE_MASK_RADIUS_RATIO',
+                'fisheye_mask_center_offset_x': 'FISHEYE_MASK_CENTER_OFFSET_X',
+                'fisheye_mask_center_offset_y': 'FISHEYE_MASK_CENTER_OFFSET_Y',
                 'dynamic_mask_use_yolo_sam': 'DYNAMIC_MASK_USE_YOLO_SAM',
                 'dynamic_mask_use_motion_diff': 'DYNAMIC_MASK_USE_MOTION_DIFF',
                 'dynamic_mask_motion_frames': 'DYNAMIC_MASK_MOTION_FRAMES',
@@ -247,6 +256,7 @@ class KeyframeSelector:
         self.previous_brightness = None
         self.rescue_mode_keyframes = []  # レスキューモードで選択されたキーフレーム
         self.target_mask_generator = self._build_target_mask_generator()
+        self.mask_processor = MaskProcessor()
 
     def _load_inpaint_hook(self):
         module_name = str(self.config.get('DYNAMIC_MASK_INPAINT_MODULE', '') or '').strip()
@@ -349,6 +359,30 @@ class KeyframeSelector:
             )
         except Exception:
             return None
+
+    def _is_fisheye_border_mask_enabled(self, is_paired: bool) -> bool:
+        return bool(is_paired and self.config.get('ENABLE_FISHEYE_BORDER_MASK', True))
+
+    def _create_fisheye_valid_mask(self, frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        return self.mask_processor.create_fisheye_valid_mask(
+            width=w,
+            height=h,
+            radius_ratio=float(self.config.get('FISHEYE_MASK_RADIUS_RATIO', 0.94)),
+            offset_x=int(self.config.get('FISHEYE_MASK_CENTER_OFFSET_X', 0)),
+            offset_y=int(self.config.get('FISHEYE_MASK_CENTER_OFFSET_Y', 0)),
+        )
+
+    @staticmethod
+    def _combine_feature_masks(
+        dynamic_mask: Optional[np.ndarray],
+        fisheye_valid_mask: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        if dynamic_mask is None:
+            return fisheye_valid_mask
+        if fisheye_valid_mask is None:
+            return dynamic_mask
+        return cv2.bitwise_and(dynamic_mask.astype(np.uint8), fisheye_valid_mask.astype(np.uint8))
 
     def _open_independent_capture(self, video_path) -> cv2.VideoCapture:
         """
@@ -627,6 +661,7 @@ class KeyframeSelector:
         candidates = []
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
+        use_fisheye_border_mask = self._is_fisheye_border_mask_enabled(is_paired)
 
         # ペアレンズ: レンズ毎品質評価 + AND条件
         if is_paired:
@@ -645,6 +680,12 @@ class KeyframeSelector:
                         frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
                         if frame_a is None or frame_b is None:
                             continue
+
+                    if use_fisheye_border_mask:
+                        valid_mask_a = self._create_fisheye_valid_mask(frame_a)
+                        valid_mask_b = self._create_fisheye_valid_mask(frame_b)
+                        frame_a = self.mask_processor.apply_valid_region_mask(frame_a, valid_mask_a, fill_value=0)
+                        frame_b = self.mask_processor.apply_valid_region_mask(frame_b, valid_mask_b, fill_value=0)
 
                     quality_scores = self._compute_quality_score_pair(frame_a, frame_b)
 
@@ -752,6 +793,7 @@ class KeyframeSelector:
         geom_frame_window = deque(maxlen=max(2, int(self.config.get('DYNAMIC_MASK_MOTION_FRAMES', 3))))
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
+        use_fisheye_border_mask = self._is_fisheye_border_mask_enabled(is_paired)
         cap = None
         cap_a = None
         cap_b = None
@@ -766,6 +808,7 @@ class KeyframeSelector:
         try:
             last_read_idx = -1
             last_read_idx_pair = -1
+            last_pair_feature_mask = None
             for idx, candidate_info in enumerate(stage1_candidates):
                 frame_idx = candidate_info['frame_idx']
                 quality_scores = candidate_info['quality_scores']
@@ -775,6 +818,7 @@ class KeyframeSelector:
 
                 current_frame = None
                 current_pair = None
+                current_pair_feature_mask = None
                 if is_paired:
                     if cap_a is not None and cap_b is not None:
                         if frame_idx != last_read_idx_pair + 1:
@@ -790,6 +834,12 @@ class KeyframeSelector:
                         frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
                         if frame_a is None or frame_b is None:
                             continue
+                    if use_fisheye_border_mask:
+                        valid_mask_a = self._create_fisheye_valid_mask(frame_a)
+                        valid_mask_b = self._create_fisheye_valid_mask(frame_b)
+                        frame_a = self.mask_processor.apply_valid_region_mask(frame_a, valid_mask_a, fill_value=0)
+                        frame_b = self.mask_processor.apply_valid_region_mask(frame_b, valid_mask_b, fill_value=0)
+                        current_pair_feature_mask = valid_mask_a
                     current_pair = (frame_a, frame_b)
                     current_frame = frame_a
                 else:
@@ -864,6 +914,9 @@ class KeyframeSelector:
                         dynamic_mask_ref, dynamic_mask_cur = self._build_dynamic_masks(
                             geom_ref, geom_cur, list(geom_frame_window)
                         )
+                    if is_paired and use_fisheye_border_mask and not self.config.get('ENABLE_RIG_STITCHING', True):
+                        dynamic_mask_ref = self._combine_feature_masks(dynamic_mask_ref, last_pair_feature_mask)
+                        dynamic_mask_cur = self._combine_feature_masks(dynamic_mask_cur, current_pair_feature_mask)
 
                     try:
                         geometric_scores = self.geometric_evaluator.evaluate(
@@ -1000,6 +1053,7 @@ class KeyframeSelector:
                 last_keyframe_idx = frame_idx
                 last_keyframe = current_frame
                 last_pair = current_pair
+                last_pair_feature_mask = current_pair_feature_mask
 
                 if frame_log_callback:
                     ssim = adaptive_scores.get("ssim", 1.0)

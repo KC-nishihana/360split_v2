@@ -181,6 +181,30 @@ def parse_arguments():
         default=None,
         help="インペイントフックモジュール（inpaint_frame(frame, mask) を実装）"
     )
+    parser.add_argument(
+        "--disable-fisheye-border-mask",
+        action="store_true",
+        default=False,
+        help="魚眼外周マスクを無効化（OSV/前後魚眼時の既定ONを上書き）"
+    )
+    parser.add_argument(
+        "--fisheye-mask-radius-ratio",
+        type=float,
+        default=None,
+        help="魚眼有効領域半径比（0.0-1.0, default=0.94）"
+    )
+    parser.add_argument(
+        "--fisheye-mask-center-offset-x",
+        type=int,
+        default=None,
+        help="魚眼有効領域中心Xオフセット（px）"
+    )
+    parser.add_argument(
+        "--fisheye-mask-center-offset-y",
+        type=int,
+        default=None,
+        help="魚眼有効領域中心Yオフセット（px）"
+    )
 
     parser.add_argument(
         "--verbose", "-v",
@@ -298,6 +322,14 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["dynamic_mask_inpaint_enabled"] = True
     if args.dynamic_mask_inpaint_module:
         config["dynamic_mask_inpaint_module"] = args.dynamic_mask_inpaint_module.strip()
+    if args.disable_fisheye_border_mask:
+        config["enable_fisheye_border_mask"] = False
+    if args.fisheye_mask_radius_ratio is not None:
+        config["fisheye_mask_radius_ratio"] = float(max(0.0, min(1.0, args.fisheye_mask_radius_ratio)))
+    if args.fisheye_mask_center_offset_x is not None:
+        config["fisheye_mask_center_offset_x"] = int(args.fisheye_mask_center_offset_x)
+    if args.fisheye_mask_center_offset_y is not None:
+        config["fisheye_mask_center_offset_y"] = int(args.fisheye_mask_center_offset_y)
 
 
 def resolve_output_dir(video_path: str, output_arg: str = None) -> Path:
@@ -436,6 +468,14 @@ def run_cli(args):
         logger.info("360度 Equirectangular モード: 有効")
     if args.apply_mask:
         logger.info("マスク処理: 有効")
+    fisheye_border_mask_enabled = bool(config.get("enable_fisheye_border_mask", True)) and is_stereo_mode
+    if fisheye_border_mask_enabled:
+        logger.info(
+            "魚眼外周マスク: 有効 "
+            f"(ratio={config.get('fisheye_mask_radius_ratio', 0.94):.2f}, "
+            f"dx={int(config.get('fisheye_mask_center_offset_x', 0))}, "
+            f"dy={int(config.get('fisheye_mask_center_offset_y', 0))})"
+        )
     if config.get("enable_dynamic_mask_removal", False):
         logger.info(
             "Stage2動体除去: 有効 "

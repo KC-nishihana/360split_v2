@@ -258,6 +258,10 @@ class ExportDialog(QDialog):
             "nadir_mask_radius": int(g.get("nadir_mask_radius", 100)),
             "enable_equipment_detection": bool(g.get("enable_equipment_detection", False)),
             "mask_dilation_size": int(g.get("mask_dilation_size", 15)),
+            "enable_fisheye_border_mask": bool(g.get("enable_fisheye_border_mask", True)),
+            "fisheye_mask_radius_ratio": float(g.get("fisheye_mask_radius_ratio", 0.94)),
+            "fisheye_mask_center_offset_x": int(g.get("fisheye_mask_center_offset_x", 0)),
+            "fisheye_mask_center_offset_y": int(g.get("fisheye_mask_center_offset_y", 0)),
             "enable_target_mask_generation": bool(g.get("enable_target_mask_generation", False)),
             "target_classes": list(g.get("target_classes", ["人物", "人", "自転車", "バイク", "車両", "動物"])),
             "enable_dynamic_mask_removal": bool(g.get("enable_dynamic_mask_removal", False)),
@@ -373,6 +377,7 @@ class ExportDialog(QDialog):
         prefix = str(g.get("naming_prefix", "keyframe"))
 
         polar = "ON" if g.get("enable_polar_mask", False) else "OFF"
+        fisheye = "ON" if g.get("enable_fisheye_border_mask", True) else "OFF"
         nadir = "ON" if g.get("enable_nadir_mask", False) else "OFF"
         equip = "ON" if g.get("enable_equipment_detection", False) else "OFF"
         target = "ON" if g.get("enable_target_mask_generation", False) else "OFF"
@@ -384,7 +389,7 @@ class ExportDialog(QDialog):
         self.global_summary_label.setText(
             f"形式: {fmt} / JPEG品質: {jpg} / 接頭辞: {prefix}\n"
             f"ステッチモード(共通): {stitch_mode}\n"
-            f"ポーラーマスク: {polar}, ナディア: {nadir}, 装備検出: {equip}\n"
+            f"ポーラーマスク: {polar}, 魚眼外周: {fisheye}, ナディア: {nadir}, 装備検出: {equip}\n"
             f"対象マスク生成: {target} (保存先: {mask_dir}, 形式: {mask_fmt}, MotionDiff: {motion})"
         )
 

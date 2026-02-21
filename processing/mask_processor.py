@@ -73,6 +73,34 @@ class MaskProcessor:
 
         return mask
 
+    def create_fisheye_valid_mask(
+        self,
+        width: int,
+        height: int,
+        radius_ratio: float = 0.94,
+        offset_x: int = 0,
+        offset_y: int = 0,
+    ) -> np.ndarray:
+        """
+        魚眼画像の有効領域（レンズ内）マスクを生成する。
+
+        Returns:
+            uint8 マスク (H x W), 255=有効領域, 0=無効領域
+        """
+        if width <= 0 or height <= 0:
+            return np.zeros((max(height, 0), max(width, 0)), dtype=np.uint8)
+
+        ratio = float(np.clip(radius_ratio, 0.0, 1.0))
+        radius = int(min(width, height) * 0.5 * ratio)
+
+        cx = int(np.clip((width // 2) + int(offset_x), 0, max(width - 1, 0)))
+        cy = int(np.clip((height // 2) + int(offset_y), 0, max(height - 1, 0)))
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+        if radius > 0:
+            cv2.circle(mask, (cx, cy), radius, 255, -1)
+        return mask
+
     def create_equipment_mask(self, frame: np.ndarray, method: str = 'threshold') -> np.ndarray:
         """
         フレーム内の機材を自動検出してマスクを生成
@@ -154,6 +182,35 @@ class MaskProcessor:
             # グレースケール値を指定
             result[mask == 1] = value
 
+        return result
+
+    def apply_valid_region_mask(
+        self,
+        frame: np.ndarray,
+        valid_mask: np.ndarray,
+        fill_value: Union[int, Tuple[int, int, int]] = 0,
+    ) -> np.ndarray:
+        """
+        有効領域マスク(255=有効, 0=無効)を使って無効領域を塗りつぶす。
+        """
+        if frame is None:
+            return frame
+        if valid_mask is None:
+            return frame.copy()
+
+        mask = valid_mask
+        if mask.ndim == 3:
+            mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        if mask.shape[:2] != frame.shape[:2]:
+            mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask = (mask > 0).astype(np.uint8)
+
+        result = frame.copy()
+        invalid = mask == 0
+        if isinstance(fill_value, (tuple, list)):
+            result[invalid] = tuple(fill_value)
+        else:
+            result[invalid] = fill_value
         return result
 
     def dilate_mask(self, mask: np.ndarray, kernel_size: int = 15) -> np.ndarray:

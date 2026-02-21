@@ -420,6 +420,48 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
 
+        # === 魚眼外周マスク ===
+        fisheye_group = QGroupBox("魚眼外周マスク（OSV/前後魚眼）")
+        fisheye_layout = QGridLayout()
+
+        self.enable_fisheye_border_mask = QCheckBox("魚眼外周マスクを有効化")
+        self.enable_fisheye_border_mask.setChecked(
+            bool(self.settings.get('enable_fisheye_border_mask', True))
+        )
+        fisheye_layout.addWidget(self.enable_fisheye_border_mask, 0, 0, 1, 2)
+
+        fisheye_layout.addWidget(QLabel("有効領域半径比 (0-1):"), 1, 0)
+        self.fisheye_mask_radius_ratio = QDoubleSpinBox()
+        self.fisheye_mask_radius_ratio.setMinimum(0.0)
+        self.fisheye_mask_radius_ratio.setMaximum(1.0)
+        self.fisheye_mask_radius_ratio.setSingleStep(0.01)
+        self.fisheye_mask_radius_ratio.setDecimals(2)
+        self.fisheye_mask_radius_ratio.setValue(
+            float(self.settings.get('fisheye_mask_radius_ratio', 0.94))
+        )
+        fisheye_layout.addWidget(self.fisheye_mask_radius_ratio, 1, 1)
+
+        fisheye_layout.addWidget(QLabel("中心オフセットX (px):"), 2, 0)
+        self.fisheye_mask_center_offset_x = QSpinBox()
+        self.fisheye_mask_center_offset_x.setMinimum(-2000)
+        self.fisheye_mask_center_offset_x.setMaximum(2000)
+        self.fisheye_mask_center_offset_x.setValue(
+            int(self.settings.get('fisheye_mask_center_offset_x', 0))
+        )
+        fisheye_layout.addWidget(self.fisheye_mask_center_offset_x, 2, 1)
+
+        fisheye_layout.addWidget(QLabel("中心オフセットY (px):"), 3, 0)
+        self.fisheye_mask_center_offset_y = QSpinBox()
+        self.fisheye_mask_center_offset_y.setMinimum(-2000)
+        self.fisheye_mask_center_offset_y.setMaximum(2000)
+        self.fisheye_mask_center_offset_y.setValue(
+            int(self.settings.get('fisheye_mask_center_offset_y', 0))
+        )
+        fisheye_layout.addWidget(self.fisheye_mask_center_offset_y, 3, 1)
+
+        fisheye_group.setLayout(fisheye_layout)
+        layout.addWidget(fisheye_group)
+
         # === ナディアマスク ===
         nadir_group = QGroupBox("ナディアマスク処理")
         nadir_layout = QGridLayout()
@@ -735,6 +777,10 @@ class SettingsDialog(QDialog):
         default_settings = ConfigManager.default_config()
         default_settings.update({
             'projection_mode': 'Equirectangular',
+            'enable_fisheye_border_mask': True,
+            'fisheye_mask_radius_ratio': 0.94,
+            'fisheye_mask_center_offset_x': 0,
+            'fisheye_mask_center_offset_y': 0,
             'enable_nadir_mask': False,
             'nadir_mask_radius': 100,
             'enable_equipment_detection': False,
@@ -802,6 +848,10 @@ class SettingsDialog(QDialog):
             'enable_polar_mask': self.enable_polar_mask.isChecked(),
             'mask_polar_ratio': self.mask_polar_ratio.value(),
             'stitching_mode': self.stitching_mode.currentText(),
+            'enable_fisheye_border_mask': self.enable_fisheye_border_mask.isChecked(),
+            'fisheye_mask_radius_ratio': self.fisheye_mask_radius_ratio.value(),
+            'fisheye_mask_center_offset_x': self.fisheye_mask_center_offset_x.value(),
+            'fisheye_mask_center_offset_y': self.fisheye_mask_center_offset_y.value(),
             'enable_nadir_mask': self.enable_nadir_mask.isChecked(),
             'nadir_mask_radius': self.nadir_mask_radius.value(),
             'enable_equipment_detection': self.enable_equipment_detection.isChecked(),
@@ -951,6 +1001,18 @@ class SettingsDialog(QDialog):
             self.mask_polar_ratio.setValue(
                 params.get('mask_polar_ratio', 0.10)
             )
+            self.enable_fisheye_border_mask.setChecked(
+                params.get('enable_fisheye_border_mask', True)
+            )
+            self.fisheye_mask_radius_ratio.setValue(
+                params.get('fisheye_mask_radius_ratio', 0.94)
+            )
+            self.fisheye_mask_center_offset_x.setValue(
+                int(params.get('fisheye_mask_center_offset_x', 0))
+            )
+            self.fisheye_mask_center_offset_y.setValue(
+                int(params.get('fisheye_mask_center_offset_y', 0))
+            )
 
             logger.info(f"プリセット '{preset_id}' ({preset_info.name}) を適用しました")
 
@@ -1002,6 +1064,10 @@ class SettingsDialog(QDialog):
             self.enable_polar_mask.setChecked(True)
             self.mask_polar_ratio.setValue(0.10)
             self.stitching_mode.setCurrentText('Fast')
+            self.enable_fisheye_border_mask.setChecked(True)
+            self.fisheye_mask_radius_ratio.setValue(0.94)
+            self.fisheye_mask_center_offset_x.setValue(0)
+            self.fisheye_mask_center_offset_y.setValue(0)
             self.enable_nadir_mask.setChecked(False)
             self.nadir_mask_radius.setValue(100)
             self.enable_equipment_detection.setChecked(False)

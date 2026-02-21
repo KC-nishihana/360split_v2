@@ -482,6 +482,10 @@ class ExportWorker(QThread):
                  nadir_mask_radius: int = 100,
                  enable_equipment_detection: bool = False,
                  mask_dilation_size: int = 15,
+                 enable_fisheye_border_mask: bool = True,
+                 fisheye_mask_radius_ratio: float = 0.94,
+                 fisheye_mask_center_offset_x: int = 0,
+                 fisheye_mask_center_offset_y: int = 0,
                  # 対象検出マスク設定
                  enable_target_mask_generation: bool = False,
                  target_classes: Optional[List[str]] = None,
@@ -537,6 +541,10 @@ class ExportWorker(QThread):
         self.nadir_mask_radius = nadir_mask_radius
         self.enable_equipment_detection = enable_equipment_detection
         self.mask_dilation_size = mask_dilation_size
+        self.enable_fisheye_border_mask = bool(enable_fisheye_border_mask)
+        self.fisheye_mask_radius_ratio = float(fisheye_mask_radius_ratio)
+        self.fisheye_mask_center_offset_x = int(fisheye_mask_center_offset_x)
+        self.fisheye_mask_center_offset_y = int(fisheye_mask_center_offset_y)
         self.enable_target_mask_generation = enable_target_mask_generation
         self.target_classes = target_classes or []
         self.yolo_model_path = yolo_model_path
@@ -630,6 +638,15 @@ class ExportWorker(QThread):
                 classes_for_detection,
                 motion_frames=safe_motion_frames,
             )
+        if self.is_stereo and self.enable_fisheye_border_mask:
+            h, w = frame.shape[:2]
+            valid_mask = np.zeros((h, w), dtype=np.uint8)
+            radius = int(min(w, h) * 0.5 * float(np.clip(self.fisheye_mask_radius_ratio, 0.0, 1.0)))
+            cx = int(np.clip((w // 2) + self.fisheye_mask_center_offset_x, 0, max(w - 1, 0)))
+            cy = int(np.clip((h // 2) + self.fisheye_mask_center_offset_y, 0, max(h - 1, 0)))
+            if radius > 0:
+                cv2.circle(valid_mask, (cx, cy), radius, 255, -1)
+            binary_mask = cv2.bitwise_and(binary_mask.astype(np.uint8), valid_mask)
         if self.dynamic_mask_inpaint_enabled:
             if mask_generator is not None:
                 _ = mask_generator.run_inpaint_hook(frame, binary_mask)
@@ -812,7 +829,7 @@ class ExportWorker(QThread):
 
                     frames_to_process = [(frame, '')]
 
-                # 各フレーム（L/R または単眼）を処理
+                    # 各フレーム（L/R または単眼）を処理
                 for frame, suffix in frames_to_process:
                     processed_frame = frame
                     force_mask_reanalysis = bool(

@@ -187,6 +187,12 @@ class KeyframeSelector:
                 'sam_model_path': 'SAM_MODEL_PATH',
                 'confidence_threshold': 'CONFIDENCE_THRESHOLD',
                 'detection_device': 'DETECTION_DEVICE',
+                'enable_rescue_mode': 'ENABLE_RESCUE_MODE',
+                'rescue_feature_threshold': 'RESCUE_FEATURE_THRESHOLD',
+                'rescue_laplacian_factor': 'RESCUE_LAPLACIAN_FACTOR',
+                'force_keyframe_on_exposure_change': 'FORCE_KEYFRAME_ON_EXPOSURE_CHANGE',
+                'exposure_change_threshold': 'EXPOSURE_CHANGE_THRESHOLD',
+                'adaptive_thresholding': 'ADAPTIVE_THRESHOLDING',
             }
             for src, dst in alias_map.items():
                 if src in config:

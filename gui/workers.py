@@ -612,6 +612,10 @@ class ExportWorker(QThread):
         if binary_mask is None:
             if mask_generator is None:
                 return False
+            safe_motion_frames = motion_frames
+            if self.use_precomputed_analysis_masks and not force_mask_reanalysis:
+                # 解析済みマスク再利用が欠損したフレームは履歴を使わず単フレームでフォールバック。
+                safe_motion_frames = [frame]
             classes_for_detection = (
                 self.dynamic_mask_target_classes or self.target_classes
                 if self.dynamic_mask_use_yolo_sam
@@ -620,7 +624,7 @@ class ExportWorker(QThread):
             binary_mask = mask_generator.generate_mask(
                 frame,
                 classes_for_detection,
-                motion_frames=motion_frames,
+                motion_frames=safe_motion_frames,
             )
         if self.dynamic_mask_inpaint_enabled:
             if mask_generator is not None:
@@ -705,6 +709,16 @@ class ExportWorker(QThread):
                     if can_reuse_only:
                         logger.info("対象マスク出力は解析時マスクを再利用（再解析なし）")
                     else:
+                        if self.use_precomputed_analysis_masks and not needs_reanalysis:
+                            missing = [
+                                int(idx) for idx in self.frame_indices
+                                if int(idx) not in self.precomputed_analysis_masks
+                            ]
+                            if missing:
+                                logger.warning(
+                                    "解析時マスクが不足しているため一部フレームは再解析します: "
+                                    f"missing={len(missing)}"
+                                )
                         from processing.target_mask_generator import TargetMaskGenerator
                         inpaint_hook = None
                         if self.dynamic_mask_inpaint_enabled and self.dynamic_mask_inpaint_module:
@@ -739,6 +753,7 @@ class ExportWorker(QThread):
             total = len(self.frame_indices)
             exported = 0
             stream_histories = {}
+            stream_last_indices = {}
 
             for i, frame_idx in enumerate(self.frame_indices):
                 if not self._is_running:
@@ -822,7 +837,11 @@ class ExportWorker(QThread):
                                 if motion_history is None:
                                     motion_history = deque(maxlen=max(2, self.dynamic_mask_motion_frames))
                                     stream_histories[history_key] = motion_history
+                                prev_idx = stream_last_indices.get(history_key)
+                                if prev_idx is not None and abs(int(frame_idx) - int(prev_idx)) > 1:
+                                    motion_history.clear()
                                 motion_history.append(processed_frame.copy())
+                                stream_last_indices[history_key] = int(frame_idx)
                                 motion_frames = list(motion_history)
                                 if not self._save_target_mask(
                                     output_path,
@@ -924,7 +943,11 @@ class ExportWorker(QThread):
                             if motion_history is None:
                                 motion_history = deque(maxlen=max(2, self.dynamic_mask_motion_frames))
                                 stream_histories[history_key] = motion_history
+                            prev_idx = stream_last_indices.get(history_key)
+                            if prev_idx is not None and abs(int(frame_idx) - int(prev_idx)) > 1:
+                                motion_history.clear()
                             motion_history.append(processed_frame.copy())
+                            stream_last_indices[history_key] = int(frame_idx)
                             motion_frames = list(motion_history)
                             if not self._save_target_mask(
                                 output_path,
@@ -1085,6 +1108,16 @@ class GenerateMasksWorker(QThread):
         try:
             from processing.target_mask_generator import TargetMaskGenerator
 
+            inpaint_hook = None
+            if self.dynamic_mask_inpaint_enabled and self.dynamic_mask_inpaint_module:
+                try:
+                    mod = __import__(self.dynamic_mask_inpaint_module, fromlist=['inpaint_frame'])
+                    hook = getattr(mod, 'inpaint_frame', None)
+                    if callable(hook):
+                        inpaint_hook = hook
+                except Exception as e:
+                    logger.warning(f"インペイントモジュール読み込み失敗: {e}")
+
             generator = TargetMaskGenerator(
                 yolo_model_path=self.yolo_model_path,
                 sam_model_path=self.sam_model_path,
@@ -1095,7 +1128,7 @@ class GenerateMasksWorker(QThread):
                 motion_threshold=self.dynamic_mask_motion_threshold,
                 motion_mask_dilation_size=self.dynamic_mask_dilation_size,
                 enable_mask_inpaint=self.dynamic_mask_inpaint_enabled,
-                inpaint_hook=None,
+                inpaint_hook=inpaint_hook,
             )
             masks_root = self.images_root / self.mask_output_dirname
             total = len(self.image_paths)

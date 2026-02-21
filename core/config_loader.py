@@ -150,6 +150,8 @@ class ConfigManager:
             "dynamic_mask_motion_frames": 3,
             "dynamic_mask_motion_threshold": 30,
             "dynamic_mask_dilation_size": 5,
+            "stage2_perf_profile": True,
+            "stage2_mask_cache_ttl_frames": 0,
             "dynamic_mask_target_classes": ["人物", "人", "自転車", "バイク", "車両", "動物"],
             "dynamic_mask_inpaint_enabled": False,
             "dynamic_mask_inpaint_module": "",

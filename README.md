@@ -12,6 +12,8 @@
 > - ステレオエクスポート時のステッチングモード（Fast/HQ/Depth-aware）を実装
 > - 評価済みキーフレーム向けの対象マスク生成（YOLO + SAM）を追加
 > - 設定ダイアログに「対象マスク」タブを追加（キーフレーム設定から分離）
+> - Stage 2の動体除去（YOLO/SAM + モーション差分）をCLI/GUIから設定可能に
+> - 前後魚眼2動画入力（`--front-video`/`--rear-video`）と魚眼外周マスク調整を追加
 
 
 ## 主な特徴
@@ -114,8 +116,17 @@ python main.py --cli input.mp4 -o ./output --format png
 # 360度動画としてCubemapも出力
 python main.py --cli input.mp4 --equirectangular --cubemap
 
+# 前後魚眼2動画をペアで処理（ステレオ）
+python main.py --front-video front.mp4 --rear-video rear.mp4 -o ./output
+
 # 天底マスク処理を有効化（三脚・撮影者除去）
 python main.py --cli input.mp4 --apply-mask
+
+# Stage 2で動体除去を有効化
+python main.py --cli input.mp4 --remove-dynamic-objects
+
+# 魚眼外周マスクを調整（ステレオ入力時）
+python main.py --cli input.osv --fisheye-mask-radius-ratio 0.92 --fisheye-mask-center-offset-x 12
 
 # 設定ファイルを指定
 python main.py --cli input.mp4 --config settings.json
@@ -134,7 +145,9 @@ python main.py --cli input.mp4 -v
 | オプション | 説明 | デフォルト |
 |---|---|---|
 | `--cli VIDEO` | CLIモードで動画を解析 | — |
-| `-o, --output DIR` | 出力ディレクトリ | `./keyframes` |
+| `--front-video PATH` | 前後魚眼モード: 前方レンズ動画 | — |
+| `--rear-video PATH` | 前後魚眼モード: 後方レンズ動画 | — |
+| `-o, --output DIR` | 出力ディレクトリ | `入力動画と同じディレクトリ/keyframes` |
 | `--format {png,jpg,tiff}` | 出力画像フォーマット | `png` |
 | `--preset {outdoor,indoor,mixed}` | 環境プリセット（下記参照） | — |
 | `--max-keyframes N` | 最大キーフレーム数 | 自動決定 |
@@ -143,11 +156,25 @@ python main.py --cli input.mp4 -v
 | `--equirectangular` | 360度Equirectangular動画として処理 | `false` |
 | `--apply-mask` | 天底マスク処理を適用 | `false` |
 | `--cubemap` | Cubemap形式でも出力 | `false` |
+| `--remove-dynamic-objects` | Stage2動体除去を有効化 | `false` |
+| `--dynamic-mask-frames N` | モーション差分に使うフレーム数（2以上） | `3` |
+| `--dynamic-mask-threshold N` | モーション差分しきい値（1-255） | `30` |
+| `--dynamic-mask-dilation N` | 動体マスク膨張サイズ（0で無効） | `5` |
+| `--dynamic-mask-inpaint` | 動体マスクのインペイントフックを有効化 | `false` |
+| `--dynamic-mask-inpaint-module MOD` | インペイント処理モジュール名 | `""` |
+| `--disable-fisheye-border-mask` | 魚眼外周マスクを無効化（ステレオ時の既定ONを上書き） | `false` |
+| `--fisheye-mask-radius-ratio F` | 魚眼有効領域の半径比（0.0-1.0） | `0.94` |
+| `--fisheye-mask-center-offset-x N` | 魚眼有効領域中心Xオフセット（px） | `0` |
+| `--fisheye-mask-center-offset-y N` | 魚眼有効領域中心Yオフセット（px） | `0` |
 | `--config FILE` | 設定ファイル（JSON） | — |
 | `-v, --verbose` | 詳細ログ出力 | `false` |
 | `--rerun-stream` | 抽出中にRerunへストリーミング | `false` |
 | `--rerun-spawn` | Rerun Viewerを自動起動（`--rerun-stream`時） | `false` |
 | `--rerun-save PATH` | Rerunログを`.rrd`で保存 | — |
+
+入力モード:
+- `--cli` を指定すると単眼または `.osv`（ステレオ）を処理
+- `--front-video` と `--rear-video` を両方指定すると、前後魚眼2動画をステレオペアとして処理
 
 ### Rerunログ（キーフレーム検証）
 
@@ -384,7 +411,20 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
   "mask_output_dirname": "masks",
   "mask_add_suffix": true,
   "mask_suffix": "_mask",
-  "mask_output_format": "same"
+  "mask_output_format": "same",
+  "enable_fisheye_border_mask": true,
+  "fisheye_mask_radius_ratio": 0.94,
+  "fisheye_mask_center_offset_x": 0,
+  "fisheye_mask_center_offset_y": 0,
+  "enable_dynamic_mask_removal": false,
+  "dynamic_mask_use_yolo_sam": true,
+  "dynamic_mask_use_motion_diff": true,
+  "dynamic_mask_motion_frames": 3,
+  "dynamic_mask_motion_threshold": 30,
+  "dynamic_mask_dilation_size": 5,
+  "dynamic_mask_target_classes": ["人物", "人", "自転車", "バイク", "車両", "動物"],
+  "dynamic_mask_inpaint_enabled": false,
+  "dynamic_mask_inpaint_module": ""
 }
 ```
 
@@ -414,6 +454,12 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
 | `mask_add_suffix` | マスクファイル名に接尾辞を付与 | true |
 | `mask_suffix` | マスクファイル接尾辞 | `_mask` |
 | `mask_output_format` | マスク拡張子（`same/png/jpg/tiff`） | `same` |
+| `enable_fisheye_border_mask` | ステレオ入力時の魚眼外周マスク | true |
+| `fisheye_mask_radius_ratio` | 魚眼有効領域の半径比（0.0-1.0） | 0.94 |
+| `enable_dynamic_mask_removal` | Stage2で動体領域を除外 | false |
+| `dynamic_mask_use_yolo_sam` | YOLO/SAMベース動体検出を併用 | true |
+| `dynamic_mask_use_motion_diff` | モーション差分動体検出を併用 | true |
+| `dynamic_mask_motion_threshold` | モーション差分しきい値 | 30 |
 
 
 ## 出力
@@ -430,13 +476,14 @@ output/
 ├── ...
 ├── keyframe_metadata.json
 └── cubemap/                    # --cubemap指定時
-    ├── frame_000000/
-    │   ├── front.png
-    │   ├── back.png
-    │   ├── left.png
-    │   ├── right.png
-    │   ├── top.png
-    │   └── bottom.png
+    ├── front/
+    │   ├── keyframe_000000_front.png
+    │   └── ...
+    ├── back/
+    ├── left/
+    ├── right/
+    ├── top/
+    └── bottom/
     └── ...
 ```
 

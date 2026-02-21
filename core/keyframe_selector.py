@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+from time import perf_counter
 
 from .video_loader import VideoLoader, VideoMetadata
 from .quality_evaluator import QualityEvaluator
@@ -69,6 +70,24 @@ class KeyframeInfo:
     is_rescue_mode: bool = False
     is_force_inserted: bool = False
     dynamic_mask: Optional[np.ndarray] = None
+
+
+@dataclass
+class Stage2PerfStats:
+    enabled: bool = True
+    total_candidates: int = 0
+    processed_candidates: int = 0
+    selected_candidates: int = 0
+    frame_read_s: float = 0.0
+    dynamic_mask_s: float = 0.0
+    geometric_eval_s: float = 0.0
+    adaptive_eval_s: float = 0.0
+    rerun_log_s: float = 0.0
+    dynamic_mask_calls: int = 0
+    dynamic_mask_mode_both_calls: int = 0
+    dynamic_mask_mode_yolo_only_calls: int = 0
+    dynamic_mask_mode_motion_only_calls: int = 0
+    total_s: float = 0.0
 
 
 class KeyframeSelector:
@@ -143,6 +162,8 @@ class KeyframeSelector:
             'SAM_MODEL_PATH': 'sam3_t.pt',
             'CONFIDENCE_THRESHOLD': 0.25,
             'DETECTION_DEVICE': 'auto',
+            'STAGE2_PERF_PROFILE': True,
+            'STAGE2_MASK_CACHE_TTL_FRAMES': 0,
             # レスキューモード設定
             'ENABLE_RESCUE_MODE': False,
             'RESCUE_FEATURE_THRESHOLD': 15,  # この値以下で特徴点不足と判定
@@ -196,6 +217,8 @@ class KeyframeSelector:
                 'sam_model_path': 'SAM_MODEL_PATH',
                 'confidence_threshold': 'CONFIDENCE_THRESHOLD',
                 'detection_device': 'DETECTION_DEVICE',
+                'stage2_perf_profile': 'STAGE2_PERF_PROFILE',
+                'stage2_mask_cache_ttl_frames': 'STAGE2_MASK_CACHE_TTL_FRAMES',
                 'enable_rescue_mode': 'ENABLE_RESCUE_MODE',
                 'rescue_feature_threshold': 'RESCUE_FEATURE_THRESHOLD',
                 'rescue_laplacian_factor': 'RESCUE_LAPLACIAN_FACTOR',
@@ -307,6 +330,9 @@ class KeyframeSelector:
         frame_prev: np.ndarray,
         frame_cur: np.ndarray,
         context_frames: List[np.ndarray],
+        frame_prev_idx: Optional[int] = None,
+        frame_cur_idx: Optional[int] = None,
+        mask_cache: Optional[Dict[int, np.ndarray]] = None,
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         if self.target_mask_generator is None:
             return None, None
@@ -325,17 +351,38 @@ class KeyframeSelector:
         if len(ctx) > motion_window:
             ctx = ctx[-motion_window:]
 
+        ttl = max(0, int(self.config.get('STAGE2_MASK_CACHE_TTL_FRAMES', 0)))
+
+        def _select_cached_mask(frame_idx: Optional[int]) -> Optional[np.ndarray]:
+            if mask_cache is None or frame_idx is None or ttl <= 0:
+                return None
+            if frame_idx in mask_cache:
+                return mask_cache[frame_idx]
+            nearest_idx = None
+            nearest_gap = ttl + 1
+            for cached_idx in mask_cache.keys():
+                gap = abs(cached_idx - frame_idx)
+                if gap <= ttl and gap < nearest_gap:
+                    nearest_idx = cached_idx
+                    nearest_gap = gap
+            return mask_cache.get(nearest_idx) if nearest_idx is not None else None
+
+        def _generate_mask(frame: np.ndarray, frame_idx: Optional[int]) -> np.ndarray:
+            cached = _select_cached_mask(frame_idx)
+            if cached is not None:
+                return cached
+            generated = self.target_mask_generator.generate_mask(
+                frame,
+                classes_for_detection,
+                motion_frames=ctx,
+            )
+            if mask_cache is not None and frame_idx is not None and ttl > 0:
+                mask_cache[frame_idx] = generated
+            return generated
+
         try:
-            mask_prev = self.target_mask_generator.generate_mask(
-                frame_prev,
-                classes_for_detection,
-                motion_frames=ctx,
-            )
-            mask_cur = self.target_mask_generator.generate_mask(
-                frame_cur,
-                classes_for_detection,
-                motion_frames=ctx,
-            )
+            mask_prev = _generate_mask(frame_prev, frame_prev_idx)
+            mask_cur = _generate_mask(frame_cur, frame_cur_idx)
             return mask_prev, mask_cur
         except Exception as e:
             logger.debug(f"動体マスク生成失敗（無効化して継続）: {e}")
@@ -359,6 +406,55 @@ class KeyframeSelector:
             )
         except Exception:
             return None
+
+    @staticmethod
+    def _emit_frame_log(
+        frame_log_callback: Optional[Callable[[Dict[str, Any]], None]],
+        payload: Dict[str, Any],
+        perf_stats: Optional[Stage2PerfStats] = None,
+    ) -> None:
+        if frame_log_callback is None:
+            return
+        started = perf_counter() if perf_stats is not None and perf_stats.enabled else 0.0
+        try:
+            frame_log_callback(payload)
+        except Exception as e:
+            frame_idx = payload.get("frame_index", -1)
+            logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
+        finally:
+            if perf_stats is not None and perf_stats.enabled:
+                perf_stats.rerun_log_s += max(0.0, perf_counter() - started)
+
+    @staticmethod
+    def _log_stage2_perf_summary(perf_stats: Stage2PerfStats) -> None:
+        if not perf_stats.enabled:
+            return
+        candidates = max(1, perf_stats.total_candidates)
+        processed = max(1, perf_stats.processed_candidates)
+        total_ms = perf_stats.total_s * 1000.0
+        read_ms = perf_stats.frame_read_s * 1000.0
+        mask_ms = perf_stats.dynamic_mask_s * 1000.0
+        geom_ms = perf_stats.geometric_eval_s * 1000.0
+        adapt_ms = perf_stats.adaptive_eval_s * 1000.0
+        rerun_ms = perf_stats.rerun_log_s * 1000.0
+        logger.info(
+            "stage2_perf,"
+            f" total_candidates={perf_stats.total_candidates},"
+            f" processed_candidates={perf_stats.processed_candidates},"
+            f" selected_candidates={perf_stats.selected_candidates},"
+            f" total_ms={total_ms:.3f},"
+            f" per_candidate_ms={total_ms/candidates:.3f},"
+            f" per_processed_ms={total_ms/processed:.3f},"
+            f" frame_read_ms={read_ms:.3f},"
+            f" dynamic_mask_ms={mask_ms:.3f},"
+            f" geometric_eval_ms={geom_ms:.3f},"
+            f" adaptive_eval_ms={adapt_ms:.3f},"
+            f" rerun_log_ms={rerun_ms:.3f},"
+            f" dynamic_mask_calls={perf_stats.dynamic_mask_calls},"
+            f" dynamic_mask_mode_both_calls={perf_stats.dynamic_mask_mode_both_calls},"
+            f" dynamic_mask_mode_yolo_only_calls={perf_stats.dynamic_mask_mode_yolo_only_calls},"
+            f" dynamic_mask_mode_motion_only_calls={perf_stats.dynamic_mask_mode_motion_only_calls}"
+        )
 
     def _is_fisheye_border_mask_enabled(self, is_paired: bool) -> bool:
         return bool(is_paired and self.config.get('ENABLE_FISHEYE_BORDER_MASK', True))
@@ -804,6 +900,12 @@ class KeyframeSelector:
             cap = self._open_independent_capture(video_path)
         else:
             cap_a, cap_b = self._open_independent_pair_captures(video_loader)
+        perf_stats = Stage2PerfStats(
+            enabled=bool(self.config.get('STAGE2_PERF_PROFILE', True)),
+            total_candidates=len(stage1_candidates),
+        )
+        stage2_started = perf_counter()
+        dynamic_mask_cache: Dict[int, np.ndarray] = {}
 
         try:
             last_read_idx = -1
@@ -819,6 +921,7 @@ class KeyframeSelector:
                 current_frame = None
                 current_pair = None
                 current_pair_feature_mask = None
+                frame_read_started = perf_counter() if perf_stats.enabled else 0.0
                 if is_paired:
                     if cap_a is not None and cap_b is not None:
                         if frame_idx != last_read_idx_pair + 1:
@@ -849,6 +952,9 @@ class KeyframeSelector:
                     last_read_idx = frame_idx
                     if not ret or current_frame is None:
                         continue
+                if perf_stats.enabled:
+                    perf_stats.frame_read_s += max(0.0, perf_counter() - frame_read_started)
+                perf_stats.processed_candidates += 1
 
                 geometric_scores = {}
                 adaptive_scores = {}
@@ -869,8 +975,9 @@ class KeyframeSelector:
                             "keyframe_flag": 0.0,
                             "combined_score": float(self._compute_combined_score(quality_scores, {}, {})),
                         }
-                        try:
-                            frame_log_callback({
+                        self._emit_frame_log(
+                            frame_log_callback,
+                            {
                                 "frame_index": frame_idx,
                                 "frame": current_frame,
                                 "is_keyframe": False,
@@ -878,9 +985,9 @@ class KeyframeSelector:
                                 "quality_scores": quality_scores,
                                 "geometric_scores": geometric_scores,
                                 "adaptive_scores": adaptive_scores,
-                            })
-                        except Exception as e:
-                            logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
+                            },
+                            perf_stats=perf_stats,
+                        )
                     continue
 
                 frame_window.append(current_frame)
@@ -911,14 +1018,30 @@ class KeyframeSelector:
                     dynamic_mask_ref = None
                     dynamic_mask_cur = None
                     if self.config.get('ENABLE_DYNAMIC_MASK_REMOVAL', False):
+                        use_yolo = bool(self.config.get('DYNAMIC_MASK_USE_YOLO_SAM', True))
+                        use_motion = bool(self.config.get('DYNAMIC_MASK_USE_MOTION_DIFF', True))
+                        perf_stats.dynamic_mask_calls += 1
+                        if use_yolo and use_motion:
+                            perf_stats.dynamic_mask_mode_both_calls += 1
+                        elif use_yolo:
+                            perf_stats.dynamic_mask_mode_yolo_only_calls += 1
+                        elif use_motion:
+                            perf_stats.dynamic_mask_mode_motion_only_calls += 1
+                        mask_started = perf_counter() if perf_stats.enabled else 0.0
                         dynamic_mask_ref, dynamic_mask_cur = self._build_dynamic_masks(
-                            geom_ref, geom_cur, list(geom_frame_window)
+                            geom_ref, geom_cur, list(geom_frame_window),
+                            frame_prev_idx=last_keyframe_idx,
+                            frame_cur_idx=frame_idx,
+                            mask_cache=dynamic_mask_cache,
                         )
+                        if perf_stats.enabled:
+                            perf_stats.dynamic_mask_s += max(0.0, perf_counter() - mask_started)
                     if is_paired and use_fisheye_border_mask and not self.config.get('ENABLE_RIG_STITCHING', True):
                         dynamic_mask_ref = self._combine_feature_masks(dynamic_mask_ref, last_pair_feature_mask)
                         dynamic_mask_cur = self._combine_feature_masks(dynamic_mask_cur, current_pair_feature_mask)
 
                     try:
+                        geom_started = perf_counter() if perf_stats.enabled else 0.0
                         geometric_scores = self.geometric_evaluator.evaluate(
                             geom_ref, geom_cur,
                             frame1_idx=last_keyframe_idx,
@@ -926,7 +1049,11 @@ class KeyframeSelector:
                             frame1_mask=dynamic_mask_ref,
                             frame2_mask=dynamic_mask_cur,
                         )
+                        if perf_stats.enabled:
+                            perf_stats.geometric_eval_s += max(0.0, perf_counter() - geom_started)
                     except GeometricDegeneracyError as e:
+                        if perf_stats.enabled:
+                            perf_stats.geometric_eval_s += max(0.0, perf_counter() - geom_started)
                         logger.debug(f"フレーム {frame_idx}: 幾何学的縮退 - {e}")
                         geometric_scores = {
                             'gric': 0.1,
@@ -937,6 +1064,8 @@ class KeyframeSelector:
                         }
                         geometric_failed = True
                     except (EstimationFailureError, InsufficientFeaturesError) as e:
+                        if perf_stats.enabled:
+                            perf_stats.geometric_eval_s += max(0.0, perf_counter() - geom_started)
                         logger.debug(f"フレーム {frame_idx}: 幾何学的評価失敗 - {e}")
                         self.is_rescue_mode = self._check_rescue_mode(0)
                         if self.is_rescue_mode and frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
@@ -961,8 +1090,9 @@ class KeyframeSelector:
                                     "keyframe_flag": 0.0,
                                     "combined_score": float(self._compute_combined_score(quality_scores, {}, {})),
                                 }
-                                try:
-                                    frame_log_callback({
+                                self._emit_frame_log(
+                                    frame_log_callback,
+                                    {
                                         "frame_index": frame_idx,
                                         "frame": current_frame,
                                         "is_keyframe": False,
@@ -970,9 +1100,9 @@ class KeyframeSelector:
                                         "quality_scores": quality_scores,
                                         "geometric_scores": geometric_scores,
                                         "adaptive_scores": adaptive_scores,
-                                    })
-                                except Exception as e:
-                                    logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
+                                    },
+                                    perf_stats=perf_stats,
+                                )
                             continue
 
                     geom_frame_window.append(geom_cur)
@@ -980,6 +1110,7 @@ class KeyframeSelector:
                     if not geometric_failed and 'feature_match_count' in geometric_scores:
                         self.is_rescue_mode = self._check_rescue_mode(geometric_scores['feature_match_count'])
 
+                    adaptive_started = perf_counter() if perf_stats.enabled else 0.0
                     adaptive_scores = self.adaptive_selector.evaluate(
                         last_keyframe, current_frame, frames_window=list(frame_window)
                     )
@@ -993,6 +1124,8 @@ class KeyframeSelector:
                             adaptive_scores['optical_flow'] = (flow_a + flow_b) * 0.5
                         adaptive_scores['optical_flow_lens_a'] = flow_a
                         adaptive_scores['optical_flow_lens_b'] = flow_b
+                    if perf_stats.enabled:
+                        perf_stats.adaptive_eval_s += max(0.0, perf_counter() - adaptive_started)
 
                     ssim = adaptive_scores.get('ssim', 1.0)
                     if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and not force_insert and not exposure_changed:
@@ -1007,8 +1140,9 @@ class KeyframeSelector:
                                 "keyframe_flag": 0.0,
                                 "combined_score": float(self._compute_combined_score(quality_scores, geometric_scores, adaptive_scores)),
                             }
-                            try:
-                                frame_log_callback({
+                            self._emit_frame_log(
+                                frame_log_callback,
+                                {
                                     "frame_index": frame_idx,
                                     "frame": current_frame,
                                     "is_keyframe": False,
@@ -1016,9 +1150,9 @@ class KeyframeSelector:
                                     "quality_scores": quality_scores,
                                     "geometric_scores": geometric_scores,
                                     "adaptive_scores": adaptive_scores,
-                                })
-                            except Exception as e:
-                                logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
+                                },
+                                perf_stats=perf_stats,
+                            )
                         continue
 
                     if exposure_changed and frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
@@ -1045,6 +1179,7 @@ class KeyframeSelector:
                     dynamic_mask=dynamic_mask_cur.copy() if dynamic_mask_cur is not None else None,
                 )
                 candidates.append(candidate)
+                perf_stats.selected_candidates += 1
                 is_selected = True
 
                 if self.is_rescue_mode:
@@ -1067,8 +1202,9 @@ class KeyframeSelector:
                         "keyframe_flag": 1.0 if is_selected else 0.0,
                         "combined_score": float(combined_score),
                     }
-                    try:
-                        frame_log_callback({
+                    self._emit_frame_log(
+                        frame_log_callback,
+                        {
                             "frame_index": frame_idx,
                             "frame": current_frame,
                             "is_keyframe": bool(is_selected),
@@ -1076,11 +1212,14 @@ class KeyframeSelector:
                             "quality_scores": quality_scores,
                             "geometric_scores": geometric_scores,
                             "adaptive_scores": adaptive_scores,
-                        })
-                    except Exception as e:
-                        logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
+                        },
+                        perf_stats=perf_stats,
+                    )
 
         finally:
+            if perf_stats.enabled:
+                perf_stats.total_s = max(0.0, perf_counter() - stage2_started)
+            self._log_stage2_perf_summary(perf_stats)
             if cap is not None:
                 cap.release()
                 logger.debug("Stage 2: 独立キャプチャを解放")

@@ -407,6 +407,143 @@ class GeometricEvaluator:
         gric = np.sum(rho_values) + lambda1 * d_model * n_points + lambda2 * k_model
         return float(gric)
 
+    def _build_match_context(
+        self,
+        frame1: np.ndarray,
+        frame2: np.ndarray,
+        frame1_idx: Optional[int] = None,
+        frame2_idx: Optional[int] = None,
+        frame1_mask: Optional[np.ndarray] = None,
+        frame2_mask: Optional[np.ndarray] = None,
+    ) -> Dict[str, object]:
+        """
+        幾何評価で使う特徴点・対応点を1回だけ構築する。
+        """
+        cfg = self.gric_config
+        kp1, desc1 = self._detect_and_compute_cached(
+            frame1, frame_idx=frame1_idx, use_polar_mask=True, external_mask=frame1_mask
+        )
+        kp2, desc2 = self._detect_and_compute_cached(
+            frame2, frame_idx=frame2_idx, use_polar_mask=True, external_mask=frame2_mask
+        )
+        matches = self._match_features(desc1, desc2, kp1, kp2)
+
+        if len(matches) < cfg.min_matches:
+            raise InsufficientFeaturesError(
+                match_count=len(matches),
+                required_count=cfg.min_matches
+            )
+
+        pts1 = np.float32([kp1[m[0]].pt for m in matches])
+        pts2 = np.float32([kp2[m[1]].pt for m in matches])
+        return {
+            "kp1": kp1,
+            "kp2": kp2,
+            "matches": matches,
+            "pts1": pts1,
+            "pts2": pts2,
+            "n_points": len(pts1),
+        }
+
+    def _compute_gric_score_from_context(self, context: Dict[str, object]) -> float:
+        """
+        事前計算済みの対応点からGRICスコアを計算する。
+        """
+        cfg = self.gric_config
+        pts1 = context["pts1"]
+        pts2 = context["pts2"]
+        n_points = context["n_points"]
+
+        # ===== ホモグラフィH推定 =====
+        try:
+            H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, cfg.ransac_threshold)
+        except cv2.error as e:
+            raise EstimationFailureError(
+                reason=f"ホモグラフィ推定でOpenCVエラー: {e}",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
+        if H is None or mask_H is None:
+            raise EstimationFailureError(
+                reason="ホモグラフィ推定失敗（RANSAC収束不可）",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
+
+        # ===== 基礎行列F推定 =====
+        try:
+            F, mask_F = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, cfg.ransac_threshold)
+        except cv2.error as e:
+            raise EstimationFailureError(
+                reason=f"基礎行列推定でOpenCVエラー: {e}",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
+        if F is None or mask_F is None:
+            raise EstimationFailureError(
+                reason="基礎行列推定失敗（RANSAC収束不可）",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
+
+        if F.shape[0] > 3:
+            logger.debug(f"基礎行列が複数解 ({F.shape}) → 先頭3x3を使用")
+            F = F[:3, :]
+
+        inlier_ratio_H = float(np.sum(mask_H.ravel())) / n_points
+        inlier_ratio_F = float(np.sum(mask_F.ravel())) / n_points
+
+        if inlier_ratio_H < cfg.min_inlier_ratio and inlier_ratio_F < cfg.min_inlier_ratio:
+            raise EstimationFailureError(
+                reason=f"インライア率不足 (H={inlier_ratio_H:.2f}, F={inlier_ratio_F:.2f})",
+                match_count=n_points,
+                required_count=cfg.min_matches
+            )
+
+        errors_H = self._compute_reprojection_errors_H(pts1, pts2, H)
+        errors_F = self._compute_sampson_errors_F(pts1, pts2, F)
+
+        gric_H = self._compute_gric(
+            errors_H, cfg.sigma, d_model=2, k_model=8,
+            n_points=n_points, lambda1=cfg.lambda1, lambda2=cfg.lambda2
+        )
+        gric_F = self._compute_gric(
+            errors_F, cfg.sigma, d_model=3, k_model=7,
+            n_points=n_points, lambda1=cfg.lambda1, lambda2=cfg.lambda2
+        )
+
+        logger.debug(
+            f"GRIC: H={gric_H:.2f}, F={gric_F:.2f}, "
+            f"inlier_H={inlier_ratio_H:.3f}, inlier_F={inlier_ratio_F:.3f}, "
+            f"matches={n_points}"
+        )
+
+        if inlier_ratio_H >= cfg.degeneracy_threshold:
+            raise GeometricDegeneracyError(
+                message="Hインライア率が高すぎる（純回転/平面シーン）",
+                gric_h=gric_H,
+                gric_f=gric_F,
+                inlier_ratio_h=inlier_ratio_H
+            )
+
+        if gric_F < gric_H:
+            gric_sum = gric_H + gric_F + 1e-10
+            ratio = (gric_H - gric_F) / gric_sum
+            score = float(np.clip(0.5 + ratio, 0.3, 1.0))
+        else:
+            gric_sum = gric_H + gric_F + 1e-10
+            ratio = (gric_F - gric_H) / gric_sum
+            score = float(np.clip(0.5 - ratio, 0.0, 0.5))
+
+            if score < 0.15:
+                raise GeometricDegeneracyError(
+                    message="GRIC判定: ホモグラフィが明確に優位（視差不十分）",
+                    gric_h=gric_H,
+                    gric_f=gric_F,
+                    inlier_ratio_h=inlier_ratio_H
+                )
+        return score
+
     def compute_gric_score(self, frame1: np.ndarray, frame2: np.ndarray,
                            frame1_idx: Optional[int] = None,
                            frame2_idx: Optional[int] = None,
@@ -443,133 +580,14 @@ class GeometricEvaluator:
         GeometricDegeneracyError
             回転のみ/平面シーンと判定された場合
         """
-        cfg = self.gric_config
-
-        # 特徴点検出（360°ポーラーマスク適用）
-        kp1, desc1 = self._detect_and_compute_cached(
-            frame1, frame_idx=frame1_idx, use_polar_mask=True, external_mask=frame1_mask
+        context = self._build_match_context(
+            frame1, frame2,
+            frame1_idx=frame1_idx,
+            frame2_idx=frame2_idx,
+            frame1_mask=frame1_mask,
+            frame2_mask=frame2_mask,
         )
-        kp2, desc2 = self._detect_and_compute_cached(
-            frame2, frame_idx=frame2_idx, use_polar_mask=True, external_mask=frame2_mask
-        )
-
-        # マッチング
-        matches = self._match_features(desc1, desc2, kp1, kp2)
-
-        # 最小マッチ数チェック
-        if len(matches) < cfg.min_matches:
-            raise InsufficientFeaturesError(
-                match_count=len(matches),
-                required_count=cfg.min_matches
-            )
-
-        # 座標変換
-        pts1 = np.float32([kp1[m[0]].pt for m in matches])
-        pts2 = np.float32([kp2[m[1]].pt for m in matches])
-        n_points = len(pts1)
-
-        # ===== ホモグラフィH推定 =====
-        try:
-            H, mask_H = cv2.findHomography(pts1, pts2, cv2.RANSAC, cfg.ransac_threshold)
-        except cv2.error as e:
-            raise EstimationFailureError(
-                reason=f"ホモグラフィ推定でOpenCVエラー: {e}",
-                match_count=n_points,
-                required_count=cfg.min_matches
-            )
-        if H is None or mask_H is None:
-            raise EstimationFailureError(
-                reason="ホモグラフィ推定失敗（RANSAC収束不可）",
-                match_count=n_points,
-                required_count=cfg.min_matches
-            )
-
-        # ===== 基礎行列F推定 =====
-        try:
-            F, mask_F = cv2.findFundamentalMat(pts1, pts2, cv2.FM_RANSAC, cfg.ransac_threshold)
-        except cv2.error as e:
-            # OpenCV内部のアサーション失敗（特定の点配置で発生し得る）
-            raise EstimationFailureError(
-                reason=f"基礎行列推定でOpenCVエラー: {e}",
-                match_count=n_points,
-                required_count=cfg.min_matches
-            )
-        if F is None or mask_F is None:
-            raise EstimationFailureError(
-                reason="基礎行列推定失敗（RANSAC収束不可）",
-                match_count=n_points,
-                required_count=cfg.min_matches
-            )
-
-        # findFundamentalMatは複数解を返すことがある（9x3等）→ 先頭3x3を使用
-        if F.shape[0] > 3:
-            logger.debug(f"基礎行列が複数解 ({F.shape}) → 先頭3x3を使用")
-            F = F[:3, :]
-
-        # インライア率
-        inlier_ratio_H = float(np.sum(mask_H.ravel())) / n_points
-        inlier_ratio_F = float(np.sum(mask_F.ravel())) / n_points
-
-        # 両方のインライア率が最低要件を満たさない場合
-        if inlier_ratio_H < cfg.min_inlier_ratio and inlier_ratio_F < cfg.min_inlier_ratio:
-            raise EstimationFailureError(
-                reason=f"インライア率不足 (H={inlier_ratio_H:.2f}, F={inlier_ratio_F:.2f})",
-                match_count=n_points,
-                required_count=cfg.min_matches
-            )
-
-        # ===== 残差計算 =====
-        errors_H = self._compute_reprojection_errors_H(pts1, pts2, H)
-        errors_F = self._compute_sampson_errors_F(pts1, pts2, F)
-
-        # ===== GRIC計算 =====
-        # H: d=2 (2DOF/点), k=8 | F: d=3 (3DOF/点), k=7
-        gric_H = self._compute_gric(
-            errors_H, cfg.sigma, d_model=2, k_model=8,
-            n_points=n_points, lambda1=cfg.lambda1, lambda2=cfg.lambda2
-        )
-        gric_F = self._compute_gric(
-            errors_F, cfg.sigma, d_model=3, k_model=7,
-            n_points=n_points, lambda1=cfg.lambda1, lambda2=cfg.lambda2
-        )
-
-        logger.debug(
-            f"GRIC: H={gric_H:.2f}, F={gric_F:.2f}, "
-            f"inlier_H={inlier_ratio_H:.3f}, inlier_F={inlier_ratio_F:.3f}, "
-            f"matches={n_points}"
-        )
-
-        # ===== 縮退判定: Hのインライア率が非常に高い =====
-        if inlier_ratio_H >= cfg.degeneracy_threshold:
-            raise GeometricDegeneracyError(
-                message="Hインライア率が高すぎる（純回転/平面シーン）",
-                gric_h=gric_H,
-                gric_f=gric_F,
-                inlier_ratio_h=inlier_ratio_H
-            )
-
-        # ===== GRIC比較による視差スコア算出 =====
-        if gric_F < gric_H:
-            # Fモデルが優位 → 有効な並進運動（視差あり）
-            gric_sum = gric_H + gric_F + 1e-10
-            ratio = (gric_H - gric_F) / gric_sum
-            score = float(np.clip(0.5 + ratio, 0.3, 1.0))
-        else:
-            # Hモデルが優位 → 回転のみ/平面の傾向
-            gric_sum = gric_H + gric_F + 1e-10
-            ratio = (gric_F - gric_H) / gric_sum
-            score = float(np.clip(0.5 - ratio, 0.0, 0.5))
-
-            # 明確にHが優位（スコアが非常に低い）場合は縮退
-            if score < 0.15:
-                raise GeometricDegeneracyError(
-                    message="GRIC判定: ホモグラフィが明確に優位（視差不十分）",
-                    gric_h=gric_H,
-                    gric_f=gric_F,
-                    inlier_ratio_h=inlier_ratio_H
-                )
-
-        return score
+        return self._compute_gric_score_from_context(context)
 
     def compute_feature_distribution(self, frame: np.ndarray,
                                      frame_idx: Optional[int] = None,
@@ -597,39 +615,36 @@ class GeometricEvaluator:
             frame, frame_idx=frame_idx, use_polar_mask=True, external_mask=feature_mask
         )
 
-        if len(kp) == 0:
+        return self._compute_feature_distribution_from_keypoints(kp, frame.shape[:2])
+
+    @staticmethod
+    def _compute_feature_distribution_from_keypoints(
+        keypoints: List,
+        image_shape: Tuple[int, int]
+    ) -> float:
+        if len(keypoints) == 0:
             return 0.0
 
-        h, w = frame.shape[:2]
+        h, w = image_shape
         grid_cols, grid_rows = 4, 4
-
-        # キーポイント座標を抽出（ベクトル化）
-        kp_coords = np.array([kp_point.pt for kp_point in kp])
+        kp_coords = np.array([kp_point.pt for kp_point in keypoints])
         x_coords = kp_coords[:, 0]
         y_coords = kp_coords[:, 1]
 
-        # np.histogram2d() で分布を計算
         cell_counts, _, _ = np.histogram2d(
             x_coords, y_coords,
             bins=[grid_cols, grid_rows],
             range=[[0, w], [0, h]]
         )
-
         cell_counts = cell_counts.flatten()
         total_count = np.sum(cell_counts)
-
         if total_count == 0:
             return 0.0
 
-        # 確率分布として正規化
         prob_dist = cell_counts / total_count
-
-        # エントロピーを計算
         entropy = -np.sum(prob_dist[prob_dist > 0] * np.log(prob_dist[prob_dist > 0] + 1e-10))
         max_entropy = np.log(grid_rows * grid_cols)
-
         distribution_score = entropy / max_entropy if max_entropy > 0 else 0.0
-
         return float(np.clip(distribution_score, 0.0, 1.0))
 
     def compute_feature_match_count(self, frame1: np.ndarray, frame2: np.ndarray,
@@ -690,14 +705,23 @@ class GeometricEvaluator:
             frame, frame_idx=frame_idx, use_polar_mask=True, external_mask=feature_mask
         )
 
-        if len(kp) < 4:
+        return self._compute_ray_dispersion_from_keypoints(
+            keypoints=kp,
+            image_shape=frame.shape[:2],
+            is_equirectangular=is_equirectangular,
+        )
+
+    @staticmethod
+    def _compute_ray_dispersion_from_keypoints(
+        keypoints: List,
+        image_shape: Tuple[int, int],
+        is_equirectangular: bool = False,
+    ) -> float:
+        if len(keypoints) < 4:
             return 0.0
 
-        h, w = frame.shape[:2]
-
-        # キーポイント数を制限
-        kp_subset = kp[:500]
-
+        h, w = image_shape
+        kp_subset = keypoints[:500]
         kp_coords = np.array([kp_point.pt for kp_point in kp_subset])
         x_coords = kp_coords[:, 0]
         y_coords = kp_coords[:, 1]
@@ -705,7 +729,6 @@ class GeometricEvaluator:
         if is_equirectangular:
             lon = 2 * np.pi * (x_coords / w) - np.pi
             lat = np.pi * (y_coords / h) - np.pi / 2
-
             rays = np.column_stack([
                 np.cos(lat) * np.cos(lon),
                 np.cos(lat) * np.sin(lon),
@@ -714,23 +737,17 @@ class GeometricEvaluator:
         else:
             nx = 2 * (x_coords / w) - 1
             ny = 2 * (y_coords / h) - 1
-
             rays = np.column_stack([nx, ny, np.ones_like(nx)])
             norms = np.linalg.norm(rays, axis=1, keepdims=True) + 1e-6
             rays = rays / norms
 
-        # 光線の分散を計算（共分散行列の固有値）
         covariance = np.cov(rays.T)
-        eigenvalues = np.linalg.eigvals(covariance)
-        eigenvalues = np.real(eigenvalues)
-
+        eigenvalues = np.real(np.linalg.eigvals(covariance))
         max_eig = np.max(eigenvalues)
         if max_eig < 1e-6:
             return 0.0
-
         normalized_eigs = eigenvalues / max_eig
         dispersion_score = np.min(normalized_eigs)
-
         return float(np.clip(dispersion_score, 0.0, 1.0))
 
     def evaluate(self, frame1: np.ndarray, frame2: np.ndarray,
@@ -776,32 +793,28 @@ class GeometricEvaluator:
         InsufficientFeaturesError
             特徴点マッチ不足
         """
-        # GRIC スコア計算（カスタム例外が発生し得る → 呼び出し元でハンドリング）
-        gric_score = self.compute_gric_score(
+        context = self._build_match_context(
             frame1, frame2,
             frame1_idx=frame1_idx,
             frame2_idx=frame2_idx,
             frame1_mask=frame1_mask,
             frame2_mask=frame2_mask,
         )
+        gric_score = self._compute_gric_score_from_context(context)
 
         # 補助スコア計算（OpenCVエラーに対する安全ネット付き）
         try:
-            dist1 = self.compute_feature_distribution(
-                frame1, frame_idx=frame1_idx, feature_mask=frame1_mask
+            dist1 = self._compute_feature_distribution_from_keypoints(
+                context["kp1"], frame1.shape[:2]
             )
-            dist2 = self.compute_feature_distribution(
-                frame2, frame_idx=frame2_idx, feature_mask=frame2_mask
+            dist2 = self._compute_feature_distribution_from_keypoints(
+                context["kp2"], frame2.shape[:2]
             )
-            match_count = self.compute_feature_match_count(
-                frame1, frame2,
-                frame1_idx=frame1_idx,
-                frame2_idx=frame2_idx,
-                frame1_mask=frame1_mask,
-                frame2_mask=frame2_mask,
-            )
-            ray_disp = self.compute_ray_dispersion(
-                frame1, frame_idx=frame1_idx, feature_mask=frame1_mask
+            match_count = len(context["matches"])
+            ray_disp = self._compute_ray_dispersion_from_keypoints(
+                keypoints=context["kp1"],
+                image_shape=frame1.shape[:2],
+                is_equirectangular=False,
             )
         except cv2.error as e:
             logger.warning(f"補助スコア計算でOpenCVエラー（GRICスコアのみ使用）: {e}")

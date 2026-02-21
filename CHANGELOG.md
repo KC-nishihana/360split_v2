@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-02-21
 ### Added
 - **Visual Odometry Module** (`test/vo_only_test.py`) - モノキュラーVisual Odometryによるカメラ軌跡推定機能（実験的）
 - **IMU融合システム** (`test/vo_imu_fusion.py`) - VOとIMUセンサーデータの融合（開発中）
@@ -14,16 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **画像I/Oユーティリティ** (`utils/image_io.py`) - 画像の入出力とメタデータ管理の拡張
 - OSVファイルフォーマット対応（センサーデータ抽出）
 - 3D軌跡可視化機能
+- 前後魚眼2動画入力モード（`--front-video` / `--rear-video`）
+- Stage2動体除去のCLIオプション群（`--remove-dynamic-objects` ほか）
+- 魚眼外周マスク調整オプション（有効/無効、半径比、中心オフセット）
 
 ### Changed
 - GeometricEvaluatorモジュールの再利用性向上（VO統合のため）
 - プロジェクト構造ドキュメントの更新
+- `ConfigManager.default_config()` を唯一のデフォルト設定ソースとして統一
+- READMEのCLIオプション、設定例、出力構造を現行実装に同期
 
 ### Documentation
 - `test/VO開発完了レポート.md` - Visual Odometry開発の技術詳細
 - `test/3D軌跡解析レポート.md` - 軌跡解析結果レポート
 - `test/OSVファイル_メタデータ調査レポート.md` - センサーデータ調査レポート
-- README.mdの更新（実験的機能セクション追加）
+- `README.md` の更新（実験的機能セクション、CLI入力モード、動体除去設定）
 
 ## [1.0.0] - YYYY-MM-DD
 

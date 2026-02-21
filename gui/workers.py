@@ -240,10 +240,8 @@ class Stage2Worker(QThread):
             if not self._is_running:
                 return
 
-            # Stage1スコアにGRIC/SSIMを反映
-            kf_indices = set()
-            for kf in keyframes:
-                kf_indices.add(kf.frame_index)
+            # Stage1スコアにGRIC/SSIMを反映（O(N_stage1 + N_keyframes)）
+            keyframe_map = {kf.frame_index: kf for kf in keyframes}
 
             updated_scores: List[FrameScoreData] = []
             for s1 in self.stage1_scores:
@@ -254,14 +252,12 @@ class Stage2Worker(QThread):
                     exposure=s1.exposure,
                     motion_blur=s1.motion_blur,
                 )
-                # キーフレーム情報があれば追加
-                for kf in keyframes:
-                    if kf.frame_index == s1.frame_index:
-                        fsd.gric = kf.geometric_scores.get('gric', 0.0)
-                        fsd.ssim = kf.adaptive_scores.get('ssim', 1.0)
-                        fsd.combined = kf.combined_score
-                        fsd.is_keyframe = True
-                        break
+                kf = keyframe_map.get(s1.frame_index)
+                if kf is not None:
+                    fsd.gric = kf.geometric_scores.get('gric', 0.0)
+                    fsd.ssim = kf.adaptive_scores.get('ssim', 1.0)
+                    fsd.combined = kf.combined_score
+                    fsd.is_keyframe = True
                 updated_scores.append(fsd)
 
             self.frame_scores_updated.emit(updated_scores)

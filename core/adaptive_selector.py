@@ -53,6 +53,9 @@ class AdaptiveSelector:
 
         # ガウシアンカーネルを一度だけ生成してキャッシュ
         self._gaussian_kernel = self._create_gaussian_kernel(window_size, sigma)
+        # 連続フレーム窓の momentum 計算を差分更新するためのキャッシュ
+        self._momentum_prev_frame_ids = ()
+        self._momentum_prev_flows = []
 
     def _create_gaussian_kernel(self, window_size: int, sigma: float) -> np.ndarray:
         """
@@ -263,15 +266,34 @@ class AdaptiveSelector:
         if frames_window is None or len(frames_window) < 2:
             return 0.0
 
-        # 連続フレーム間の光学フロー大きさを計算
-        flow_magnitudes = []
-        for i in range(len(frames_window) - 1):
-            mag = self.compute_optical_flow_magnitude(
-                frames_window[i], frames_window[i + 1], method
+        frame_ids = tuple(id(f) for f in frames_window)
+        prev_ids = self._momentum_prev_frame_ids
+        prev_flows = self._momentum_prev_flows
+
+        flow_magnitudes = None
+        if (
+            prev_ids and
+            len(prev_ids) == len(frame_ids) and
+            len(prev_flows) == max(0, len(frame_ids) - 1) and
+            frame_ids[:-1] == prev_ids[1:]
+        ):
+            # 1フレーム進んだ窓は先頭のフローを捨て、末尾のみ再計算する。
+            tail_flow = self.compute_optical_flow_magnitude(
+                frames_window[-2], frames_window[-1], method
             )
-            flow_magnitudes.append(mag)
+            flow_magnitudes = prev_flows[1:] + [tail_flow]
+
+        if flow_magnitudes is None:
+            flow_magnitudes = []
+            for i in range(len(frames_window) - 1):
+                mag = self.compute_optical_flow_magnitude(
+                    frames_window[i], frames_window[i + 1], method
+                )
+                flow_magnitudes.append(mag)
 
         if len(flow_magnitudes) < 2:
+            self._momentum_prev_frame_ids = frame_ids
+            self._momentum_prev_flows = flow_magnitudes
             return 0.0
 
         # 動きの加速度を計算（光学フロー大きさの変化率）
@@ -280,6 +302,8 @@ class AdaptiveSelector:
 
         # 加速度の平均を返す
         momentum = float(np.mean(accelerations))
+        self._momentum_prev_frame_ids = frame_ids
+        self._momentum_prev_flows = flow_magnitudes.tolist()
 
         return momentum
 

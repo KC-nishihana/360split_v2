@@ -557,6 +557,8 @@ class ExportWorker(QThread):
         self.dynamic_mask_inpaint_module = str(dynamic_mask_inpaint_module or "").strip()
         self.precomputed_analysis_masks = dict(precomputed_analysis_masks or {})
         self.use_precomputed_analysis_masks = bool(use_precomputed_analysis_masks)
+        self._sparse_frame_export = False
+        self._effective_motion_diff = self.dynamic_mask_use_motion_diff
 
         # ステレオ（OSV）設定
         self.is_stereo = False
@@ -615,6 +617,8 @@ class ExportWorker(QThread):
             safe_motion_frames = motion_frames
             if self.use_precomputed_analysis_masks and not force_mask_reanalysis:
                 # 解析済みマスク再利用が欠損したフレームは履歴を使わず単フレームでフォールバック。
+                safe_motion_frames = [frame]
+            if self._sparse_frame_export:
                 safe_motion_frames = [frame]
             classes_for_detection = (
                 self.dynamic_mask_target_classes or self.target_classes
@@ -697,6 +701,15 @@ class ExportWorker(QThread):
                     logger.warning(f"StitchingProcessor のインポートに失敗: {e}")
                     self.enable_stereo_stitch = False
 
+            sorted_idx = sorted(int(i) for i in self.frame_indices)
+            self._sparse_frame_export = any(
+                (b - a) > 1 for a, b in zip(sorted_idx, sorted_idx[1:])
+            )
+            self._effective_motion_diff = bool(self.dynamic_mask_use_motion_diff)
+            if self._sparse_frame_export and self._effective_motion_diff:
+                logger.info("疎フレーム出力のため MotionDiff を自動無効化します")
+                self._effective_motion_diff = False
+
             target_mask_generator = None
             if self.enable_target_mask_generation:
                 try:
@@ -735,13 +748,15 @@ class ExportWorker(QThread):
                             sam_model_path=self.sam_model_path,
                             confidence_threshold=self.confidence_threshold,
                             device=self.detection_device,
-                            enable_motion_detection=self.dynamic_mask_use_motion_diff,
+                            enable_motion_detection=self._effective_motion_diff,
                             motion_history_frames=self.dynamic_mask_motion_frames,
                             motion_threshold=self.dynamic_mask_motion_threshold,
                             motion_mask_dilation_size=self.dynamic_mask_dilation_size,
                             enable_mask_inpaint=self.dynamic_mask_inpaint_enabled,
                             inpaint_hook=inpaint_hook,
                         )
+                        if "空" in (self.dynamic_mask_target_classes or self.target_classes):
+                            logger.warning("対象クラスに「空」が含まれています。広域マスクになりやすいです。")
                         logger.info(
                             "対象マスク生成を有効化: "
                             f"classes={self.target_classes}, yolo={self.yolo_model_path}, sam={self.sam_model_path}"

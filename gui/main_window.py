@@ -20,7 +20,7 @@ from typing import Dict, Optional, List
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QDockWidget, QTabWidget,
+    QDockWidget, QTabWidget, QSplitter,
     QFileDialog, QMenuBar, QToolBar, QStatusBar,
     QMessageBox, QProgressBar, QLabel
 )
@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
         self._full_worker: Optional[FullAnalysisWorker] = None
         self._export_worker: Optional[ExportWorker] = None
         self._analysis_masks: Dict[int, object] = {}
+        self._trajectory_left: bool = False
 
         # ステレオ（OSV）対応
         self.is_stereo: bool = False
@@ -91,17 +92,34 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        self._main_splitter = QSplitter(Qt.Vertical)
+        self._main_splitter.setChildrenCollapsible(False)
+        layout.addWidget(self._main_splitter, stretch=1)
+
         # ビデオプレーヤー
         self.video_player = VideoPlayerWidget()
-        layout.addWidget(self.video_player, stretch=1)
+        self._main_splitter.addWidget(self.video_player)
 
         # タイムライン
         self.timeline = TimelineWidget()
-        layout.addWidget(self.timeline, stretch=0)
+        self.timeline.setMinimumHeight(220)
+        self.timeline.setMaximumHeight(360)
 
         # 擬似軌跡ビュー
         self.trajectory = TrajectoryWidget()
-        layout.addWidget(self.trajectory, stretch=0)
+        self.trajectory.setMinimumSize(200, 200)
+
+        # 下段: スコア + 擬似軌跡（左右配置を切り替え可能）
+        self._bottom_splitter = QSplitter(Qt.Horizontal)
+        self._bottom_splitter.setChildrenCollapsible(False)
+        self._main_splitter.addWidget(self._bottom_splitter)
+        self._rebuild_bottom_splitter()
+
+        # 初期比率: ビデオを大きめ
+        self._main_splitter.setStretchFactor(0, 4)
+        self._main_splitter.setStretchFactor(1, 2)
+        self._bottom_splitter.setStretchFactor(0, 3)
+        self._bottom_splitter.setStretchFactor(1, 1)
 
         # ステータスバーにプログレスバーを追加
         self._progress_bar = QProgressBar()
@@ -177,6 +195,16 @@ class MainWindow(QMainWindow):
         )
         view_menu.addAction(grid_action)
 
+        traj_left_action = QAction("擬似軌跡を左に配置", self)
+        traj_left_action.setCheckable(True)
+        traj_left_action.setChecked(self._trajectory_left)
+        traj_left_action.triggered.connect(self._set_trajectory_left)
+        view_menu.addAction(traj_left_action)
+
+        reset_layout_action = QAction("レイアウトをリセット", self)
+        reset_layout_action.triggered.connect(self._reset_layout_sizes)
+        view_menu.addAction(reset_layout_action)
+
         # 解析(A)
         analysis_menu = menubar.addMenu("解析(&A)")
 
@@ -208,6 +236,29 @@ class MainWindow(QMainWindow):
         tb.addAction("🚀 フル解析", self._run_full_analysis)
         tb.addSeparator()
         tb.addAction("💾 エクスポート", self.export_keyframes)
+
+    def _rebuild_bottom_splitter(self):
+        """下段splitterの並び順を更新"""
+        if self._bottom_splitter.indexOf(self.timeline) != -1:
+            self.timeline.setParent(None)
+        if self._bottom_splitter.indexOf(self.trajectory) != -1:
+            self.trajectory.setParent(None)
+
+        if self._trajectory_left:
+            self._bottom_splitter.addWidget(self.trajectory)
+            self._bottom_splitter.addWidget(self.timeline)
+        else:
+            self._bottom_splitter.addWidget(self.timeline)
+            self._bottom_splitter.addWidget(self.trajectory)
+        self._bottom_splitter.setSizes([900, 320])
+
+    def _set_trajectory_left(self, checked: bool):
+        self._trajectory_left = bool(checked)
+        self._rebuild_bottom_splitter()
+
+    def _reset_layout_sizes(self):
+        self._main_splitter.setSizes([700, 320])
+        self._bottom_splitter.setSizes([900, 320])
 
     def _setup_connections(self):
         """全シグナル/スロットを接続"""

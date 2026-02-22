@@ -44,11 +44,9 @@
 ### 1. リポジトリのクローン
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/360split.git
+git clone https://github.com/KC-nishihana/360split_v2.git
 cd 360split
 ```
-
-（注：`YOUR_USERNAME`を実際のGitHubユーザー名に置き換えてください）
 
 ### 2. Python仮想環境の作成
 
@@ -551,4 +549,25 @@ python3 vo_imu_fusion.py
 
 ## ライセンス
 
-（準備中）
+本リポジトリ本体のライセンスは `MIT` です。詳細は `LICENSE` を参照してください。
+
+本プロジェクトで使用している主要技術・ライブラリのライセンスは以下です（2026-02-22時点）。
+
+| 区分 | 技術/ライブラリ | ライセンス |
+|---|---|---|
+| 必須依存 | PySide6 (Qt for Python) | `LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only` |
+| 必須依存 | OpenCV (`opencv-python`) | `Apache-2.0` |
+| 必須依存 | NumPy | `BSD-3-Clause` |
+| 必須依存 | pyqtgraph | `MIT` |
+| 必須依存 | rerun-sdk | `MIT OR Apache-2.0` |
+| オプション依存 | PyTorch (`torch`) | `BSD-3-Clause` |
+| オプション依存 | torchvision | `BSD` |
+| オプション依存 | Ultralytics (`ultralytics`) | `AGPL-3.0` |
+
+ロジック（アルゴリズム）について:
+- 本ツールのキーフレーム選定ロジック（ラプラシアン鮮明度、SSIM、GRIC、特徴点マッチング、光学フロー等）は、数理手法・古典的CV手法の組み合わせです。
+- これらの「手法そのもの」には通常ソフトウェア著作権ライセンスは直接適用されませんが、実装に利用するライブラリのライセンス遵守が必要です。
+
+注意:
+- 本体コードは MIT ですが、利用する依存ライブラリには各ライセンスが適用されます（特に `ultralytics` は `AGPL-3.0`）。
+- 学習済み重みファイル（例: `yolo26x-seg.pt`, `sam3.pt`）には提供元の個別ライセンス/利用規約が適用されます。

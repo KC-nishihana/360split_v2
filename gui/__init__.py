@@ -17,6 +17,7 @@ from gui.timeline_widget import TimelineWidget
 from gui.trajectory_widget import TrajectoryWidget
 from gui.settings_panel import SettingsPanel
 from gui.keyframe_panel import KeyframePanel
+from gui.log_panel import LogPanel
 
 __all__ = [
     "MainWindow",
@@ -25,4 +26,5 @@ __all__ = [
     "TrajectoryWidget",
     "SettingsPanel",
     "KeyframePanel",
+    "LogPanel",
 ]

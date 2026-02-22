@@ -45,6 +45,11 @@ class FrameScoreData:
     translation_delta: float = 0.0
     rotation_delta: float = 0.0
     match_count: float = 0.0
+    stage0_motion_risk: float = 0.0
+    trajectory_consistency: float = 0.5
+    combined_stage2: float = 0.0
+    combined_stage3: float = 0.0
+    stage3_selected: bool = False
     is_stationary: bool = False
     is_keyframe: bool = False
 
@@ -91,6 +96,12 @@ class Stage1Worker(QThread):
         cap = None
         try:
             from core.quality_evaluator import QualityEvaluator
+            logger.info(
+                "worker_start, worker=Stage1Worker,"
+                f" video_path={self.video_path},"
+                f" sample_interval={int(self.sample_interval)},"
+                f" batch_size={int(self.config.get('STAGE1_BATCH_SIZE', 32))}"
+            )
 
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
@@ -149,6 +160,10 @@ class Stage1Worker(QThread):
                 self.progress.emit(len(frame_indices), len(frame_indices),
                                    "Stage 1 完了")
                 self.finished_scores.emit(all_scores)
+                logger.info(
+                    "worker_finished, worker=Stage1Worker,"
+                    f" scanned_frames={len(all_scores)}"
+                )
 
         except Exception as e:
             logger.exception("Stage 1 ワーカーエラー")
@@ -201,6 +216,17 @@ class Stage2Worker(QThread):
         try:
             from core.video_loader import VideoLoader
             from core.keyframe_selector import KeyframeSelector
+            stage_label = str(self.config.get("analysis_stage_label", "Stage 2"))
+            logger.info(
+                "worker_start, worker=Stage2Worker,"
+                f" stage_label={stage_label},"
+                f" analysis_mode={str(self.config.get('analysis_mode', 'full'))},"
+                f" video_path={self.video_path},"
+                f" stage1_scores={len(self.stage1_scores)},"
+                f" enable_stage0_scan={bool(self.config.get('enable_stage0_scan', self.config.get('ENABLE_STAGE0_SCAN', True)))},"
+                f" enable_stage3_refinement={bool(self.config.get('enable_stage3_refinement', self.config.get('ENABLE_STAGE3_REFINEMENT', True)))},"
+                f" stage0_stride={int(self.config.get('stage0_stride', self.config.get('STAGE0_STRIDE', 5)))}"
+            )
 
             loader = VideoLoader()
             loader.load(self.video_path)
@@ -220,7 +246,7 @@ class Stage2Worker(QThread):
                 if not self._is_running:
                     return
                 self.progress.emit(current, total,
-                                   f"Stage 2: {current}/{total} {message}")
+                                   f"{stage_label}: {current}/{total} {message}")
 
             def frame_log_cb(payload: dict):
                 if not self._is_running:
@@ -267,19 +293,31 @@ class Stage2Worker(QThread):
                 fsd.translation_delta = float(m.get('translation_delta', 0.0))
                 fsd.rotation_delta = float(m.get('rotation_delta', 0.0))
                 fsd.match_count = float(m.get('match_count', 0.0))
+                fsd.stage0_motion_risk = float(m.get('stage0_motion_risk', 0.0))
+                fsd.trajectory_consistency = float(m.get('trajectory_consistency', 0.5))
+                fsd.combined_stage2 = float(m.get('combined_stage2', fsd.combined))
+                fsd.combined_stage3 = float(m.get('combined_stage3', fsd.combined))
+                fsd.stage3_selected = bool(float(m.get('stage3_selected_flag', 0.0)) > 0.5)
                 fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
                     fsd.ssim = kf.adaptive_scores.get('ssim', 1.0)
                     fsd.combined = kf.combined_score
+                    fsd.combined_stage3 = kf.combined_score
                     fsd.is_keyframe = True
                 updated_scores.append(fsd)
 
             self.frame_scores_updated.emit(updated_scores)
             self.keyframes_found.emit(keyframes)
-            self.progress.emit(1, 1, "Stage 2 完了")
+            self.progress.emit(1, 1, f"{stage_label} 完了")
             self.analysis_finished.emit()
+            logger.info(
+                "worker_finished, worker=Stage2Worker,"
+                f" stage_label={stage_label},"
+                f" keyframes={len(keyframes)},"
+                f" updated_scores={len(updated_scores)}"
+            )
 
         except Exception as e:
             logger.exception("Stage 2 ワーカーエラー")
@@ -287,10 +325,10 @@ class Stage2Worker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# フルパイプラインワーカー（Stage 1 + Stage 2 を連続実行）
+# 統合解析ワーカー（GUI解析の単一実行経路）
 # ---------------------------------------------------------------------------
 
-class FullAnalysisWorker(QThread):
+class UnifiedAnalysisWorker(QThread):
     """
     Stage 1 + Stage 2 を連続実行するワーカー。
 
@@ -332,6 +370,14 @@ class FullAnalysisWorker(QThread):
             from core.video_loader import VideoLoader
             from core.keyframe_selector import KeyframeSelector
             from core.quality_evaluator import QualityEvaluator
+            run_id = str(self.config.get("analysis_run_id", "n/a"))
+            logger.info(
+                "worker_start, worker=UnifiedAnalysisWorker,"
+                f" analysis_run_id={run_id},"
+                f" video_path={self.video_path},"
+                f" enable_stage0_scan={bool(self.config.get('enable_stage0_scan', self.config.get('ENABLE_STAGE0_SCAN', True)))},"
+                f" enable_stage3_refinement={bool(self.config.get('enable_stage3_refinement', self.config.get('ENABLE_STAGE3_REFINEMENT', True)))}"
+            )
 
             # ----- Stage 1: 高速品質スキャン -----
             self.progress.emit(0, 100, "Stage 1: 品質スキャン開始...")
@@ -393,7 +439,7 @@ class FullAnalysisWorker(QThread):
                 return
 
             self.stage1_finished.emit(all_scores)
-            self.progress.emit(50, 100, "Stage 1 完了。Stage 2 開始...")
+            self.progress.emit(50, 100, "Stage 1 完了。Stage 2/3 開始...")
 
             # ----- Stage 2: 精密評価 -----
             loader = VideoLoader()
@@ -415,7 +461,7 @@ class FullAnalysisWorker(QThread):
                     return
                 pct = 50 + int(current / max(total, 1) * 50)  # 50-100%
                 self.progress.emit(pct, 100,
-                                   f"Stage 2: {current}/{total}")
+                                   f"解析: {current}/{total} {message}")
 
             def frame_log_cb(payload: dict):
                 if not self._is_running:
@@ -459,12 +505,18 @@ class FullAnalysisWorker(QThread):
                 fsd.translation_delta = float(m.get('translation_delta', 0.0))
                 fsd.rotation_delta = float(m.get('rotation_delta', 0.0))
                 fsd.match_count = float(m.get('match_count', 0.0))
+                fsd.stage0_motion_risk = float(m.get('stage0_motion_risk', 0.0))
+                fsd.trajectory_consistency = float(m.get('trajectory_consistency', 0.5))
+                fsd.combined_stage2 = float(m.get('combined_stage2', fsd.combined))
+                fsd.combined_stage3 = float(m.get('combined_stage3', fsd.combined))
+                fsd.stage3_selected = bool(float(m.get('stage3_selected_flag', 0.0)) > 0.5)
                 fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
                     fsd.ssim = kf.adaptive_scores.get('ssim', 1.0)
                     fsd.combined = kf.combined_score
+                    fsd.combined_stage3 = kf.combined_score
                     fsd.is_keyframe = True
                 updated_scores.append(fsd)
 
@@ -472,10 +524,21 @@ class FullAnalysisWorker(QThread):
             self.keyframes_found.emit(keyframes)
             self.progress.emit(100, 100, "解析完了")
             self.analysis_finished.emit()
+            logger.info(
+                "worker_finished, worker=UnifiedAnalysisWorker,"
+                f" analysis_run_id={run_id},"
+                f" keyframes={len(keyframes)},"
+                f" updated_scores={len(updated_scores)}"
+            )
 
         except Exception as e:
             logger.exception("解析ワーカーエラー")
             self.error.emit(f"解析エラー: {e}")
+
+
+class FullAnalysisWorker(UnifiedAnalysisWorker):
+    """後方互換ラッパー。GUIは UnifiedAnalysisWorker を使用する。"""
+    pass
 
 
 # ---------------------------------------------------------------------------

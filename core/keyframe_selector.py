@@ -72,6 +72,7 @@ class KeyframeInfo:
     dynamic_mask: Optional[np.ndarray] = None
     is_stationary: bool = False
     stationary_penalty_applied: bool = False
+    stage3_scores: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -205,6 +206,13 @@ class KeyframeSelector:
             'STATIONARY_ALLOW_BOUNDARY_FRAMES': True,
             'STATIONARY_BOUNDARY_GRACE_FRAMES': 2,
             'STATIONARY_HYSTERESIS_EXIT_SCALE': 1.25,
+            # Stage0/Stage3
+            'ENABLE_STAGE0_SCAN': True,
+            'STAGE0_STRIDE': 5,
+            'ENABLE_STAGE3_REFINEMENT': True,
+            'STAGE3_WEIGHT_BASE': 0.70,
+            'STAGE3_WEIGHT_TRAJECTORY': 0.25,
+            'STAGE3_WEIGHT_STAGE0_RISK': 0.05,
         }
 
         # 外部設定でオーバーライド
@@ -271,6 +279,13 @@ class KeyframeSelector:
                 'stationary_allow_boundary_frames': 'STATIONARY_ALLOW_BOUNDARY_FRAMES',
                 'stationary_boundary_grace_frames': 'STATIONARY_BOUNDARY_GRACE_FRAMES',
                 'stationary_hysteresis_exit_scale': 'STATIONARY_HYSTERESIS_EXIT_SCALE',
+                'enable_stage0_scan': 'ENABLE_STAGE0_SCAN',
+                'stage0_stride': 'STAGE0_STRIDE',
+                'enable_stage3_refinement': 'ENABLE_STAGE3_REFINEMENT',
+                'stage3_weight_base': 'STAGE3_WEIGHT_BASE',
+                'stage3_weight_trajectory': 'STAGE3_WEIGHT_TRAJECTORY',
+                'stage3_weight_stage0_risk': 'STAGE3_WEIGHT_STAGE0_RISK',
+                'analysis_mode': 'ANALYSIS_MODE',
             }
             for src, dst in alias_map.items():
                 if src in config:
@@ -857,6 +872,225 @@ class KeyframeSelector:
 
         return candidates
 
+    @staticmethod
+    def _lookup_stage0_metrics(
+        frame_idx: int,
+        stage0_metrics: Dict[int, Dict[str, float]],
+    ) -> Dict[str, float]:
+        if not stage0_metrics:
+            return {"flow_mag_light": 0.0, "ssim_light": 1.0, "motion_risk": 0.0}
+        if frame_idx in stage0_metrics:
+            return stage0_metrics[frame_idx]
+        keys = sorted(stage0_metrics.keys())
+        pos = int(np.searchsorted(keys, frame_idx))
+        nearest = keys[max(0, min(len(keys) - 1, pos))]
+        if pos > 0 and pos < len(keys):
+            left = keys[pos - 1]
+            right = keys[pos]
+            nearest = left if abs(frame_idx - left) <= abs(frame_idx - right) else right
+        return stage0_metrics.get(nearest, {"flow_mag_light": 0.0, "ssim_light": 1.0, "motion_risk": 0.0})
+
+    def _stage0_lightweight_motion_scan(
+        self,
+        video_loader,
+        metadata: VideoMetadata,
+        progress_callback: Optional[Callable[[int, int], None]],
+    ) -> Dict[int, Dict[str, float]]:
+        total_frames = max(0, int(metadata.frame_count))
+        stride = max(1, int(self.config.get('STAGE0_STRIDE', 5)))
+        frame_indices = list(range(0, total_frames, stride))
+        if not frame_indices:
+            return {}
+
+        is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
+        use_rig = bool(is_paired and self.config.get('ENABLE_RIG_STITCHING', True))
+        out_w = int(self.config.get('EQUIRECT_WIDTH', 4096))
+        out_h = int(self.config.get('EQUIRECT_HEIGHT', 2048))
+        calibration = getattr(metadata, 'rig_calibration', None)
+        lap_th = max(1.0, float(self.config.get('LAPLACIAN_THRESHOLD', 100.0)))
+        flow_norm_factor = max(1e-6, float(self.normalization.OPTICAL_FLOW_NORM_FACTOR))
+
+        metrics: Dict[int, Dict[str, float]] = {}
+        prev_frame = None
+
+        for idx, frame_idx in enumerate(frame_indices):
+            if is_paired:
+                frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
+                if frame_a is None or frame_b is None:
+                    continue
+                if use_rig:
+                    frame_cur, _ = self.rig_processor.stitch_to_equirect(
+                        frame_a, frame_b, calibration, (out_w, out_h)
+                    )
+                else:
+                    frame_cur = frame_a
+            else:
+                frame_cur = video_loader.get_frame(frame_idx)
+                if frame_cur is None:
+                    continue
+
+            if prev_frame is None:
+                flow_mag = 0.0
+                ssim_light = 1.0
+            else:
+                flow_mag = float(self.adaptive_selector.compute_optical_flow_magnitude(prev_frame, frame_cur))
+                ssim_light = float(self.adaptive_selector.compute_ssim(prev_frame, frame_cur))
+
+            sharpness = float(self.quality_evaluator.evaluate(
+                frame_cur,
+                beta=float(self.config.get('SOFTMAX_BETA', 5.0))
+            ).get("sharpness", 0.0))
+            texture_risk = float(np.clip(1.0 - min(sharpness / lap_th, 1.0), 0.0, 1.0))
+            flow_risk = float(np.clip(flow_mag / flow_norm_factor, 0.0, 1.0))
+            ssim_change = float(np.clip(1.0 - ssim_light, 0.0, 1.0))
+            motion_risk = float(np.clip(0.4 * texture_risk + 0.4 * flow_risk + 0.2 * ssim_change, 0.0, 1.0))
+
+            metrics[int(frame_idx)] = {
+                "flow_mag_light": flow_mag,
+                "ssim_light": ssim_light,
+                "motion_risk": motion_risk,
+            }
+            prev_frame = frame_cur
+
+            if progress_callback:
+                progress_callback(idx + 1, len(frame_indices))
+
+        return metrics
+
+    def _stage3_refine_with_trajectory(
+        self,
+        metadata: VideoMetadata,
+        stage2_candidates: List[KeyframeInfo],
+        stage2_final: List[KeyframeInfo],
+        stage2_records: List[Stage2FrameRecord],
+        stage0_metrics: Dict[int, Dict[str, float]],
+        video_loader=None,
+    ) -> List[KeyframeInfo]:
+        if not stage2_candidates:
+            return stage2_candidates
+
+        if video_loader is None:
+            logger.warning("Stage3をスキップ: video_loaderが未指定")
+            return stage2_candidates
+
+        tracked_set = {int(kf.frame_index) for kf in stage2_candidates}
+        tracked_set.update(int(kf.frame_index) for kf in stage2_final)
+        tracked_indices = sorted(tracked_set)
+        if len(tracked_indices) < 2:
+            for kf in stage2_candidates:
+                base = float(kf.combined_score)
+                risk = float(np.clip(self._lookup_stage0_metrics(kf.frame_index, stage0_metrics).get("motion_risk", 0.0), 0.0, 1.0))
+                kf.stage3_scores = {
+                    "trajectory_consistency": 0.5,
+                    "stage0_motion_risk": risk,
+                    "combined_stage2": base,
+                    "combined_stage3": base,
+                }
+            return stage2_candidates
+
+        is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
+        use_rig = bool(is_paired and self.config.get('ENABLE_RIG_STITCHING', True))
+        out_w = int(self.config.get('EQUIRECT_WIDTH', 4096))
+        out_h = int(self.config.get('EQUIRECT_HEIGHT', 2048))
+        calibration = getattr(metadata, 'rig_calibration', None)
+        flow_norm_factor = max(1e-6, float(self.normalization.OPTICAL_FLOW_NORM_FACTOR))
+        match_norm_factor = max(1e-6, float(self.normalization.FEATURE_MATCH_NORM_FACTOR))
+
+        frame_cache: Dict[int, Optional[np.ndarray]] = {}
+
+        def _get_eval_frame(frame_idx: int) -> Optional[np.ndarray]:
+            if frame_idx in frame_cache:
+                return frame_cache[frame_idx]
+            if is_paired:
+                frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
+                if frame_a is None or frame_b is None:
+                    frame_cache[frame_idx] = None
+                    return None
+                if use_rig:
+                    stitched, _ = self.rig_processor.stitch_to_equirect(
+                        frame_a, frame_b, calibration, (out_w, out_h)
+                    )
+                    frame_cache[frame_idx] = stitched
+                else:
+                    frame_cache[frame_idx] = frame_a
+                return frame_cache[frame_idx]
+            frame = video_loader.get_frame(frame_idx)
+            frame_cache[frame_idx] = frame
+            return frame
+
+        trajectory_consistency: Dict[int, float] = {tracked_indices[0]: 0.5}
+        prev_flow_norm = None
+        for i in range(1, len(tracked_indices)):
+            prev_idx = tracked_indices[i - 1]
+            cur_idx = tracked_indices[i]
+            prev_frame = _get_eval_frame(prev_idx)
+            cur_frame = _get_eval_frame(cur_idx)
+            if prev_frame is None or cur_frame is None:
+                trajectory_consistency[cur_idx] = 0.0
+                prev_flow_norm = None
+                continue
+
+            try:
+                g_scores = self.geometric_evaluator.evaluate(
+                    prev_frame, cur_frame, frame1_idx=prev_idx, frame2_idx=cur_idx
+                )
+                gric = float(g_scores.get('gric', 0.0))
+                match_norm = float(np.clip(
+                    float(g_scores.get('feature_match_count', 0.0)) / match_norm_factor,
+                    0.0, 1.0
+                ))
+            except Exception:
+                gric = 0.0
+                match_norm = 0.0
+
+            a_scores = self.adaptive_selector.evaluate(prev_frame, cur_frame, frames_window=[prev_frame, cur_frame])
+            ssim = float(a_scores.get('ssim', 1.0))
+            flow = float(a_scores.get('optical_flow', 0.0))
+            flow_norm = float(np.clip(flow / flow_norm_factor, 0.0, 1.0))
+            if prev_flow_norm is None:
+                smooth_score = 0.5
+            else:
+                smooth_score = float(np.clip(1.0 - abs(flow_norm - prev_flow_norm), 0.0, 1.0))
+            prev_flow_norm = flow_norm
+
+            # しきい値近傍のSSIMは連続性が高いとみなす
+            ssim_centered = float(np.clip(1.0 - abs(ssim - 0.85) / 0.85, 0.0, 1.0))
+            consistency = float(np.clip(
+                0.40 * gric + 0.30 * match_norm + 0.20 * ssim_centered + 0.10 * smooth_score,
+                0.0, 1.0,
+            ))
+            trajectory_consistency[cur_idx] = consistency
+
+        w_base = float(self.config.get('STAGE3_WEIGHT_BASE', 0.70))
+        w_traj = float(self.config.get('STAGE3_WEIGHT_TRAJECTORY', 0.25))
+        w_risk = float(self.config.get('STAGE3_WEIGHT_STAGE0_RISK', 0.05))
+
+        record_map = {int(r.frame_index): r for r in stage2_records}
+        for kf in stage2_candidates:
+            base_score = float(kf.combined_score)
+            traj = float(np.clip(trajectory_consistency.get(int(kf.frame_index), 0.5), 0.0, 1.0))
+            risk = float(np.clip(
+                self._lookup_stage0_metrics(int(kf.frame_index), stage0_metrics).get("motion_risk", 0.0),
+                0.0, 1.0
+            ))
+            combined_stage3 = float(np.clip(w_base * base_score + w_traj * traj - w_risk * risk, 0.0, 1.0))
+            kf.stage3_scores = {
+                "trajectory_consistency": traj,
+                "stage0_motion_risk": risk,
+                "combined_stage2": base_score,
+                "combined_stage3": combined_stage3,
+            }
+            kf.combined_score = combined_stage3
+
+            record = record_map.get(int(kf.frame_index))
+            if record is not None:
+                record.metrics["trajectory_consistency"] = traj
+                record.metrics["combined_stage2"] = base_score
+                record.metrics["combined_stage3"] = combined_stage3
+                record.metrics["stage0_motion_risk"] = risk
+
+        return stage2_candidates
+
     def select_keyframes(
         self,
         video_loader,
@@ -909,8 +1143,51 @@ class KeyframeSelector:
 
         total_frames = metadata.frame_count
         logger.info(f"キーフレーム選択開始: {total_frames}フレーム")
+        run_id = str(self.config.get("ANALYSIS_RUN_ID", self.config.get("analysis_run_id", "n/a")))
+        analysis_mode = str(
+            self.config.get("ANALYSIS_MODE", self.config.get("analysis_mode", "full"))
+        ).strip().lower()
+        logger.info(f"解析モード: {analysis_mode}")
+
+        def _stage_start(stage: str, **kwargs):
+            extra = ",".join([f" {k}={v}" for k, v in kwargs.items()])
+            logger.info(f"stage_start, analysis_run_id={run_id}, stage={stage},{extra}".rstrip(","))
+
+        def _stage_summary(stage: str, **kwargs):
+            extra = ",".join([f" {k}={v}" for k, v in kwargs.items()])
+            logger.info(f"stage_summary, analysis_run_id={run_id}, stage={stage},{extra}".rstrip(","))
+
+        mode_enable_stage0 = bool(self.config.get('ENABLE_STAGE0_SCAN', True))
+        mode_enable_stage3 = bool(self.config.get('ENABLE_STAGE3_REFINEMENT', True))
+        if analysis_mode == "stage0":
+            mode_enable_stage0 = True
+            mode_enable_stage3 = False
+        elif analysis_mode == "stage2":
+            mode_enable_stage3 = False
+        elif analysis_mode == "stage3":
+            mode_enable_stage0 = True
+            mode_enable_stage3 = True
+
+        # ===== Stage 0: 軽量走査 =====
+        stage0_metrics: Dict[int, Dict[str, float]] = {}
+        if mode_enable_stage0:
+            _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
+            logger.info("Stage 0: 軽量運動量走査開始")
+            stage0_metrics = self._stage0_lightweight_motion_scan(
+                video_loader, metadata, progress_callback
+            )
+            logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
+            _stage_summary("0", samples=len(stage0_metrics))
+        if analysis_mode == "stage0":
+            logger.info("Stage 0モードのため Stage1/2/3 をスキップ")
+            logger.info(
+                f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
+                " keyframes=0, note=stage0_only"
+            )
+            return []
 
         # ===== Stage 1: 高速フィルタリング =====
+        _stage_start("1", total_frames=total_frames)
         logger.info("Stage 1: 高速品質フィルタリング開始")
         stage1_candidates = self._stage1_fast_filter(
             video_loader, metadata, progress_callback
@@ -919,32 +1196,65 @@ class KeyframeSelector:
             f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
             f"({100*len(stage1_candidates)/max(total_frames, 1):.1f}%)"
         )
+        _stage_summary(
+            "1",
+            passed=len(stage1_candidates),
+            total=total_frames,
+            pass_ratio=f"{100*len(stage1_candidates)/max(total_frames, 1):.2f}",
+        )
 
         if not stage1_candidates:
             logger.warning("Stage 1でフレームが残りませんでした")
+            logger.info(
+                f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
+                " keyframes=0, note=stage1_empty"
+            )
             return []
 
         # ===== Stage 2: 精密評価 =====
+        _stage_start("2", candidates=len(stage1_candidates))
         logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
         stage2_candidates, stage2_records = self._stage2_precise_evaluation(
-            video_loader, metadata, stage1_candidates, progress_callback, frame_log_callback
+            video_loader, metadata, stage1_candidates, progress_callback, frame_log_callback, stage0_metrics
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
+        _stage_summary("2", candidates=len(stage2_candidates), records=len(stage2_records))
 
         # 停止区間に対するソフト抑制を適用
         stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
 
-        # 非最大値抑制を適用
-        keyframes = self._apply_nms(stage2_candidates)
+        # Stage2の従来最終（Stage3入力用）
+        stage2_keyframes_pre_stage3 = self._enforce_max_interval(
+            self._apply_nms(stage2_candidates),
+            metadata.fps,
+        )
 
-        # 最大間隔制約を適用
-        keyframes = self._enforce_max_interval(keyframes, metadata.fps)
+        # ===== Stage 3: 軌跡再評価 =====
+        keyframes = stage2_keyframes_pre_stage3
+        if mode_enable_stage3:
+            _stage_start("3", input_candidates=len(stage2_candidates))
+            logger.info("Stage 3: 軌跡再評価開始")
+            stage2_candidates = self._stage3_refine_with_trajectory(
+                metadata=metadata,
+                stage2_candidates=stage2_candidates,
+                stage2_final=stage2_keyframes_pre_stage3,
+                stage2_records=stage2_records,
+                stage0_metrics=stage0_metrics,
+                video_loader=video_loader,
+            )
+            keyframes = self._enforce_max_interval(
+                self._apply_nms(stage2_candidates),
+                metadata.fps,
+            )
+            logger.info(f"Stage 3完了: {len(keyframes)}個")
+            _stage_summary("3", keyframes=len(keyframes))
 
         if frame_log_callback:
             selected_idx = {kf.frame_index for kf in keyframes}
             for record in stage2_records:
                 record.is_keyframe = record.frame_index in selected_idx
                 record.metrics["keyframe_flag"] = 1.0 if record.is_keyframe else 0.0
+                record.metrics["stage3_selected_flag"] = 1.0 if record.is_keyframe else 0.0
                 self._emit_frame_log(
                     frame_log_callback,
                     {
@@ -962,6 +1272,11 @@ class KeyframeSelector:
                 )
 
         logger.info(f"最終キーフレーム数: {len(keyframes)}個")
+        mean_score = float(np.mean([kf.combined_score for kf in keyframes])) if keyframes else 0.0
+        logger.info(
+            f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
+            f" keyframes={len(keyframes)}, mean_score={mean_score:.4f}"
+        )
 
         return keyframes
 
@@ -1100,6 +1415,7 @@ class KeyframeSelector:
         stage1_candidates: List[Dict],
         progress_callback: Optional[Callable[[int, int], None]],
         frame_log_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        stage0_metrics: Optional[Dict[int, Dict[str, float]]] = None,
     ) -> Tuple[List[KeyframeInfo], List[Stage2FrameRecord]]:
         """
         Stage 2: 精密評価（候補フレームのみ）
@@ -1158,6 +1474,7 @@ class KeyframeSelector:
             a_scores: Dict[str, float],
             combined: float,
             is_keyframe_flag: float = 0.0,
+            stage0_motion_risk: float = 0.0,
         ) -> Dict[str, float]:
             ssim = float(a_scores.get("ssim", 1.0))
             flow_mag = float(a_scores.get("optical_flow", 0.0))
@@ -1176,6 +1493,11 @@ class KeyframeSelector:
                 "is_stationary": 0.0,
                 "stationary_confidence": 0.0,
                 "stationary_penalty_applied": 0.0,
+                "stage0_motion_risk": float(np.clip(stage0_motion_risk, 0.0, 1.0)),
+                "trajectory_consistency": 0.5,
+                "combined_stage2": float(combined),
+                "combined_stage3": float(combined),
+                "stage3_selected_flag": 0.0,
             }
 
         def _append_record(
@@ -1207,6 +1529,8 @@ class KeyframeSelector:
             for idx, candidate_info in enumerate(stage1_candidates):
                 frame_idx = candidate_info['frame_idx']
                 quality_scores = candidate_info['quality_scores']
+                stage0_entry = self._lookup_stage0_metrics(frame_idx, stage0_metrics or {})
+                stage0_motion_risk = float(np.clip(stage0_entry.get("motion_risk", 0.0), 0.0, 1.0))
 
                 if progress_callback:
                     progress_callback(idx, len(stage1_candidates))
@@ -1258,7 +1582,10 @@ class KeyframeSelector:
 
                 if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
                     combined = float(self._compute_combined_score(quality_scores, {}, {}))
-                    metrics = _build_metrics(quality_scores, geometric_scores, adaptive_scores, combined, is_keyframe_flag=0.0)
+                    metrics = _build_metrics(
+                        quality_scores, geometric_scores, adaptive_scores, combined,
+                        is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk
+                    )
                     _append_record(
                         frame_idx=frame_idx,
                         frame_img=current_frame,
@@ -1360,7 +1687,10 @@ class KeyframeSelector:
                             force_insert = True
                         else:
                             combined = float(self._compute_combined_score(quality_scores, {}, {}))
-                            metrics = _build_metrics(quality_scores, geometric_scores, adaptive_scores, combined, is_keyframe_flag=0.0)
+                            metrics = _build_metrics(
+                                quality_scores, geometric_scores, adaptive_scores, combined,
+                                is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk
+                            )
                             _append_record(
                                 frame_idx=frame_idx,
                                 frame_img=current_frame,
@@ -1397,7 +1727,10 @@ class KeyframeSelector:
                     ssim = adaptive_scores.get('ssim', 1.0)
                     if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and not force_insert and not exposure_changed:
                         combined = float(self._compute_combined_score(quality_scores, geometric_scores, adaptive_scores))
-                        metrics = _build_metrics(quality_scores, geometric_scores, adaptive_scores, combined, is_keyframe_flag=0.0)
+                        metrics = _build_metrics(
+                            quality_scores, geometric_scores, adaptive_scores, combined,
+                            is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk
+                        )
                         _append_record(
                             frame_idx=frame_idx,
                             frame_img=current_frame,
@@ -1450,6 +1783,7 @@ class KeyframeSelector:
                     adaptive_scores,
                     float(combined_score),
                     is_keyframe_flag=1.0 if is_selected else 0.0,
+                    stage0_motion_risk=stage0_motion_risk,
                 )
                 _append_record(
                     frame_idx=frame_idx,

@@ -10,11 +10,12 @@
 機能:
   - ドラッグ＆ドロップでの動画読み込み
   - メニューバー: ファイル(F), 表示(V)
-  - Stage 1 / Stage 2 分離解析
+  - 単一解析実行（Stage0→1→2→3）
   - Live Preview (パラメータ変更 → 判定再実行)
 """
 
 import json
+import uuid
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -33,8 +34,9 @@ from gui.trajectory_widget import TrajectoryWidget
 from gui.settings_panel import SettingsPanel
 from gui.settings_dialog import SettingsDialog
 from gui.keyframe_panel import KeyframePanel
+from gui.log_panel import LogPanel
 from gui.export_dialog import ExportDialog
-from gui.workers import Stage1Worker, Stage2Worker, FullAnalysisWorker, ExportWorker, FrameScoreData
+from gui.workers import UnifiedAnalysisWorker, ExportWorker, FrameScoreData
 
 from config import KeyframeConfig, NormalizationConfig
 
@@ -58,12 +60,12 @@ class MainWindow(QMainWindow):
         # 状態
         self.video_path: Optional[str] = None
         self._stage1_scores: List[FrameScoreData] = []
-        self._stage1_worker: Optional[Stage1Worker] = None
-        self._stage2_worker: Optional[Stage2Worker] = None
-        self._full_worker: Optional[FullAnalysisWorker] = None
+        self._analysis_worker: Optional[UnifiedAnalysisWorker] = None
         self._export_worker: Optional[ExportWorker] = None
         self._analysis_masks: Dict[int, object] = {}
         self._trajectory_left: bool = False
+        self._active_stage_mode_label: str = "解析"
+        self._analysis_run_id: Optional[str] = None
 
         # ステレオ（OSV）対応
         self.is_stereo: bool = False
@@ -132,7 +134,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self._progress_label)
 
     def _setup_dock(self):
-        """右側ドック: 設定パネル + キーフレーム一覧 (タブ切り替え)"""
+        """右側ドック: 設定パネル + キーフレーム一覧 + 解析ログ (タブ切り替え)"""
         dock = QDockWidget("パネル", self)
         dock.setMinimumWidth(300)
         dock.setFeatures(
@@ -149,6 +151,10 @@ class MainWindow(QMainWindow):
         self.keyframe_list = KeyframePanel()
         tab_widget.addTab(self.keyframe_list, "📋 キーフレーム")
 
+        # タブ 3: 解析ログ
+        self.log_panel = LogPanel()
+        tab_widget.addTab(self.log_panel, "🧾 解析ログ")
+
         dock.setWidget(tab_widget)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
@@ -160,14 +166,14 @@ class MainWindow(QMainWindow):
 
         open_action = QAction("開く(&O)...", self)
         open_action.setShortcut(QKeySequence.Open)
-        open_action.triggered.connect(self.open_video)
+        open_action.triggered.connect(lambda: self.open_video())
         file_menu.addAction(open_action)
 
         file_menu.addSeparator()
 
         export_action = QAction("キーフレームをエクスポート(&E)...", self)
         export_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
-        export_action.triggered.connect(self.export_keyframes)
+        export_action.triggered.connect(lambda: self.export_keyframes())
         file_menu.addAction(export_action)
 
         file_menu.addSeparator()
@@ -207,23 +213,10 @@ class MainWindow(QMainWindow):
 
         # 解析(A)
         analysis_menu = menubar.addMenu("解析(&A)")
-
-        stage1_action = QAction("簡易解析 (Stage 1)(&1)", self)
-        stage1_action.setShortcut(QKeySequence("Ctrl+1"))
-        stage1_action.triggered.connect(self._run_stage1)
-        analysis_menu.addAction(stage1_action)
-
-        stage2_action = QAction("詳細解析 (Stage 2)(&2)", self)
-        stage2_action.setShortcut(QKeySequence("Ctrl+2"))
-        stage2_action.triggered.connect(self._run_stage2)
-        analysis_menu.addAction(stage2_action)
-
-        analysis_menu.addSeparator()
-
-        full_action = QAction("フル解析 (Stage 1+2)(&R)", self)
-        full_action.setShortcut(QKeySequence("Ctrl+R"))
-        full_action.triggered.connect(self._run_full_analysis)
-        analysis_menu.addAction(full_action)
+        run_action = QAction("解析実行(&R)", self)
+        run_action.setShortcut(QKeySequence("Ctrl+R"))
+        run_action.triggered.connect(lambda: self._run_analysis(trigger_source="menu:run"))
+        analysis_menu.addAction(run_action)
 
     def _setup_toolbar(self):
         tb = self.addToolBar("メイン")
@@ -231,9 +224,7 @@ class MainWindow(QMainWindow):
 
         tb.addAction("📂 開く", self.open_video)
         tb.addSeparator()
-        tb.addAction("⚡ 簡易解析", self._run_stage1)
-        tb.addAction("🔬 詳細解析", self._run_stage2)
-        tb.addAction("🚀 フル解析", self._run_full_analysis)
+        tb.addAction("🚀 解析実行", lambda: self._run_analysis(trigger_source="toolbar:run"))
         tb.addSeparator()
         tb.addAction("💾 エクスポート", self.export_keyframes)
 
@@ -277,8 +268,28 @@ class MainWindow(QMainWindow):
 
         # 設定パネル → Live Preview
         self.settings_panel.setting_changed.connect(self._on_live_preview)
-        self.settings_panel.run_stage2_requested.connect(self._run_stage2)
+        self.settings_panel.run_analysis_requested.connect(
+            lambda: self._run_analysis(trigger_source="settings_panel:run_analysis")
+        )
+        self.settings_panel.run_stage2_requested.connect(
+            lambda: self._run_analysis(trigger_source="settings_panel:run_stage2_legacy")
+        )
         self.settings_panel.open_settings_requested.connect(self._open_settings_dialog)
+
+    def _log_analysis_request(self, trigger_source: str, stage_mode_label: str, config: Dict, overrides: Dict):
+        run_id = str(config.get("analysis_run_id", "n/a"))
+        logger.info(
+            "analysis_request,"
+            f" analysis_run_id={run_id},"
+            f" trigger={trigger_source},"
+            f" stage_mode={stage_mode_label},"
+            f" has_stage1_scores={bool(self._stage1_scores)},"
+            f" stage1_scores_count={len(self._stage1_scores)},"
+            f" overrides={json.dumps(overrides, ensure_ascii=False, sort_keys=True)},"
+            f" enable_stage0_scan={bool(config.get('enable_stage0_scan', config.get('ENABLE_STAGE0_SCAN', True)))},"
+            f" enable_stage3_refinement={bool(config.get('enable_stage3_refinement', config.get('ENABLE_STAGE3_REFINEMENT', True)))},"
+            f" stage0_stride={int(config.get('stage0_stride', config.get('STAGE0_STRIDE', 5)))}"
+        )
 
     # ==================================================================
     # ドラッグ＆ドロップ
@@ -402,10 +413,10 @@ class MainWindow(QMainWindow):
             logger.info("設定パネルを再読み込みしました")
 
     # ==================================================================
-    # Stage 1: 簡易解析
+    # 解析実行（Stage0->1->2->3）
     # ==================================================================
 
-    def _run_stage1(self):
+    def _run_analysis(self, trigger_source: str = "unknown"):
         if not self.video_path:
             QMessageBox.warning(self, "警告", "ビデオを先に開いてください")
             return
@@ -415,16 +426,35 @@ class MainWindow(QMainWindow):
         self._analysis_masks.clear()
 
         config = self.settings_panel.get_selector_dict()
-        self._stage1_worker = Stage1Worker(self.video_path, config=config)
-        self._stage1_worker.progress.connect(self._on_progress)
-        self._stage1_worker.frame_scores.connect(self._on_stage1_batch)
-        self._stage1_worker.finished_scores.connect(self._on_stage1_finished)
-        self._stage1_worker.error.connect(self._on_error)
+        # GUI統合モードでは常に Stage0->1->2->3 を実行する
+        config["enable_stage0_scan"] = True
+        config["ENABLE_STAGE0_SCAN"] = True
+        config["enable_stage3_refinement"] = True
+        config["ENABLE_STAGE3_REFINEMENT"] = True
+        self._analysis_run_id = str(uuid.uuid4())
+        config["analysis_mode"] = "full"
+        config["analysis_run_id"] = self._analysis_run_id
+        config["ANALYSIS_RUN_ID"] = self._analysis_run_id
+        self._log_analysis_request(
+            trigger_source=trigger_source,
+            stage_mode_label="Unified(Stage0->1->2->3)",
+            config=config,
+            overrides={},
+        )
+        self._active_stage_mode_label = "解析"
+        self._analysis_worker = UnifiedAnalysisWorker(self.video_path, config=config)
+        self._analysis_worker.progress.connect(self._on_progress)
+        self._analysis_worker.stage1_batch.connect(self._on_stage1_batch)
+        self._analysis_worker.stage1_finished.connect(self._on_stage1_finished)
+        self._analysis_worker.frame_scores_updated.connect(self._on_scores_updated)
+        self._analysis_worker.keyframes_found.connect(self._on_keyframes_found)
+        self._analysis_worker.analysis_finished.connect(self._on_analysis_finished)
+        self._analysis_worker.error.connect(self._on_error)
 
         self._progress_bar.setVisible(True)
         self._progress_bar.setValue(0)
-        self.statusBar().showMessage("Stage 1: 品質スキャン中...")
-        self._stage1_worker.start()
+        self.statusBar().showMessage("解析実行中... (Stage0→1→2→3)")
+        self._analysis_worker.start()
 
     def _on_stage1_batch(self, batch: list):
         """Stage 1 バッチ結果をプログレッシブにグラフ追加"""
@@ -437,7 +467,9 @@ class MainWindow(QMainWindow):
     def _on_stage1_finished(self, all_scores: list):
         """Stage 1 完了"""
         self._stage1_scores = all_scores
-        self._progress_bar.setVisible(False)
+        # 統合解析中は Stage1 は中間段なのでプログレスバーを維持
+        if not (self._analysis_worker and self._analysis_worker.isRunning()):
+            self._progress_bar.setVisible(False)
 
         # 全データでグラフを更新
         norm_factor = 1000.0
@@ -449,38 +481,11 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(
             f"Stage 1 完了: {len(all_scores)} フレームをスキャン。"
-            "「詳細解析」で GRIC/SSIM を計算できます。"
+            "同一実行内で Stage2/3 に進みます。"
         )
-
-    # ==================================================================
-    # Stage 2: 詳細解析
-    # ==================================================================
-
-    def _run_stage2(self):
-        if not self.video_path:
-            QMessageBox.warning(self, "警告", "ビデオを先に開いてください")
-            return
-
-        self._stop_workers()
-        self._analysis_masks.clear()
-
-        config = self.settings_panel.get_selector_dict()
-        self._stage2_worker = Stage2Worker(
-            self.video_path, self._stage1_scores, config=config
-        )
-        self._stage2_worker.progress.connect(self._on_progress)
-        self._stage2_worker.keyframes_found.connect(self._on_keyframes_found)
-        self._stage2_worker.frame_scores_updated.connect(self._on_scores_updated)
-        self._stage2_worker.analysis_finished.connect(self._on_stage2_finished)
-        self._stage2_worker.error.connect(self._on_error)
-
-        self._progress_bar.setVisible(True)
-        self._progress_bar.setValue(0)
-        self.statusBar().showMessage("Stage 2: 精密評価中...")
-        self._stage2_worker.start()
 
     def _on_scores_updated(self, updated: list):
-        """Stage 2 でGRIC/SSIM付きスコア更新"""
+        """解析でGRIC/SSIM付きスコア更新"""
         self._stage1_scores = updated
         norm_factor = 1000.0
         indices = [s.frame_index for s in updated]
@@ -500,42 +505,15 @@ class MainWindow(QMainWindow):
         self.timeline.set_stationary_ranges(self._extract_stationary_ranges(updated))
         self.trajectory.set_frame_data(updated, self.keyframe_list.keyframe_frames)
 
-    def _on_stage2_finished(self):
+    def _on_analysis_finished(self):
         self._progress_bar.setVisible(False)
         n = len(self.keyframe_list.keyframe_frames)
-        self.statusBar().showMessage(f"Stage 2 完了: {n} キーフレーム検出")
-
-    # ==================================================================
-    # フル解析 (Stage 1 + 2)
-    # ==================================================================
-
-    def _run_full_analysis(self):
-        if not self.video_path:
-            QMessageBox.warning(self, "警告", "ビデオを先に開いてください")
-            return
-
-        self._stop_workers()
-        self._stage1_scores.clear()
-        self._analysis_masks.clear()
-
-        config = self.settings_panel.get_selector_dict()
-        self._full_worker = FullAnalysisWorker(self.video_path, config=config)
-        self._full_worker.progress.connect(self._on_progress)
-        self._full_worker.stage1_batch.connect(self._on_stage1_batch)
-        self._full_worker.stage1_finished.connect(self._on_stage1_finished)
-        self._full_worker.frame_scores_updated.connect(self._on_scores_updated)
-        self._full_worker.keyframes_found.connect(self._on_keyframes_found)
-        self._full_worker.analysis_finished.connect(self._on_full_finished)
-        self._full_worker.error.connect(self._on_error)
-
-        self._progress_bar.setVisible(True)
-        self._progress_bar.setValue(0)
-        self.statusBar().showMessage("フル解析開始 (Stage 1 + 2)...")
-        self._full_worker.start()
-
-    def _on_full_finished(self):
-        self._progress_bar.setVisible(False)
-        n = len(self.keyframe_list.keyframe_frames)
+        logger.info(
+            "analysis_finished,"
+            f" analysis_run_id={self._analysis_run_id or 'n/a'},"
+            f" stage_mode={self._active_stage_mode_label},"
+            f" keyframes={n}"
+        )
         self.statusBar().showMessage(f"解析完了: {n} キーフレーム検出")
         QMessageBox.information(self, "完了", f"解析完了: {n} キーフレームを検出しました")
 
@@ -547,6 +525,8 @@ class MainWindow(QMainWindow):
         pct = int(current / max(total, 1) * 100)
         self._progress_bar.setValue(pct)
         self._progress_label.setText(message)
+        if message:
+            self.statusBar().showMessage(message)
 
     def _on_keyframes_found(self, keyframes):
         """キーフレーム検出結果を全ウィジェットに反映"""
@@ -753,7 +733,7 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _stop_workers(self):
-        for w in [self._stage1_worker, self._stage2_worker, self._full_worker, self._export_worker]:
+        for w in [self._analysis_worker, self._export_worker]:
             if w and w.isRunning():
                 w.stop()
                 w.wait(3000)

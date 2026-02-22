@@ -137,6 +137,12 @@ class KeyframeConfig:
     stage1_batch_size: int = 32        # Stage 1 バッチサイズ
     thumbnail_size: Tuple[int, int] = (192, 108)
     enable_rerun_logging: bool = False  # GUI実行時のRerunログ有効化
+    enable_stage0_scan: bool = True
+    stage0_stride: int = 5
+    enable_stage3_refinement: bool = True
+    stage3_weight_base: float = 0.70
+    stage3_weight_trajectory: float = 0.25
+    stage3_weight_stage0_risk: float = 0.05
 
     def to_selector_dict(self) -> dict:
         """
@@ -206,6 +212,12 @@ class KeyframeConfig:
             'SAMPLE_INTERVAL': self.sample_interval,
             'STAGE1_BATCH_SIZE': self.stage1_batch_size,
             'enable_rerun_logging': self.enable_rerun_logging,
+            'ENABLE_STAGE0_SCAN': self.enable_stage0_scan,
+            'STAGE0_STRIDE': self.stage0_stride,
+            'ENABLE_STAGE3_REFINEMENT': self.enable_stage3_refinement,
+            'STAGE3_WEIGHT_BASE': self.stage3_weight_base,
+            'STAGE3_WEIGHT_TRAJECTORY': self.stage3_weight_trajectory,
+            'STAGE3_WEIGHT_STAGE0_RISK': self.stage3_weight_stage0_risk,
         }
 
     @classmethod
@@ -350,6 +362,12 @@ class KeyframeConfig:
         config.equirect360.detection_device = d.get('detection_device', config.equirect360.detection_device)
         # Rerun
         config.enable_rerun_logging = bool(d.get('enable_rerun_logging', config.enable_rerun_logging))
+        config.enable_stage0_scan = bool(d.get('enable_stage0_scan', config.enable_stage0_scan))
+        config.stage0_stride = int(d.get('stage0_stride', config.stage0_stride))
+        config.enable_stage3_refinement = bool(d.get('enable_stage3_refinement', config.enable_stage3_refinement))
+        config.stage3_weight_base = float(d.get('stage3_weight_base', config.stage3_weight_base))
+        config.stage3_weight_trajectory = float(d.get('stage3_weight_trajectory', config.stage3_weight_trajectory))
+        config.stage3_weight_stage0_risk = float(d.get('stage3_weight_stage0_risk', config.stage3_weight_stage0_risk))
         return config
 
 

@@ -19,7 +19,10 @@
 import logging
 import logging.handlers
 import sys
+import threading
+import re
 from pathlib import Path
+from datetime import datetime
 
 # アプリケーションのルートロガー名
 ROOT_LOGGER_NAME = '360split'
@@ -82,6 +85,35 @@ class _ColoredShortNameFormatter(ColoredFormatter):
 
 # ---- 初期化済みフラグ ----
 _initialized = False
+_gui_log_entries = []
+_gui_log_lock = threading.Lock()
+_gui_buffer_handler = None
+_GUI_BUFFER_MAX = 10000
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class _GuiBufferHandler(logging.Handler):
+    """GUI表示向けにログをメモリバッファへ蓄積するハンドラ。"""
+
+    def __init__(self, level=logging.INFO):
+        super().__init__(level=level)
+
+    def emit(self, record):
+        try:
+            entry = {
+                "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S"),
+                "level": logging.getLevelName(record.levelno),
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            with _gui_log_lock:
+                _gui_log_entries.append(entry)
+                if len(_gui_log_entries) > _GUI_BUFFER_MAX:
+                    overflow = len(_gui_log_entries) - _GUI_BUFFER_MAX
+                    del _gui_log_entries[:overflow]
+        except Exception:
+            # GUIバッファ書き込み失敗はメインロギングへ影響させない
+            return
 
 
 def setup_logger(name=ROOT_LOGGER_NAME, level=logging.INFO,
@@ -162,6 +194,12 @@ def setup_logger(name=ROOT_LOGGER_NAME, level=logging.INFO,
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
+    # ---- GUIメモリバッファハンドラ ----
+    global _gui_buffer_handler
+    if _gui_buffer_handler is None:
+        _gui_buffer_handler = _GuiBufferHandler(level=logging.INFO)
+        logger.addHandler(_gui_buffer_handler)
+
     _initialized = True
     return logger
 
@@ -210,3 +248,46 @@ def set_log_level(level: int) -> None:
         if isinstance(handler, logging.handlers.RotatingFileHandler):
             continue
         handler.setLevel(level)
+
+
+def enable_gui_log_buffer(level: int = logging.INFO) -> None:
+    """GUIログバッファを有効化する。setup_logger後なら重複登録しない。"""
+    root = logging.getLogger(ROOT_LOGGER_NAME)
+    global _gui_buffer_handler
+    if _gui_buffer_handler is None:
+        _gui_buffer_handler = _GuiBufferHandler(level=level)
+        root.addHandler(_gui_buffer_handler)
+    else:
+        _gui_buffer_handler.setLevel(level)
+
+
+def get_gui_log_entries(from_index: int = 0):
+    """
+    GUIバッファのログを取得する。
+
+    Returns:
+    --------
+    tuple(list, int)
+      (entries[from_index:], next_index)
+    """
+    with _gui_log_lock:
+        safe_index = max(0, min(int(from_index), len(_gui_log_entries)))
+        return list(_gui_log_entries[safe_index:]), len(_gui_log_entries)
+
+
+def read_log_tail(max_lines: int = 1000, log_file: Path = None):
+    """ログファイル末尾を行単位で取得する。"""
+    path = Path(log_file) if log_file else DEFAULT_LOG_FILE
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return [line.rstrip("\n") for line in lines[-max(1, int(max_lines)):]]
+    except Exception:
+        return []
+
+
+def strip_ansi(text: str) -> str:
+    """ANSIエスケープを除去する。"""
+    return _ANSI_RE.sub("", text or "")

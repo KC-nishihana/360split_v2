@@ -24,11 +24,13 @@ class SettingsDialog(QDialog):
     """
     設定ダイアログ
 
-    4つのタブで構成：
+    6つのタブで構成：
     1. キーフレーム選択設定（品質重み、適応閾値）
-    2. 360度処理設定（解像度、投影モード）
-    3. マスク処理設定（ナディアマスク、装備検出）
-    4. 出力設定（形式、品質、ディレクトリ）
+    2. Stage0/Stage3設定（軌跡再評価）
+    3. 360度処理設定（解像度、投影モード）
+    4. マスク処理設定（ナディアマスク、装備検出）
+    5. 出力設定（形式、品質、ディレクトリ）
+    6. 対象マスク設定
 
     Attributes:
     -----------
@@ -68,18 +70,22 @@ class SettingsDialog(QDialog):
         tab_widget.addTab(keyframe_tab, "キーフレーム選択")
 
         # Tab 2: 360度処理
+        stage03_tab = self._create_stage03_tab()
+        tab_widget.addTab(stage03_tab, "Stage0/Stage3")
+
+        # Tab 3: 360度処理
         processing_tab = self._create_processing_tab()
         tab_widget.addTab(processing_tab, "360度処理")
 
-        # Tab 3: マスク処理
+        # Tab 4: マスク処理
         mask_tab = self._create_mask_tab()
         tab_widget.addTab(mask_tab, "マスク処理")
 
-        # Tab 4: 出力設定
+        # Tab 5: 出力設定
         output_tab = self._create_output_tab()
         tab_widget.addTab(output_tab, "出力設定")
 
-        # Tab 5: 対象マスク
+        # Tab 6: 対象マスク
         target_mask_tab = self._create_target_mask_tab()
         tab_widget.addTab(target_mask_tab, "対象マスク")
 
@@ -312,6 +318,63 @@ class SettingsDialog(QDialog):
         rerun_group.setLayout(rerun_layout)
         layout.addWidget(rerun_group)
 
+        layout.addStretch()
+        return widget
+
+    def _create_stage03_tab(self) -> QWidget:
+        """Stage0/Stage3 設定タブを作成する。"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        stage03_group = QGroupBox("Stage0/Stage3 軌跡再評価")
+        stage03_layout = QGridLayout()
+
+        self.enable_stage0_scan = QCheckBox("Stage0軽量走査を有効化")
+        self.enable_stage0_scan.setChecked(
+            self.settings.get("enable_stage0_scan", True)
+        )
+        stage03_layout.addWidget(self.enable_stage0_scan, 0, 0, 1, 3)
+
+        stage03_layout.addWidget(QLabel("Stage0サンプリング間隔:"), 1, 0)
+        self.stage0_stride = QSpinBox()
+        self.stage0_stride.setMinimum(1)
+        self.stage0_stride.setMaximum(120)
+        self.stage0_stride.setValue(int(self.settings.get("stage0_stride", 5)))
+        stage03_layout.addWidget(self.stage0_stride, 1, 1)
+
+        self.enable_stage3_refinement = QCheckBox("Stage3軌跡再評価を有効化")
+        self.enable_stage3_refinement.setChecked(
+            self.settings.get("enable_stage3_refinement", True)
+        )
+        stage03_layout.addWidget(self.enable_stage3_refinement, 2, 0, 1, 3)
+
+        stage03_layout.addWidget(QLabel("Stage3 base重み:"), 3, 0)
+        self.stage3_weight_base = QDoubleSpinBox()
+        self.stage3_weight_base.setRange(0.0, 1.0)
+        self.stage3_weight_base.setSingleStep(0.01)
+        self.stage3_weight_base.setDecimals(2)
+        self.stage3_weight_base.setValue(float(self.settings.get("stage3_weight_base", 0.70)))
+        stage03_layout.addWidget(self.stage3_weight_base, 3, 1)
+
+        stage03_layout.addWidget(QLabel("Stage3 trajectory重み:"), 4, 0)
+        self.stage3_weight_trajectory = QDoubleSpinBox()
+        self.stage3_weight_trajectory.setRange(0.0, 1.0)
+        self.stage3_weight_trajectory.setSingleStep(0.01)
+        self.stage3_weight_trajectory.setDecimals(2)
+        self.stage3_weight_trajectory.setValue(float(self.settings.get("stage3_weight_trajectory", 0.25)))
+        stage03_layout.addWidget(self.stage3_weight_trajectory, 4, 1)
+
+        stage03_layout.addWidget(QLabel("Stage3 stage0-risk重み:"), 5, 0)
+        self.stage3_weight_stage0_risk = QDoubleSpinBox()
+        self.stage3_weight_stage0_risk.setRange(0.0, 1.0)
+        self.stage3_weight_stage0_risk.setSingleStep(0.01)
+        self.stage3_weight_stage0_risk.setDecimals(2)
+        self.stage3_weight_stage0_risk.setValue(float(self.settings.get("stage3_weight_stage0_risk", 0.05)))
+        stage03_layout.addWidget(self.stage3_weight_stage0_risk, 5, 1)
+
+        stage03_group.setLayout(stage03_layout)
+        layout.addWidget(stage03_group)
         layout.addStretch()
         return widget
 
@@ -806,6 +869,12 @@ class SettingsDialog(QDialog):
             'dynamic_mask_target_classes': ["人物", "人", "自転車", "バイク", "車両", "動物"],
             'dynamic_mask_inpaint_enabled': False,
             'dynamic_mask_inpaint_module': '',
+            'enable_stage0_scan': True,
+            'stage0_stride': 5,
+            'enable_stage3_refinement': True,
+            'stage3_weight_base': 0.70,
+            'stage3_weight_trajectory': 0.25,
+            'stage3_weight_stage0_risk': 0.05,
         })
 
         try:
@@ -884,6 +953,12 @@ class SettingsDialog(QDialog):
             ],
             'dynamic_mask_inpaint_enabled': self.dynamic_mask_inpaint_enabled.isChecked(),
             'dynamic_mask_inpaint_module': self.dynamic_mask_inpaint_module.currentText().strip(),
+            'enable_stage0_scan': self.enable_stage0_scan.isChecked(),
+            'stage0_stride': self.stage0_stride.value(),
+            'enable_stage3_refinement': self.enable_stage3_refinement.isChecked(),
+            'stage3_weight_base': self.stage3_weight_base.value(),
+            'stage3_weight_trajectory': self.stage3_weight_trajectory.value(),
+            'stage3_weight_stage0_risk': self.stage3_weight_stage0_risk.value(),
         }
 
         try:
@@ -1013,6 +1088,24 @@ class SettingsDialog(QDialog):
             self.fisheye_mask_center_offset_y.setValue(
                 int(params.get('fisheye_mask_center_offset_y', 0))
             )
+            self.enable_stage0_scan.setChecked(
+                params.get('enable_stage0_scan', True)
+            )
+            self.stage0_stride.setValue(
+                int(params.get('stage0_stride', 5))
+            )
+            self.enable_stage3_refinement.setChecked(
+                params.get('enable_stage3_refinement', True)
+            )
+            self.stage3_weight_base.setValue(
+                float(params.get('stage3_weight_base', 0.70))
+            )
+            self.stage3_weight_trajectory.setValue(
+                float(params.get('stage3_weight_trajectory', 0.25))
+            )
+            self.stage3_weight_stage0_risk.setValue(
+                float(params.get('stage3_weight_stage0_risk', 0.05))
+            )
 
             logger.info(f"プリセット '{preset_id}' ({preset_info.name}) を適用しました")
 
@@ -1084,6 +1177,12 @@ class SettingsDialog(QDialog):
             self.dynamic_mask_dilation_size.setValue(5)
             self.dynamic_mask_inpaint_enabled.setChecked(False)
             self.dynamic_mask_inpaint_module.setCurrentText('')
+            self.enable_stage0_scan.setChecked(True)
+            self.stage0_stride.setValue(5)
+            self.enable_stage3_refinement.setChecked(True)
+            self.stage3_weight_base.setValue(0.70)
+            self.stage3_weight_trajectory.setValue(0.25)
+            self.stage3_weight_stage0_risk.setValue(0.05)
 
             QMessageBox.information(self, "完了", "設定をデフォルト値にリセットしました")
 

@@ -101,12 +101,13 @@ class SettingsPanel(QWidget):
     -------
     setting_changed : Signal(dict)
         設定が変更された時に発火。dict は変更後の設定全体。
-    run_stage2_requested : Signal()
-        「詳細解析」ボタンが押された時に発火。
+    run_analysis_requested : Signal()
+        「解析実行」が要求された時に発火（互換のため run_stage2_requested も残す）。
     """
 
     setting_changed = Signal(dict)
-    run_stage2_requested = Signal()
+    run_analysis_requested = Signal()
+    run_stage2_requested = Signal()  # backward compatibility
     open_settings_requested = Signal()
 
     def __init__(self, parent=None):
@@ -273,6 +274,50 @@ class SettingsPanel(QWidget):
 
         layout.addWidget(grp_360)
 
+        # ---------- Stage0 / Stage3 ----------
+        grp_stage03 = QGroupBox("Stage0/Stage3 軌跡再評価")
+        grp_stage03.setStyleSheet(self._group_style())
+        s03 = QVBoxLayout(grp_stage03)
+
+        self._enable_stage0_scan = QCheckBox("Stage0軽量走査を有効化")
+        self._enable_stage0_scan.setChecked(self._config.enable_stage0_scan)
+        self._enable_stage0_scan.toggled.connect(self._on_live_change)
+        s03.addWidget(self._enable_stage0_scan)
+
+        row_stage0_stride = QHBoxLayout()
+        row_stage0_stride.addWidget(QLabel("Stage0サンプリング間隔:"))
+        self._stage0_stride = QSpinBox()
+        self._stage0_stride.setRange(1, 120)
+        self._stage0_stride.setValue(self._config.stage0_stride)
+        self._stage0_stride.valueChanged.connect(self._on_live_change)
+        row_stage0_stride.addWidget(self._stage0_stride)
+        s03.addLayout(row_stage0_stride)
+
+        self._enable_stage3_refinement = QCheckBox("Stage3軌跡再評価を有効化")
+        self._enable_stage3_refinement.setChecked(self._config.enable_stage3_refinement)
+        self._enable_stage3_refinement.toggled.connect(self._on_live_change)
+        s03.addWidget(self._enable_stage3_refinement)
+
+        self._stage3_weight_base = _LinkedSliderSpin(
+            "Stage3 base:", 0.0, 1.0, self._config.stage3_weight_base
+        )
+        self._stage3_weight_base.valueChanged.connect(self._on_live_change)
+        s03.addWidget(self._stage3_weight_base)
+
+        self._stage3_weight_trajectory = _LinkedSliderSpin(
+            "Stage3 trajectory:", 0.0, 1.0, self._config.stage3_weight_trajectory
+        )
+        self._stage3_weight_trajectory.valueChanged.connect(self._on_live_change)
+        s03.addWidget(self._stage3_weight_trajectory)
+
+        self._stage3_weight_stage0_risk = _LinkedSliderSpin(
+            "Stage3 stage0-risk:", 0.0, 1.0, self._config.stage3_weight_stage0_risk
+        )
+        self._stage3_weight_stage0_risk.valueChanged.connect(self._on_live_change)
+        s03.addWidget(self._stage3_weight_stage0_risk)
+
+        layout.addWidget(grp_stage03)
+
         # ---------- Rerun ----------
         grp_rerun = QGroupBox("Rerunログ")
         grp_rerun.setStyleSheet(self._group_style())
@@ -317,6 +362,12 @@ class SettingsPanel(QWidget):
             self._ransac_th,
             self._use_mask,
             self._mask_ratio,
+            self._enable_stage0_scan,
+            self._stage0_stride,
+            self._enable_stage3_refinement,
+            self._stage3_weight_base,
+            self._stage3_weight_trajectory,
+            self._stage3_weight_stage0_risk,
             self._enable_rerun_logging,
         ]
         for w in readonly_widgets:
@@ -347,6 +398,12 @@ class SettingsPanel(QWidget):
 
         c.equirect360.enable_polar_mask = self._use_mask.isChecked()
         c.equirect360.mask_polar_ratio = self._mask_ratio.value()
+        c.enable_stage0_scan = self._enable_stage0_scan.isChecked()
+        c.stage0_stride = self._stage0_stride.value()
+        c.enable_stage3_refinement = self._enable_stage3_refinement.isChecked()
+        c.stage3_weight_base = self._stage3_weight_base.value()
+        c.stage3_weight_trajectory = self._stage3_weight_trajectory.value()
+        c.stage3_weight_stage0_risk = self._stage3_weight_stage0_risk.value()
         c.enable_rerun_logging = self._enable_rerun_logging.isChecked()
 
         return c
@@ -423,6 +480,12 @@ class SettingsPanel(QWidget):
         # 360度設定
         self._use_mask.setChecked(c.equirect360.enable_polar_mask)
         self._mask_ratio.setValue(c.equirect360.mask_polar_ratio)
+        self._enable_stage0_scan.setChecked(c.enable_stage0_scan)
+        self._stage0_stride.setValue(c.stage0_stride)
+        self._enable_stage3_refinement.setChecked(c.enable_stage3_refinement)
+        self._stage3_weight_base.setValue(c.stage3_weight_base)
+        self._stage3_weight_trajectory.setValue(c.stage3_weight_trajectory)
+        self._stage3_weight_stage0_risk.setValue(c.stage3_weight_stage0_risk)
         self._enable_rerun_logging.setChecked(c.enable_rerun_logging)
 
         logger.info("settings_dialog からの設定を読み込みました")
@@ -504,6 +567,12 @@ class SettingsPanel(QWidget):
             # 360度設定
             self._use_mask.setChecked(params.get('enable_polar_mask', True))
             self._mask_ratio.setValue(params.get('mask_polar_ratio', 0.10))
+            self._enable_stage0_scan.setChecked(params.get('enable_stage0_scan', True))
+            self._stage0_stride.setValue(int(params.get('stage0_stride', 5)))
+            self._enable_stage3_refinement.setChecked(params.get('enable_stage3_refinement', True))
+            self._stage3_weight_base.setValue(float(params.get('stage3_weight_base', 0.70)))
+            self._stage3_weight_trajectory.setValue(float(params.get('stage3_weight_trajectory', 0.25)))
+            self._stage3_weight_stage0_risk.setValue(float(params.get('stage3_weight_stage0_risk', 0.05)))
 
             logger.info(f"プリセット '{preset_id}' ({preset_info.name}) を適用しました")
 
@@ -544,6 +613,12 @@ class SettingsPanel(QWidget):
         self._ransac_th.setValue(d.gric.ransac_threshold)
         self._use_mask.setChecked(d.equirect360.enable_polar_mask)
         self._mask_ratio.setValue(d.equirect360.mask_polar_ratio)
+        self._enable_stage0_scan.setChecked(d.enable_stage0_scan)
+        self._stage0_stride.setValue(d.stage0_stride)
+        self._enable_stage3_refinement.setChecked(d.enable_stage3_refinement)
+        self._stage3_weight_base.setValue(d.stage3_weight_base)
+        self._stage3_weight_trajectory.setValue(d.stage3_weight_trajectory)
+        self._stage3_weight_stage0_risk.setValue(d.stage3_weight_stage0_risk)
         self._enable_rerun_logging.setChecked(d.enable_rerun_logging)
 
     # ==================================================================

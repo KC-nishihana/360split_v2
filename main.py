@@ -182,6 +182,42 @@ def parse_arguments():
         help="インペイントフックモジュール（inpaint_frame(frame, mask) を実装）"
     )
     parser.add_argument(
+        "--disable-stage0-scan",
+        action="store_true",
+        default=False,
+        help="Stage0軽量走査を無効化する"
+    )
+    parser.add_argument(
+        "--stage0-stride",
+        type=int,
+        default=None,
+        help="Stage0固定サンプリング間隔（フレーム数）"
+    )
+    parser.add_argument(
+        "--disable-stage3-refinement",
+        action="store_true",
+        default=False,
+        help="Stage3軌跡再評価を無効化する"
+    )
+    parser.add_argument(
+        "--stage3-weight-base",
+        type=float,
+        default=None,
+        help="Stage3再スコア式のbase重み"
+    )
+    parser.add_argument(
+        "--stage3-weight-trajectory",
+        type=float,
+        default=None,
+        help="Stage3再スコア式のtrajectory重み"
+    )
+    parser.add_argument(
+        "--stage3-weight-stage0-risk",
+        type=float,
+        default=None,
+        help="Stage3再スコア式のstage0リスク重み"
+    )
+    parser.add_argument(
         "--disable-fisheye-border-mask",
         action="store_true",
         default=False,
@@ -322,6 +358,18 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["dynamic_mask_inpaint_enabled"] = True
     if args.dynamic_mask_inpaint_module:
         config["dynamic_mask_inpaint_module"] = args.dynamic_mask_inpaint_module.strip()
+    if args.disable_stage0_scan:
+        config["enable_stage0_scan"] = False
+    if args.stage0_stride is not None:
+        config["stage0_stride"] = max(1, int(args.stage0_stride))
+    if args.disable_stage3_refinement:
+        config["enable_stage3_refinement"] = False
+    if args.stage3_weight_base is not None:
+        config["stage3_weight_base"] = float(args.stage3_weight_base)
+    if args.stage3_weight_trajectory is not None:
+        config["stage3_weight_trajectory"] = float(args.stage3_weight_trajectory)
+    if args.stage3_weight_stage0_risk is not None:
+        config["stage3_weight_stage0_risk"] = float(args.stage3_weight_stage0_risk)
     if args.disable_fisheye_border_mask:
         config["enable_fisheye_border_mask"] = False
     if args.fisheye_mask_radius_ratio is not None:
@@ -483,6 +531,12 @@ def run_cli(args):
             f"th={config.get('dynamic_mask_motion_threshold', 30)}, "
             f"dilate={config.get('dynamic_mask_dilation_size', 5)})"
         )
+    logger.info(
+        "Stage0/Stage3: "
+        f"stage0={'ON' if config.get('enable_stage0_scan', True) else 'OFF'} "
+        f"(stride={config.get('stage0_stride', 5)}), "
+        f"stage3={'ON' if config.get('enable_stage3_refinement', True) else 'OFF'}"
+    )
     logger.info("-" * 60)
 
     loader = create_loader(video_path, args, is_front_rear, is_osv)
@@ -638,6 +692,7 @@ def run_cli(args):
                 "quality_scores": round_json_friendly(kf.quality_scores) if kf.quality_scores else {},
                 "geometric_scores": round_json_friendly(kf.geometric_scores) if kf.geometric_scores else {},
                 "adaptive_scores": round_json_friendly(kf.adaptive_scores) if kf.adaptive_scores else {},
+                "stage3_scores": round_json_friendly(kf.stage3_scores) if kf.stage3_scores else {},
             }
             for kf in keyframes
         ]

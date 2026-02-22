@@ -18,11 +18,11 @@
 
 ## 主な特徴
 
-- **2段階キーフレーム選択パイプライン** — Stage 1で品質ベースの高速フィルタリング（60〜70%除外）、Stage 2で幾何学的・適応的精密評価を行う効率的なアーキテクチャ
+- **4段階統合解析パイプライン** — GUIの「解析実行」1ボタンで Stage0→1→2→3 を順次実行し、軌跡再評価まで一括処理
 - **360度映像ネイティブ対応** — Equirectangular / Cubemap / Perspective投影変換をサポート
 - **対象マスク生成** — 選択済みキーフレームに対して人物・車両など指定対象の二値マスク（対象=黒/背景=白）を生成
 - **GPU高速化** — Apple Silicon (MPS) / NVIDIA CUDA の自動検出と活用
-- **GUIモード** — PySide6ベースの直感的なインタフェースで動画プレビュー、タイムライン操作、リアルタイム分析が可能
+- **GUIモード** — PySide6ベースの直感的なインタフェースで動画プレビュー、タイムライン操作、リアルタイム分析、解析ログタブ表示が可能
 - **CLIモード** — スクリプト連携やバッチ処理に対応したコマンドラインインタフェース
 - **クロスプラットフォーム** — macOS (Apple Silicon) / Windows (CUDA) / Linux で動作
 
@@ -99,7 +99,8 @@ pip install ultralytics
 python main.py
 ```
 
-GUIが起動したら、メニューまたはツールバーから動画ファイルを読み込み、「分析実行」でキーフレーム抽出を開始します。
+GUIが起動したら、メニューまたはツールバーから動画ファイルを読み込み、「解析実行」でキーフレーム抽出を開始します。
+右側パネルの `🧾 解析ログ` タブで、処理内容・進捗・結果ログを確認できます。
 
 ### CLIモード
 
@@ -178,7 +179,7 @@ python main.py --cli input.mp4 -v
 抽出結果をRerunで可視化し、`metrics/*` の時系列と軌跡を同時に確認できます。
 
 GUIでは右側の`⚙ 設定`パネル（または設定ダイアログ）で
-`解析時にRerunログを有効化（GUI）` をONにすると、Stage 2 / フル解析時にRerunへ送信されます。
+`解析時にRerunログを有効化（GUI）` をONにすると、「解析実行」時にRerunへ送信されます。
 
 ```bash
 # オンラインストリーミング（Viewer起動）
@@ -352,13 +353,20 @@ GUIモードでは、設定ダイアログの「キーフレーム選択」タ�
 └── test/                    # 開発用テストスクリプト、サンプルデータ
 ```
 
-### 2段階キーフレーム選択パイプライン
+### 4段階キーフレーム選択パイプライン
 
 ```
 入力動画 (360° / 通常)
          │
     ┌────▼─────────────────────────────────────────┐
-    │  Stage 1: 高速品質フィルタリング               　│
+    │  Stage 0: 軽量走査（固定間隔）                   │
+    │  ─────────────────────────────────────────   │
+    │  • 低コストの flow/SSIM 走査                     │
+    │  • motion_risk（VO不安定リスク）推定              │
+    └────┬─────────────────────────────────────────┘
+         │ 全体観測（候補は削除しない）
+    ┌────▼─────────────────────────────────────────┐
+    │  Stage 1: 高速品質フィルタリング                 │
     │  ─────────────────────────────────────────   │
     │  • ラプラシアン鮮明度評価                        │
     │  • モーションブラー検出                         │
@@ -374,7 +382,16 @@ GUIモードでは、設定ダイアログの「キーフレーム選択」タ�
     │  • 特徴点マッチングと空間分布評価                │
     │  • SSIM変化量による冗長フレーム除外              │
     │  • オプティカルフロー（カメラ運動量）             │
-    │  → NMS（非最大値抑制）で最終選別                 │
+    │  → Stage2候補 + Stage2最終を生成                 │
+    └────┬─────────────────────────────────────────┘
+         │
+    ┌────▼─────────────────────────────────────────┐
+    │  Stage 3: 軌跡再評価・再スコア                   │
+    │  ─────────────────────────────────────────   │
+    │  • 対象: Stage2候補 ∪ Stage2最終                │
+    │  • trajectory_consistency を再計算               │
+    │  • Stage0 motion_risk と合成して再スコア          │
+    │  → NMS/最大間隔を再実行して最終確定               │
     └────┬─────────────────────────────────────────┘
          │
     最適キーフレーム群 → エクスポート
@@ -425,6 +442,12 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
   "dynamic_mask_motion_frames": 3,
   "dynamic_mask_motion_threshold": 30,
   "dynamic_mask_dilation_size": 5,
+  "enable_stage0_scan": true,
+  "stage0_stride": 5,
+  "enable_stage3_refinement": true,
+  "stage3_weight_base": 0.70,
+  "stage3_weight_trajectory": 0.25,
+  "stage3_weight_stage0_risk": 0.05,
   "dynamic_mask_target_classes": ["人物", "人", "自転車", "バイク", "車両", "動物"],
   "dynamic_mask_inpaint_enabled": false,
   "dynamic_mask_inpaint_module": ""
@@ -458,6 +481,12 @@ JSON形式の設定ファイルで各パラメータをカスタマイズでき�
 | `mask_suffix` | マスクファイル接尾辞 | `_mask` |
 | `mask_output_format` | マスク拡張子（`same/png/jpg/tiff`） | `same` |
 | `enable_fisheye_border_mask` | ステレオ入力時の魚眼外周マスク | true |
+| `enable_stage0_scan` | Stage0軽量走査の有効化 | true |
+| `stage0_stride` | Stage0固定サンプリング間隔（フレーム） | 5 |
+| `enable_stage3_refinement` | Stage3軌跡再評価の有効化 | true |
+| `stage3_weight_base` | Stage3再スコア式の base 重み | 0.70 |
+| `stage3_weight_trajectory` | Stage3再スコア式の trajectory 重み | 0.25 |
+| `stage3_weight_stage0_risk` | Stage3再スコア式の Stage0リスク重み | 0.05 |
 | `fisheye_mask_radius_ratio` | 魚眼有効領域の半径比（0.0-1.0） | 0.94 |
 | `enable_dynamic_mask_removal` | Stage2で動体領域を除外 | false |
 | `dynamic_mask_use_yolo_sam` | YOLO/SAMベース動体検出を併用 | true |

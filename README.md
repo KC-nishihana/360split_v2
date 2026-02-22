@@ -195,11 +195,17 @@ python main.py --cli input.mp4 --rerun-stream --rerun-spawn --rerun-save ./logs/
 - `world/keyframes`
 - `metrics/translation_delta`
 - `metrics/rotation_delta`
+- `metrics/flow_mag`
 - `metrics/laplacian_var`
 - `metrics/match_count`
 - `metrics/overlap_ratio`
 - `metrics/exposure_ratio`
 - `metrics/keyframe_flag`
+- `metrics/stationary_vo_flag`
+- `metrics/stationary_flow_flag`
+- `metrics/is_stationary`
+- `metrics/stationary_confidence`
+- `metrics/stationary_penalty_applied`
 
 ### オフライン再生（CSV/JSON -> .rrd）
 

@@ -70,6 +70,8 @@ class KeyframeInfo:
     is_rescue_mode: bool = False
     is_force_inserted: bool = False
     dynamic_mask: Optional[np.ndarray] = None
+    is_stationary: bool = False
+    stationary_penalty_applied: bool = False
 
 
 @dataclass
@@ -88,6 +90,21 @@ class Stage2PerfStats:
     dynamic_mask_mode_yolo_only_calls: int = 0
     dynamic_mask_mode_motion_only_calls: int = 0
     total_s: float = 0.0
+
+
+@dataclass
+class Stage2FrameRecord:
+    frame_index: int
+    frame: Optional[np.ndarray]
+    quality_scores: Dict[str, float]
+    geometric_scores: Dict[str, float]
+    adaptive_scores: Dict[str, float]
+    metrics: Dict[str, float]
+    is_candidate: bool = False
+    is_keyframe: bool = False
+    t_xyz: Optional[List[float]] = None
+    q_wxyz: Optional[List[float]] = None
+    points_world: Optional[np.ndarray] = None
 
 
 class KeyframeSelector:
@@ -173,6 +190,21 @@ class KeyframeSelector:
             'FORCE_KEYFRAME_ON_EXPOSURE_CHANGE': False,
             'EXPOSURE_CHANGE_THRESHOLD': 0.3,  # 露出変化の検知閾値
             'ADAPTIVE_THRESHOLDING': False,  # 動的閾値調整
+            # 停止区間検出・抑制
+            'STATIONARY_ENABLE': True,
+            'STATIONARY_MIN_DURATION_SEC': 0.7,
+            'STATIONARY_USE_QUANTILE_THRESHOLD': True,
+            'STATIONARY_QUANTILE': 0.10,
+            'STATIONARY_TRANSLATION_THRESHOLD': None,
+            'STATIONARY_ROTATION_THRESHOLD': None,
+            'STATIONARY_FLOW_THRESHOLD': None,
+            'STATIONARY_MIN_MATCH_COUNT_FOR_VO': 30,
+            'STATIONARY_FALLBACK_WHEN_VO_UNRELIABLE': 'not_stationary',
+            'STATIONARY_SOFT_PENALTY': True,
+            'STATIONARY_PENALTY': 0.7,
+            'STATIONARY_ALLOW_BOUNDARY_FRAMES': True,
+            'STATIONARY_BOUNDARY_GRACE_FRAMES': 2,
+            'STATIONARY_HYSTERESIS_EXIT_SCALE': 1.25,
         }
 
         # 外部設定でオーバーライド
@@ -225,6 +257,20 @@ class KeyframeSelector:
                 'force_keyframe_on_exposure_change': 'FORCE_KEYFRAME_ON_EXPOSURE_CHANGE',
                 'exposure_change_threshold': 'EXPOSURE_CHANGE_THRESHOLD',
                 'adaptive_thresholding': 'ADAPTIVE_THRESHOLDING',
+                'stationary_enable': 'STATIONARY_ENABLE',
+                'stationary_min_duration_sec': 'STATIONARY_MIN_DURATION_SEC',
+                'stationary_use_quantile_threshold': 'STATIONARY_USE_QUANTILE_THRESHOLD',
+                'stationary_quantile': 'STATIONARY_QUANTILE',
+                'stationary_translation_threshold': 'STATIONARY_TRANSLATION_THRESHOLD',
+                'stationary_rotation_threshold': 'STATIONARY_ROTATION_THRESHOLD',
+                'stationary_flow_threshold': 'STATIONARY_FLOW_THRESHOLD',
+                'stationary_min_match_count_for_vo': 'STATIONARY_MIN_MATCH_COUNT_FOR_VO',
+                'stationary_fallback_when_vo_unreliable': 'STATIONARY_FALLBACK_WHEN_VO_UNRELIABLE',
+                'stationary_soft_penalty': 'STATIONARY_SOFT_PENALTY',
+                'stationary_penalty': 'STATIONARY_PENALTY',
+                'stationary_allow_boundary_frames': 'STATIONARY_ALLOW_BOUNDARY_FRAMES',
+                'stationary_boundary_grace_frames': 'STATIONARY_BOUNDARY_GRACE_FRAMES',
+                'stationary_hysteresis_exit_scale': 'STATIONARY_HYSTERESIS_EXIT_SCALE',
             }
             for src, dst in alias_map.items():
                 if src in config:
@@ -637,6 +683,180 @@ class KeyframeSelector:
 
         return base_threshold
 
+    @staticmethod
+    def _extract_true_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+        runs: List[Tuple[int, int]] = []
+        i = 0
+        n = len(mask)
+        while i < n:
+            if not mask[i]:
+                i += 1
+                continue
+            j = i + 1
+            while j < n and mask[j]:
+                j += 1
+            runs.append((i, j))
+            i = j
+        return runs
+
+    @staticmethod
+    def _resolve_stationary_threshold(
+        values: np.ndarray,
+        fixed_threshold: Optional[float],
+        use_quantile: bool,
+        quantile: float,
+    ) -> float:
+        finite = values[np.isfinite(values)]
+        if fixed_threshold is not None and not use_quantile:
+            return float(fixed_threshold)
+        if finite.size == 0:
+            return float(fixed_threshold if fixed_threshold is not None else 0.0)
+        if fixed_threshold is None or use_quantile:
+            return float(np.quantile(finite, np.clip(quantile, 0.0, 1.0)))
+        return float(fixed_threshold)
+
+    def _compute_stationary_flags(
+        self,
+        records: List[Stage2FrameRecord],
+        fps: float,
+    ) -> Dict[str, Any]:
+        n = len(records)
+        if n == 0 or not bool(self.config.get('STATIONARY_ENABLE', True)):
+            for record in records:
+                record.metrics["stationary_vo_flag"] = 0.0
+                record.metrics["stationary_flow_flag"] = 0.0
+                record.metrics["is_stationary"] = 0.0
+                record.metrics["stationary_confidence"] = 0.0
+                record.metrics["stationary_penalty_applied"] = 0.0
+            return {"mask": np.zeros(0, dtype=bool), "boundary_mask": np.zeros(0, dtype=bool)}
+
+        trans = np.asarray([r.metrics.get("translation_delta", np.nan) for r in records], dtype=np.float64)
+        rot = np.asarray([r.metrics.get("rotation_delta", np.nan) for r in records], dtype=np.float64)
+        flow = np.asarray([r.metrics.get("flow_mag", np.nan) for r in records], dtype=np.float64)
+        match_count = np.asarray([r.metrics.get("match_count", np.nan) for r in records], dtype=np.float64)
+
+        use_quantile = bool(self.config.get('STATIONARY_USE_QUANTILE_THRESHOLD', True))
+        quantile = float(self.config.get('STATIONARY_QUANTILE', 0.10))
+        t_th = self._resolve_stationary_threshold(
+            trans,
+            self.config.get('STATIONARY_TRANSLATION_THRESHOLD'),
+            use_quantile,
+            quantile,
+        )
+        r_th = self._resolve_stationary_threshold(
+            rot,
+            self.config.get('STATIONARY_ROTATION_THRESHOLD'),
+            use_quantile,
+            quantile,
+        )
+        f_th = self._resolve_stationary_threshold(
+            flow,
+            self.config.get('STATIONARY_FLOW_THRESHOLD'),
+            use_quantile,
+            quantile,
+        )
+        min_match = int(self.config.get('STATIONARY_MIN_MATCH_COUNT_FOR_VO', self.config.get('MIN_FEATURE_MATCHES', 30)))
+        fallback = str(self.config.get('STATIONARY_FALLBACK_WHEN_VO_UNRELIABLE', 'not_stationary')).strip().lower()
+
+        vo_reliable = np.isfinite(match_count) & (match_count >= float(min_match))
+        vo_enter = np.isfinite(trans) & np.isfinite(rot) & (trans <= t_th) & (rot <= r_th)
+        flow_enter = np.isfinite(flow) & (flow <= f_th)
+
+        if fallback == "flow_only":
+            vo_enter = np.where(vo_reliable, vo_enter, flow_enter)
+        else:
+            vo_enter = np.where(vo_reliable, vo_enter, False)
+
+        enter_mask = vo_enter & flow_enter
+
+        exit_scale = max(1.0, float(self.config.get('STATIONARY_HYSTERESIS_EXIT_SCALE', 1.25)))
+        vo_exit = np.isfinite(trans) & np.isfinite(rot) & (trans <= t_th * exit_scale) & (rot <= r_th * exit_scale)
+        flow_exit = np.isfinite(flow) & (flow <= f_th * exit_scale)
+        if fallback == "flow_only":
+            vo_exit = np.where(vo_reliable, vo_exit, flow_exit)
+        else:
+            vo_exit = np.where(vo_reliable, vo_exit, False)
+
+        stable_mask = np.zeros(n, dtype=bool)
+        in_stationary = False
+        for i in range(n):
+            if not in_stationary:
+                if enter_mask[i]:
+                    in_stationary = True
+                    stable_mask[i] = True
+            else:
+                if vo_exit[i] & flow_exit[i]:
+                    stable_mask[i] = True
+                else:
+                    in_stationary = False
+
+        min_len = max(1, int(round(float(self.config.get('STATIONARY_MIN_DURATION_SEC', 0.7)) * max(fps, 1e-6))))
+        for s, e in self._extract_true_runs(stable_mask):
+            if (e - s) < min_len:
+                stable_mask[s:e] = False
+
+        boundary_mask = np.zeros(n, dtype=bool)
+        if bool(self.config.get('STATIONARY_ALLOW_BOUNDARY_FRAMES', True)):
+            grace = max(0, int(self.config.get('STATIONARY_BOUNDARY_GRACE_FRAMES', 2)))
+            for s, e in self._extract_true_runs(stable_mask):
+                bs = max(0, s - grace)
+                be = min(n, s + grace + 1)
+                boundary_mask[bs:be] = True
+                es = max(0, e - 1 - grace)
+                ee = min(n, e + grace)
+                boundary_mask[es:ee] = True
+
+        for i, record in enumerate(records):
+            record.metrics["flow_mag"] = float(flow[i]) if np.isfinite(flow[i]) else 0.0
+            record.metrics["stationary_vo_flag"] = 1.0 if bool(vo_enter[i]) else 0.0
+            record.metrics["stationary_flow_flag"] = 1.0 if bool(flow_enter[i]) else 0.0
+            record.metrics["is_stationary"] = 1.0 if bool(stable_mask[i]) else 0.0
+            record.metrics["stationary_confidence"] = 1.0 if bool(vo_reliable[i]) else 0.0
+            record.metrics["stationary_penalty_applied"] = 0.0
+            record.metrics["stationary_translation_threshold"] = float(t_th)
+            record.metrics["stationary_rotation_threshold"] = float(r_th)
+            record.metrics["stationary_flow_threshold"] = float(f_th)
+
+        return {"mask": stable_mask, "boundary_mask": boundary_mask}
+
+    def _apply_stationary_penalty(
+        self,
+        candidates: List[KeyframeInfo],
+        records: List[Stage2FrameRecord],
+        fps: float,
+    ) -> List[KeyframeInfo]:
+        stationary = self._compute_stationary_flags(records, fps=fps)
+        if not candidates:
+            return candidates
+
+        mask = stationary["mask"]
+        boundary_mask = stationary["boundary_mask"]
+
+        frame_to_idx = {record.frame_index: i for i, record in enumerate(records)}
+        soft = bool(self.config.get('STATIONARY_SOFT_PENALTY', True))
+        penalty = float(np.clip(self.config.get('STATIONARY_PENALTY', 0.7), 0.0, 1.0))
+
+        for candidate in candidates:
+            idx = frame_to_idx.get(candidate.frame_index)
+            if idx is None:
+                continue
+            is_stationary = bool(mask[idx])
+            candidate.is_stationary = is_stationary
+            if candidate.is_force_inserted:
+                continue
+            if not is_stationary:
+                continue
+            if bool(boundary_mask[idx]):
+                continue
+            if soft:
+                candidate.combined_score *= (1.0 - penalty)
+            else:
+                candidate.combined_score = 0.0
+            candidate.stationary_penalty_applied = True
+            records[idx].metrics["stationary_penalty_applied"] = 1.0
+
+        return candidates
+
     def select_keyframes(
         self,
         video_loader,
@@ -706,16 +926,40 @@ class KeyframeSelector:
 
         # ===== Stage 2: 精密評価 =====
         logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
-        stage2_candidates = self._stage2_precise_evaluation(
+        stage2_candidates, stage2_records = self._stage2_precise_evaluation(
             video_loader, metadata, stage1_candidates, progress_callback, frame_log_callback
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
+
+        # 停止区間に対するソフト抑制を適用
+        stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
 
         # 非最大値抑制を適用
         keyframes = self._apply_nms(stage2_candidates)
 
         # 最大間隔制約を適用
         keyframes = self._enforce_max_interval(keyframes, metadata.fps)
+
+        if frame_log_callback:
+            selected_idx = {kf.frame_index for kf in keyframes}
+            for record in stage2_records:
+                record.is_keyframe = record.frame_index in selected_idx
+                record.metrics["keyframe_flag"] = 1.0 if record.is_keyframe else 0.0
+                self._emit_frame_log(
+                    frame_log_callback,
+                    {
+                        "frame_index": record.frame_index,
+                        "frame": record.frame,
+                        "is_keyframe": record.is_keyframe,
+                        "metrics": record.metrics,
+                        "quality_scores": record.quality_scores,
+                        "geometric_scores": record.geometric_scores,
+                        "adaptive_scores": record.adaptive_scores,
+                        "t_xyz": record.t_xyz,
+                        "q_wxyz": record.q_wxyz,
+                        "points_world": record.points_world,
+                    },
+                )
 
         logger.info(f"最終キーフレーム数: {len(keyframes)}個")
 
@@ -856,7 +1100,7 @@ class KeyframeSelector:
         stage1_candidates: List[Dict],
         progress_callback: Optional[Callable[[int, int], None]],
         frame_log_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ) -> List[KeyframeInfo]:
+    ) -> Tuple[List[KeyframeInfo], List[Stage2FrameRecord]]:
         """
         Stage 2: 精密評価（候補フレームのみ）
 
@@ -876,10 +1120,11 @@ class KeyframeSelector:
 
         Returns:
         --------
-        list of KeyframeInfo
-            精密評価後のキーフレーム候補
+        tuple
+            (精密評価後のキーフレーム候補, 可視化用フレーム記録)
         """
         candidates = []
+        records: List[Stage2FrameRecord] = []
         last_keyframe_idx = -self.config['MIN_KEYFRAME_INTERVAL']
         last_keyframe = None
         last_pair = None
@@ -906,6 +1151,54 @@ class KeyframeSelector:
         )
         stage2_started = perf_counter()
         dynamic_mask_cache: Dict[int, np.ndarray] = {}
+
+        def _build_metrics(
+            q_scores: Dict[str, float],
+            g_scores: Dict[str, float],
+            a_scores: Dict[str, float],
+            combined: float,
+            is_keyframe_flag: float = 0.0,
+        ) -> Dict[str, float]:
+            ssim = float(a_scores.get("ssim", 1.0))
+            flow_mag = float(a_scores.get("optical_flow", 0.0))
+            return {
+                "translation_delta": flow_mag,
+                "rotation_delta": float(max(0.0, 1.0 - ssim) * 180.0),
+                "flow_mag": flow_mag,
+                "laplacian_var": float(q_scores.get("sharpness", 0.0)),
+                "match_count": float(g_scores.get("feature_match_count", q_scores.get("seam_features_cur", 0.0))),
+                "overlap_ratio": float(g_scores.get("gric", 0.0)),
+                "exposure_ratio": float(q_scores.get("exposure", 0.0)),
+                "keyframe_flag": float(is_keyframe_flag),
+                "combined_score": float(combined),
+                "stationary_vo_flag": 0.0,
+                "stationary_flow_flag": 0.0,
+                "is_stationary": 0.0,
+                "stationary_confidence": 0.0,
+                "stationary_penalty_applied": 0.0,
+            }
+
+        def _append_record(
+            frame_idx: int,
+            frame_img: Optional[np.ndarray],
+            q_scores: Dict[str, float],
+            g_scores: Dict[str, float],
+            a_scores: Dict[str, float],
+            metrics: Dict[str, float],
+            is_candidate: bool,
+        ) -> None:
+            keep_frame = bool(self.config.get('STAGE2_DEFERRED_FRAME_LOG_IMAGES', False))
+            records.append(
+                Stage2FrameRecord(
+                    frame_index=int(frame_idx),
+                    frame=frame_img.copy() if (keep_frame and frame_img is not None) else None,
+                    quality_scores=dict(q_scores),
+                    geometric_scores=dict(g_scores),
+                    adaptive_scores=dict(a_scores),
+                    metrics=dict(metrics),
+                    is_candidate=is_candidate,
+                )
+            )
 
         try:
             last_read_idx = -1
@@ -964,30 +1257,17 @@ class KeyframeSelector:
                 dynamic_mask_cur = None
 
                 if frame_idx - last_keyframe_idx < self.config['MIN_KEYFRAME_INTERVAL']:
-                    if frame_log_callback:
-                        metrics = {
-                            "translation_delta": 0.0,
-                            "rotation_delta": 0.0,
-                            "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
-                            "match_count": float(quality_scores.get("seam_features_cur", 0.0)),
-                            "overlap_ratio": 0.0,
-                            "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
-                            "keyframe_flag": 0.0,
-                            "combined_score": float(self._compute_combined_score(quality_scores, {}, {})),
-                        }
-                        self._emit_frame_log(
-                            frame_log_callback,
-                            {
-                                "frame_index": frame_idx,
-                                "frame": current_frame,
-                                "is_keyframe": False,
-                                "metrics": metrics,
-                                "quality_scores": quality_scores,
-                                "geometric_scores": geometric_scores,
-                                "adaptive_scores": adaptive_scores,
-                            },
-                            perf_stats=perf_stats,
-                        )
+                    combined = float(self._compute_combined_score(quality_scores, {}, {}))
+                    metrics = _build_metrics(quality_scores, geometric_scores, adaptive_scores, combined, is_keyframe_flag=0.0)
+                    _append_record(
+                        frame_idx=frame_idx,
+                        frame_img=current_frame,
+                        q_scores=quality_scores,
+                        g_scores=geometric_scores,
+                        a_scores=adaptive_scores,
+                        metrics=metrics,
+                        is_candidate=False,
+                    )
                     continue
 
                 frame_window.append(current_frame)
@@ -1079,30 +1359,17 @@ class KeyframeSelector:
                             geometric_failed = True
                             force_insert = True
                         else:
-                            if frame_log_callback:
-                                metrics = {
-                                    "translation_delta": 0.0,
-                                    "rotation_delta": 0.0,
-                                    "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
-                                    "match_count": 0.0,
-                                    "overlap_ratio": 0.0,
-                                    "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
-                                    "keyframe_flag": 0.0,
-                                    "combined_score": float(self._compute_combined_score(quality_scores, {}, {})),
-                                }
-                                self._emit_frame_log(
-                                    frame_log_callback,
-                                    {
-                                        "frame_index": frame_idx,
-                                        "frame": current_frame,
-                                        "is_keyframe": False,
-                                        "metrics": metrics,
-                                        "quality_scores": quality_scores,
-                                        "geometric_scores": geometric_scores,
-                                        "adaptive_scores": adaptive_scores,
-                                    },
-                                    perf_stats=perf_stats,
-                                )
+                            combined = float(self._compute_combined_score(quality_scores, {}, {}))
+                            metrics = _build_metrics(quality_scores, geometric_scores, adaptive_scores, combined, is_keyframe_flag=0.0)
+                            _append_record(
+                                frame_idx=frame_idx,
+                                frame_img=current_frame,
+                                q_scores=quality_scores,
+                                g_scores=geometric_scores,
+                                a_scores=adaptive_scores,
+                                metrics=metrics,
+                                is_candidate=False,
+                            )
                             continue
 
                     geom_frame_window.append(geom_cur)
@@ -1129,30 +1396,17 @@ class KeyframeSelector:
 
                     ssim = adaptive_scores.get('ssim', 1.0)
                     if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and not force_insert and not exposure_changed:
-                        if frame_log_callback:
-                            metrics = {
-                                "translation_delta": float(adaptive_scores.get("optical_flow", 0.0)),
-                                "rotation_delta": float(max(0.0, 1.0 - ssim) * 180.0),
-                                "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
-                                "match_count": float(geometric_scores.get("feature_match_count", 0.0)),
-                                "overlap_ratio": float(geometric_scores.get("gric", 0.0)),
-                                "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
-                                "keyframe_flag": 0.0,
-                                "combined_score": float(self._compute_combined_score(quality_scores, geometric_scores, adaptive_scores)),
-                            }
-                            self._emit_frame_log(
-                                frame_log_callback,
-                                {
-                                    "frame_index": frame_idx,
-                                    "frame": current_frame,
-                                    "is_keyframe": False,
-                                    "metrics": metrics,
-                                    "quality_scores": quality_scores,
-                                    "geometric_scores": geometric_scores,
-                                    "adaptive_scores": adaptive_scores,
-                                },
-                                perf_stats=perf_stats,
-                            )
+                        combined = float(self._compute_combined_score(quality_scores, geometric_scores, adaptive_scores))
+                        metrics = _build_metrics(quality_scores, geometric_scores, adaptive_scores, combined, is_keyframe_flag=0.0)
+                        _append_record(
+                            frame_idx=frame_idx,
+                            frame_img=current_frame,
+                            q_scores=quality_scores,
+                            g_scores=geometric_scores,
+                            a_scores=adaptive_scores,
+                            metrics=metrics,
+                            is_candidate=False,
+                        )
                         continue
 
                     if exposure_changed and frame_idx - last_keyframe_idx >= self.config['MIN_KEYFRAME_INTERVAL']:
@@ -1190,31 +1444,22 @@ class KeyframeSelector:
                 last_pair = current_pair
                 last_pair_feature_mask = current_pair_feature_mask
 
-                if frame_log_callback:
-                    ssim = adaptive_scores.get("ssim", 1.0)
-                    metrics = {
-                        "translation_delta": float(adaptive_scores.get("optical_flow", 0.0)),
-                        "rotation_delta": float(max(0.0, 1.0 - ssim) * 180.0),
-                        "laplacian_var": float(quality_scores.get("sharpness", 0.0)),
-                        "match_count": float(geometric_scores.get("feature_match_count", 0.0)),
-                        "overlap_ratio": float(geometric_scores.get("gric", 0.0)),
-                        "exposure_ratio": float(quality_scores.get("exposure", 0.0)),
-                        "keyframe_flag": 1.0 if is_selected else 0.0,
-                        "combined_score": float(combined_score),
-                    }
-                    self._emit_frame_log(
-                        frame_log_callback,
-                        {
-                            "frame_index": frame_idx,
-                            "frame": current_frame,
-                            "is_keyframe": bool(is_selected),
-                            "metrics": metrics,
-                            "quality_scores": quality_scores,
-                            "geometric_scores": geometric_scores,
-                            "adaptive_scores": adaptive_scores,
-                        },
-                        perf_stats=perf_stats,
-                    )
+                metrics = _build_metrics(
+                    quality_scores,
+                    geometric_scores,
+                    adaptive_scores,
+                    float(combined_score),
+                    is_keyframe_flag=1.0 if is_selected else 0.0,
+                )
+                _append_record(
+                    frame_idx=frame_idx,
+                    frame_img=current_frame,
+                    q_scores=quality_scores,
+                    g_scores=geometric_scores,
+                    a_scores=adaptive_scores,
+                    metrics=metrics,
+                    is_candidate=True,
+                )
 
         finally:
             if perf_stats.enabled:
@@ -1228,7 +1473,7 @@ class KeyframeSelector:
             if cap_b is not None:
                 cap_b.release()
 
-        return candidates
+        return candidates, records
 
     def _compute_quality_score(self, frame: np.ndarray) -> Dict[str, float]:
         """

@@ -14,6 +14,7 @@ PySide6ベースのユーザーインターフェース実装
 from gui.main_window import MainWindow
 from gui.video_player import VideoPlayerWidget
 from gui.timeline_widget import TimelineWidget
+from gui.trajectory_widget import TrajectoryWidget
 from gui.settings_panel import SettingsPanel
 from gui.keyframe_panel import KeyframePanel
 
@@ -21,6 +22,7 @@ __all__ = [
     "MainWindow",
     "VideoPlayerWidget",
     "TimelineWidget",
+    "TrajectoryWidget",
     "SettingsPanel",
     "KeyframePanel",
 ]

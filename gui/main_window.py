@@ -29,6 +29,7 @@ from PySide6.QtGui import QKeySequence, QAction, QDragEnterEvent, QDropEvent
 
 from gui.video_player import VideoPlayerWidget
 from gui.timeline_widget import TimelineWidget
+from gui.trajectory_widget import TrajectoryWidget
 from gui.settings_panel import SettingsPanel
 from gui.settings_dialog import SettingsDialog
 from gui.keyframe_panel import KeyframePanel
@@ -97,6 +98,10 @@ class MainWindow(QMainWindow):
         # タイムライン
         self.timeline = TimelineWidget()
         layout.addWidget(self.timeline, stretch=0)
+
+        # 擬似軌跡ビュー
+        self.trajectory = TrajectoryWidget()
+        layout.addWidget(self.trajectory, stretch=0)
 
         # ステータスバーにプログレスバーを追加
         self._progress_bar = QProgressBar()
@@ -213,6 +218,7 @@ class MainWindow(QMainWindow):
         # タイムライン → ビデオプレーヤー同期
         self.timeline.positionChanged.connect(self.video_player.seek_to_frame)
         self.timeline.keyframeClicked.connect(self.video_player.seek_to_frame)
+        self.trajectory.frameSelected.connect(self.video_player.seek_to_frame)
 
         # キーフレーム一覧 → ビデオプレーヤー
         self.keyframe_list.keyframe_selected.connect(self.video_player.seek_to_frame)
@@ -264,7 +270,9 @@ class MainWindow(QMainWindow):
             self._analysis_masks.clear()
             self.keyframe_list.clear()
             self.timeline.set_keyframes([], [])
+            self.timeline.set_stationary_ranges([])
             self.timeline.set_score_data([], [])
+            self.trajectory.set_frame_data([], [])
             self.video_player.set_keyframe_indices([])
 
             self.video_path = path
@@ -385,6 +393,8 @@ class MainWindow(QMainWindow):
         indices = [s.frame_index for s in all_scores]
         sharpness = [min(s.sharpness / norm_factor, 1.0) for s in all_scores]
         self.timeline.set_score_data(indices, sharpness)
+        self.timeline.set_stationary_ranges([])
+        self.trajectory.set_frame_data(all_scores, self.keyframe_list.keyframe_frames)
 
         self.statusBar().showMessage(
             f"Stage 1 完了: {len(all_scores)} フレームをスキャン。"
@@ -436,6 +446,8 @@ class MainWindow(QMainWindow):
             gric=gric if has_gric else None,
             ssim_change=ssim_change if has_ssim else None
         )
+        self.timeline.set_stationary_ranges(self._extract_stationary_ranges(updated))
+        self.trajectory.set_frame_data(updated, self.keyframe_list.keyframe_frames)
 
     def _on_stage2_finished(self):
         self._progress_bar.setVisible(False)
@@ -460,6 +472,7 @@ class MainWindow(QMainWindow):
         self._full_worker.progress.connect(self._on_progress)
         self._full_worker.stage1_batch.connect(self._on_stage1_batch)
         self._full_worker.stage1_finished.connect(self._on_stage1_finished)
+        self._full_worker.frame_scores_updated.connect(self._on_scores_updated)
         self._full_worker.keyframes_found.connect(self._on_keyframes_found)
         self._full_worker.analysis_finished.connect(self._on_full_finished)
         self._full_worker.error.connect(self._on_error)
@@ -497,6 +510,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_keyframes(frames, scores)
         self.keyframe_list.set_keyframes(frames, scores)
         self.video_player.set_keyframe_indices(frames)
+        self.trajectory.set_frame_data(self._stage1_scores, frames)
 
     def _on_error(self, msg: str):
         self._progress_bar.setVisible(False)
@@ -515,6 +529,7 @@ class MainWindow(QMainWindow):
                 self.keyframe_list.keyframe_scores
             )
             self.video_player.set_keyframe_indices(self.keyframe_list.keyframe_frames)
+            self.trajectory.set_frame_data(self._stage1_scores, self.keyframe_list.keyframe_frames)
 
     # ==================================================================
     # Live Preview
@@ -550,6 +565,24 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Live Preview: {len(candidates)} フレームが閾値を通過"
         )
+
+    @staticmethod
+    def _extract_stationary_ranges(scores: List[FrameScoreData]) -> List[tuple[int, int]]:
+        ranges: List[tuple[int, int]] = []
+        start_idx: Optional[int] = None
+        end_idx: Optional[int] = None
+        for score in scores:
+            if bool(getattr(score, "is_stationary", False)):
+                if start_idx is None:
+                    start_idx = int(score.frame_index)
+                end_idx = int(score.frame_index)
+            elif start_idx is not None and end_idx is not None:
+                ranges.append((start_idx, end_idx))
+                start_idx = None
+                end_idx = None
+        if start_idx is not None and end_idx is not None:
+            ranges.append((start_idx, end_idx))
+        return ranges
 
     # ==================================================================
     # エクスポート

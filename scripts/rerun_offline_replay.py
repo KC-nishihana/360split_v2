@@ -100,12 +100,18 @@ def _extract_metrics(record: Dict) -> Dict[str, float]:
     metric_keys = (
         "translation_delta",
         "rotation_delta",
+        "flow_mag",
         "laplacian_var",
         "match_count",
         "overlap_ratio",
         "exposure_ratio",
         "keyframe_flag",
         "combined_score",
+        "stationary_vo_flag",
+        "stationary_flow_flag",
+        "is_stationary",
+        "stationary_confidence",
+        "stationary_penalty_applied",
     )
     for k in metric_keys:
         if k in record:

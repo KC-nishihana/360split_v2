@@ -65,6 +65,7 @@ class TimelineWidget(QWidget):
         # キーフレーム
         self.keyframe_frames: List[int] = []
         self.keyframe_scores: List[float] = []
+        self.stationary_ranges: List[tuple[int, int]] = []
 
         self.setMinimumHeight(180)
         self.setMaximumHeight(250)
@@ -102,6 +103,12 @@ class TimelineWidget(QWidget):
         self._cb_ssim.setStyleSheet("color: #44cc44;")
         self._cb_ssim.toggled.connect(self._update_visibility)
         legend_layout.addWidget(self._cb_ssim)
+
+        self._cb_stationary = QCheckBox("停止区間")
+        self._cb_stationary.setChecked(True)
+        self._cb_stationary.setStyleSheet("color: #aaaaaa;")
+        self._cb_stationary.toggled.connect(self._update_visibility)
+        legend_layout.addWidget(self._cb_stationary)
 
         legend_layout.addStretch()
 
@@ -154,6 +161,7 @@ class TimelineWidget(QWidget):
 
         # キーフレームマーカー用リスト
         self._kf_lines: List[pg.InfiniteLine] = []
+        self._stationary_regions: List[pg.LinearRegionItem] = []
 
         # マウスイベント接続
         self._plot_widget.scene().sigMouseClicked.connect(self._on_plot_clicked)
@@ -195,6 +203,11 @@ class TimelineWidget(QWidget):
         self.keyframe_frames = list(frames)
         self.keyframe_scores = list(scores)
         self._draw_keyframe_markers()
+
+    def set_stationary_ranges(self, ranges: List[tuple[int, int]]):
+        """停止区間レンジを設定"""
+        self.stationary_ranges = [(int(s), int(e)) for s, e in ranges if int(e) >= int(s)]
+        self._draw_stationary_regions()
 
     def set_score_data(self, frame_indices: List[int],
                        sharpness: List[float],
@@ -320,6 +333,27 @@ class TimelineWidget(QWidget):
             self._plot_widget.addItem(line)
             self._kf_lines.append(line)
 
+    def _draw_stationary_regions(self):
+        """停止区間の帯を描画"""
+        if not HAS_PYQTGRAPH or self._plot_widget is None:
+            return
+
+        for region in self._stationary_regions:
+            self._plot_widget.removeItem(region)
+        self._stationary_regions.clear()
+
+        for start, end in self.stationary_ranges:
+            region = pg.LinearRegionItem(
+                values=(float(start), float(end)),
+                orientation='vertical',
+                movable=False,
+                brush=(170, 170, 170, 50),
+                pen=pg.mkPen((180, 180, 180, 90), width=1),
+            )
+            region.setZValue(-50)
+            self._plot_widget.addItem(region)
+            self._stationary_regions.append(region)
+
     def _update_visibility(self):
         """チェックボックスに基づくカーブの表示/非表示"""
         if not HAS_PYQTGRAPH or self._plot_widget is None:
@@ -327,6 +361,9 @@ class TimelineWidget(QWidget):
         self._curve_sharpness.setVisible(self._cb_sharpness.isChecked())
         self._curve_gric.setVisible(self._cb_gric.isChecked())
         self._curve_ssim.setVisible(self._cb_ssim.isChecked())
+        show_stationary = self._cb_stationary.isChecked()
+        for region in self._stationary_regions:
+            region.setVisible(show_stationary)
 
     def _update_info_label(self, frame_idx: int):
         """情報ラベルを更新"""

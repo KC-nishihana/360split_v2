@@ -8,7 +8,7 @@ GUI/CLIではdict形式でオーバーライドできる。
 """
 
 from dataclasses import dataclass, field, asdict
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 # =============================================================================
@@ -77,6 +77,20 @@ class SelectionConfig:
     ssim_change_threshold: float = 0.85  # SSIM変化検知閾値
     softmax_beta: float = 5.0           # Softmax温度パラメータ
     nms_time_window: float = 1.0        # NMS時間ウィンドウ（秒）
+    stationary_enable: bool = True
+    stationary_min_duration_sec: float = 0.7
+    stationary_use_quantile_threshold: bool = True
+    stationary_quantile: float = 0.10
+    stationary_translation_threshold: Optional[float] = None
+    stationary_rotation_threshold: Optional[float] = None
+    stationary_flow_threshold: Optional[float] = None
+    stationary_min_match_count_for_vo: int = 15
+    stationary_fallback_when_vo_unreliable: str = "not_stationary"
+    stationary_soft_penalty: bool = True
+    stationary_penalty: float = 0.7
+    stationary_allow_boundary_frames: bool = True
+    stationary_boundary_grace_frames: int = 2
+    stationary_hysteresis_exit_scale: float = 1.25
 
 
 @dataclass
@@ -153,6 +167,22 @@ class KeyframeConfig:
             'MOTION_BLUR_THRESHOLD': self.selection.motion_blur_threshold,
             'EXPOSURE_THRESHOLD': self.selection.exposure_threshold,
             'MIN_FEATURE_MATCHES': self.gric.min_matches,
+            'STATIONARY_ENABLE': self.selection.stationary_enable,
+            'STATIONARY_MIN_DURATION_SEC': self.selection.stationary_min_duration_sec,
+            'STATIONARY_USE_QUANTILE_THRESHOLD': self.selection.stationary_use_quantile_threshold,
+            'STATIONARY_QUANTILE': self.selection.stationary_quantile,
+            'STATIONARY_TRANSLATION_THRESHOLD': self.selection.stationary_translation_threshold,
+            'STATIONARY_ROTATION_THRESHOLD': self.selection.stationary_rotation_threshold,
+            'STATIONARY_FLOW_THRESHOLD': self.selection.stationary_flow_threshold,
+            'STATIONARY_MIN_MATCH_COUNT_FOR_VO': int(
+                self.selection.stationary_min_match_count_for_vo or self.gric.min_matches
+            ),
+            'STATIONARY_FALLBACK_WHEN_VO_UNRELIABLE': self.selection.stationary_fallback_when_vo_unreliable,
+            'STATIONARY_SOFT_PENALTY': self.selection.stationary_soft_penalty,
+            'STATIONARY_PENALTY': self.selection.stationary_penalty,
+            'STATIONARY_ALLOW_BOUNDARY_FRAMES': self.selection.stationary_allow_boundary_frames,
+            'STATIONARY_BOUNDARY_GRACE_FRAMES': self.selection.stationary_boundary_grace_frames,
+            'STATIONARY_HYSTERESIS_EXIT_SCALE': self.selection.stationary_hysteresis_exit_scale,
             'ENABLE_POLAR_MASK': self.equirect360.enable_polar_mask,
             'MASK_POLAR_RATIO': self.equirect360.mask_polar_ratio,
             'ENABLE_FISHEYE_BORDER_MASK': self.equirect360.enable_fisheye_border_mask,
@@ -206,6 +236,47 @@ class KeyframeConfig:
         config.selection.laplacian_threshold = d.get('laplacian_threshold', config.selection.laplacian_threshold)
         config.selection.motion_blur_threshold = d.get('motion_blur_threshold', config.selection.motion_blur_threshold)
         config.selection.exposure_threshold = d.get('exposure_threshold', config.selection.exposure_threshold)
+        config.selection.stationary_enable = d.get('stationary_enable', config.selection.stationary_enable)
+        config.selection.stationary_min_duration_sec = d.get(
+            'stationary_min_duration_sec', config.selection.stationary_min_duration_sec
+        )
+        config.selection.stationary_use_quantile_threshold = d.get(
+            'stationary_use_quantile_threshold', config.selection.stationary_use_quantile_threshold
+        )
+        config.selection.stationary_quantile = d.get(
+            'stationary_quantile', config.selection.stationary_quantile
+        )
+        config.selection.stationary_translation_threshold = d.get(
+            'stationary_translation_threshold', config.selection.stationary_translation_threshold
+        )
+        config.selection.stationary_rotation_threshold = d.get(
+            'stationary_rotation_threshold', config.selection.stationary_rotation_threshold
+        )
+        config.selection.stationary_flow_threshold = d.get(
+            'stationary_flow_threshold', config.selection.stationary_flow_threshold
+        )
+        config.selection.stationary_min_match_count_for_vo = int(d.get(
+            'stationary_min_match_count_for_vo', config.selection.stationary_min_match_count_for_vo
+        ))
+        config.selection.stationary_fallback_when_vo_unreliable = str(d.get(
+            'stationary_fallback_when_vo_unreliable',
+            config.selection.stationary_fallback_when_vo_unreliable,
+        ))
+        config.selection.stationary_soft_penalty = bool(d.get(
+            'stationary_soft_penalty', config.selection.stationary_soft_penalty
+        ))
+        config.selection.stationary_penalty = float(d.get(
+            'stationary_penalty', config.selection.stationary_penalty
+        ))
+        config.selection.stationary_allow_boundary_frames = bool(d.get(
+            'stationary_allow_boundary_frames', config.selection.stationary_allow_boundary_frames
+        ))
+        config.selection.stationary_boundary_grace_frames = int(d.get(
+            'stationary_boundary_grace_frames', config.selection.stationary_boundary_grace_frames
+        ))
+        config.selection.stationary_hysteresis_exit_scale = float(d.get(
+            'stationary_hysteresis_exit_scale', config.selection.stationary_hysteresis_exit_scale
+        ))
         # GRIC
         config.gric.ransac_threshold = d.get('ransac_threshold', config.gric.ransac_threshold)
         config.gric.lambda1 = d.get('gric_lambda1', config.gric.lambda1)

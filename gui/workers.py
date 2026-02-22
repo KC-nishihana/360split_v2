@@ -41,6 +41,11 @@ class FrameScoreData:
     gric: float = 0.0
     ssim: float = 1.0
     combined: float = 0.0
+    flow_mag: float = 0.0
+    translation_delta: float = 0.0
+    rotation_delta: float = 0.0
+    match_count: float = 0.0
+    is_stationary: bool = False
     is_keyframe: bool = False
 
 
@@ -202,6 +207,7 @@ class Stage2Worker(QThread):
 
             selector = KeyframeSelector(config=self.config)
             rerun_logger = None
+            metrics_map: Dict[int, Dict[str, float]] = {}
             if bool(self.config.get("enable_rerun_logging", False)):
                 rerun_logger = RerunKeyframeLogger(
                     app_id="keyframe_check_gui_stage2",
@@ -217,10 +223,14 @@ class Stage2Worker(QThread):
                                    f"Stage 2: {current}/{total} {message}")
 
             def frame_log_cb(payload: dict):
-                if not self._is_running or rerun_logger is None or not rerun_logger.enabled:
+                if not self._is_running:
+                    return
+                frame_idx = int(payload.get("frame_index", 0))
+                metrics_map[frame_idx] = dict(payload.get("metrics", {}))
+                if rerun_logger is None or not rerun_logger.enabled:
                     return
                 rerun_logger.log_frame(
-                    frame_idx=int(payload.get("frame_index", 0)),
+                    frame_idx=frame_idx,
                     img=payload.get("frame"),
                     t_xyz=payload.get("t_xyz"),
                     q_wxyz=payload.get("q_wxyz"),
@@ -232,7 +242,7 @@ class Stage2Worker(QThread):
             keyframes = selector.select_keyframes(
                 loader,
                 progress_callback=progress_cb,
-                frame_log_callback=frame_log_cb if rerun_logger is not None else None,
+                frame_log_callback=frame_log_cb,
             )
 
             loader.close()
@@ -252,6 +262,12 @@ class Stage2Worker(QThread):
                     exposure=s1.exposure,
                     motion_blur=s1.motion_blur,
                 )
+                m = metrics_map.get(s1.frame_index, {})
+                fsd.flow_mag = float(m.get('flow_mag', 0.0))
+                fsd.translation_delta = float(m.get('translation_delta', 0.0))
+                fsd.rotation_delta = float(m.get('rotation_delta', 0.0))
+                fsd.match_count = float(m.get('match_count', 0.0))
+                fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
@@ -296,6 +312,7 @@ class FullAnalysisWorker(QThread):
     progress = Signal(int, int, str)
     stage1_batch = Signal(list)
     stage1_finished = Signal(list)
+    frame_scores_updated = Signal(list)
     keyframes_found = Signal(list)
     analysis_finished = Signal()
     error = Signal(str)
@@ -384,6 +401,7 @@ class FullAnalysisWorker(QThread):
 
             selector = KeyframeSelector(config=self.config)
             rerun_logger = None
+            metrics_map: Dict[int, Dict[str, float]] = {}
             if bool(self.config.get("enable_rerun_logging", False)):
                 rerun_logger = RerunKeyframeLogger(
                     app_id="keyframe_check_gui_full",
@@ -400,10 +418,14 @@ class FullAnalysisWorker(QThread):
                                    f"Stage 2: {current}/{total}")
 
             def frame_log_cb(payload: dict):
-                if not self._is_running or rerun_logger is None or not rerun_logger.enabled:
+                if not self._is_running:
+                    return
+                frame_idx = int(payload.get("frame_index", 0))
+                metrics_map[frame_idx] = dict(payload.get("metrics", {}))
+                if rerun_logger is None or not rerun_logger.enabled:
                     return
                 rerun_logger.log_frame(
-                    frame_idx=int(payload.get("frame_index", 0)),
+                    frame_idx=frame_idx,
                     img=payload.get("frame"),
                     t_xyz=payload.get("t_xyz"),
                     q_wxyz=payload.get("q_wxyz"),
@@ -415,13 +437,38 @@ class FullAnalysisWorker(QThread):
             keyframes = selector.select_keyframes(
                 loader,
                 progress_callback=progress_cb,
-                frame_log_callback=frame_log_cb if rerun_logger is not None else None,
+                frame_log_callback=frame_log_cb,
             )
             loader.close()
 
             if not self._is_running:
                 return
 
+            keyframe_map = {kf.frame_index: kf for kf in keyframes}
+            updated_scores: List[FrameScoreData] = []
+            for s1 in all_scores:
+                fsd = FrameScoreData(
+                    frame_index=s1.frame_index,
+                    timestamp=s1.timestamp,
+                    sharpness=s1.sharpness,
+                    exposure=s1.exposure,
+                    motion_blur=s1.motion_blur,
+                )
+                m = metrics_map.get(s1.frame_index, {})
+                fsd.flow_mag = float(m.get('flow_mag', 0.0))
+                fsd.translation_delta = float(m.get('translation_delta', 0.0))
+                fsd.rotation_delta = float(m.get('rotation_delta', 0.0))
+                fsd.match_count = float(m.get('match_count', 0.0))
+                fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
+                kf = keyframe_map.get(s1.frame_index)
+                if kf is not None:
+                    fsd.gric = kf.geometric_scores.get('gric', 0.0)
+                    fsd.ssim = kf.adaptive_scores.get('ssim', 1.0)
+                    fsd.combined = kf.combined_score
+                    fsd.is_keyframe = True
+                updated_scores.append(fsd)
+
+            self.frame_scores_updated.emit(updated_scores)
             self.keyframes_found.emit(keyframes)
             self.progress.emit(100, 100, "解析完了")
             self.analysis_finished.emit()

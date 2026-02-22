@@ -1,4 +1,5 @@
 import numpy as np
+from pathlib import Path
 
 from processing.mask_processor import MaskProcessor
 from processing.target_mask_generator import TargetMaskGenerator
@@ -59,3 +60,52 @@ def test_apply_valid_region_mask_blacks_outside_and_keeps_inside():
 
     assert np.array_equal(masked[40, 60], frame[40, 60])
     assert np.array_equal(masked[0, 0], np.array([0, 0, 0], dtype=np.uint8))
+
+
+def test_build_mask_path_keeps_default_relative_structure():
+    image_path = Path("output/images/L/keyframe_000150_L.png")
+    images_root = Path("output/images")
+    masks_root = Path("output/masks")
+
+    out_path = TargetMaskGenerator.build_mask_path(
+        image_path=image_path,
+        images_root=images_root,
+        masks_root=masks_root,
+        add_suffix=True,
+        suffix="_mask",
+        mask_ext="same",
+    )
+
+    assert out_path == Path("output/masks/L/keyframe_000150_L_mask.png")
+
+
+def test_build_mask_path_flattens_stereo_lr_when_enabled():
+    images_root = Path("output/images")
+    masks_root = Path("output/masks")
+
+    left_path = TargetMaskGenerator.build_mask_path(
+        image_path=Path("output/images/L/keyframe_000150_L.png"),
+        images_root=images_root,
+        masks_root=masks_root,
+        flatten_stereo_lr=True,
+    )
+    right_path = TargetMaskGenerator.build_mask_path(
+        image_path=Path("output/images/R/keyframe_000150_R.png"),
+        images_root=images_root,
+        masks_root=masks_root,
+        flatten_stereo_lr=True,
+    )
+
+    assert left_path == Path("output/masks/keyframe_000150_L_mask.png")
+    assert right_path == Path("output/masks/keyframe_000150_R_mask.png")
+
+
+def test_build_mask_path_does_not_flatten_non_lr_subdirs():
+    out_path = TargetMaskGenerator.build_mask_path(
+        image_path=Path("output/images/cubemap/front/keyframe_000150_front.png"),
+        images_root=Path("output/images"),
+        masks_root=Path("output/masks"),
+        flatten_stereo_lr=True,
+    )
+
+    assert out_path == Path("output/masks/cubemap/front/keyframe_000150_front_mask.png")

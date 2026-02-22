@@ -607,6 +607,7 @@ def run_cli(args):
     logger.info("キーフレームを出力中...")
     fmt = config["output_image_format"]
     stereo_suffixes = ("_F", "_R") if is_front_rear else ("_L", "_R")
+    stereo_images_root = output_dir / "images" if is_stereo_mode else output_dir
 
     for i, kf in enumerate(keyframes):
         # ステレオ判定
@@ -629,7 +630,7 @@ def run_cli(args):
             # ステレオの場合はスティッチ未処理のため分割処理をスキップ
             if is_stereo_mode:
                 # パノラマ画像のみを L/ または R/ フォルダに保存
-                output_subdir = output_dir / suffix.strip('_')  # 'L' or 'R'
+                output_subdir = stereo_images_root / suffix.strip('_')  # 'L' or 'R'
                 output_subdir.mkdir(parents=True, exist_ok=True)
 
                 # ファイル名にサフィックスあり (_L or _R)

@@ -237,14 +237,18 @@ class TargetMaskGenerator:
         add_suffix: bool = True,
         suffix: str = "_mask",
         mask_ext: str = "same",
+        flatten_stereo_lr: bool = False,
     ) -> Path:
         """
         画像パスから対応するマスク出力パスを構築する。
         """
         rel = image_path.relative_to(images_root)
+        rel_parent = rel.parent
+        if flatten_stereo_lr and rel_parent in (Path("L"), Path("R")):
+            rel_parent = Path(".")
         stem = f"{image_path.stem}{suffix}" if add_suffix else image_path.stem
         if mask_ext == "same":
             ext = image_path.suffix
         else:
             ext = f".{mask_ext.lstrip('.')}"
-        return (masks_root / rel.parent / f"{stem}{ext}")
+        return (masks_root / rel_parent / f"{stem}{ext}")

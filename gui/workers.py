@@ -693,16 +693,17 @@ class ExportWorker(QThread):
     def _save_target_mask(
         self,
         images_root: Path,
+        masks_root: Path,
         image_path: Path,
         frame_idx: int,
         frame: np.ndarray,
         mask_generator,
         motion_frames: Optional[List[np.ndarray]] = None,
         force_mask_reanalysis: bool = False,
+        flatten_stereo_lr: bool = False,
     ) -> bool:
         from processing.target_mask_generator import TargetMaskGenerator
 
-        masks_root = images_root / self.mask_output_dirname
         mask_path = TargetMaskGenerator.build_mask_path(
             image_path=image_path,
             images_root=images_root,
@@ -710,6 +711,7 @@ class ExportWorker(QThread):
             add_suffix=self.mask_add_suffix,
             suffix=self.mask_suffix,
             mask_ext=self.mask_output_format,
+            flatten_stereo_lr=flatten_stereo_lr,
         )
         mask_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -769,6 +771,8 @@ class ExportWorker(QThread):
         try:
             output_path = Path(self.output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
+            stereo_images_root = output_path / "images"
+            masks_root = output_path / self.mask_output_dirname
 
             # ステレオ判定
             if self.is_stereo and self.stereo_left_path and self.stereo_right_path:
@@ -948,7 +952,7 @@ class ExportWorker(QThread):
                     # ステレオ・非ステッチ時は L/R を分離保存
                     if self.is_stereo and (not self.enable_stereo_stitch or suffix):
                         # パノラマ画像のみを L/ または R/ フォルダに保存
-                        output_subdir = output_path / suffix.strip('_')  # 'L' or 'R'
+                        output_subdir = stereo_images_root / suffix.strip('_')  # 'L' or 'R'
                         output_subdir.mkdir(parents=True, exist_ok=True)
 
                         # ファイル名にサフィックスあり (_L or _R)
@@ -982,13 +986,15 @@ class ExportWorker(QThread):
                                 stream_last_indices[history_key] = int(frame_idx)
                                 motion_frames = list(motion_history)
                                 if not self._save_target_mask(
-                                    output_path,
+                                    stereo_images_root,
+                                    masks_root,
                                     filepath,
                                     frame_idx,
                                     processed_frame,
                                     target_mask_generator,
                                     motion_frames,
                                     force_mask_reanalysis,
+                                    flatten_stereo_lr=True,
                                 ):
                                     logger.warning(f"対象マスク保存失敗: {filepath}")
                             except Exception as e:
@@ -1089,6 +1095,7 @@ class ExportWorker(QThread):
                             motion_frames = list(motion_history)
                             if not self._save_target_mask(
                                 output_path,
+                                masks_root,
                                 filepath,
                                 frame_idx,
                                 processed_frame,

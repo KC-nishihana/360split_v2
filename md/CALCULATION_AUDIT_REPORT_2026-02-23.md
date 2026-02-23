@@ -233,20 +233,23 @@ PYTHONPATH=. pytest -q
 
 ## 11. 要注意点（監査所見）
 
+追補（2026-02-23 実装修正反映）:
+- `core/accelerator.py` の `batch_ssim` CPUフォールバック引数不一致は修正済み。
+- `_enforce_max_interval` はギャップ補完挿入を実装済み（source candidates から補完）。
+- `--equirectangular` の説明は `main.py` / `README.md` で「入力モード指定」である旨を明記済み。
+
 1. `core/accelerator.py` の `batch_ssim` CPUフォールバック呼び出し
-- 現状コード: `selector.compute_ssim(ref=reference, frame=f)`
-- `compute_ssim` シグネチャは `compute_ssim(frame1, frame2, dense=False)`
-- CPUフォールバック経路で `TypeError` となる可能性がある。
+- 旧コードでは `selector.compute_ssim(ref=reference, frame=f)` となっており引数不一致リスクがあった。
+- 追補時点では `selector.compute_ssim(reference, f)` に修正済み。
 
 2. `main.py` の `--equirectangular` オプション
-- 現状は `config["projection_mode"]` を設定するのみで、CLI出力時に常に equirect 変換を行う制御には直結していない。
-- 実際の再投影処理は `--cubemap` や GUI Export設定側で明確に有効化される。
+- 仕様上、`config["projection_mode"]` を設定する入力モード指定であり、CLI出力時の再投影強制とは別。
+- 誤解回避のため、`main.py` 引数help/`README.md` でこの挙動を明記済み。
 
 3. `_enforce_max_interval` の挙動
-- ログは出すが、ギャップ区間の補完フレーム追加は現状未実装。
-- 「最大間隔制約」の名前に対して期待挙動との差が出る余地がある。
+- 旧実装はログのみだったが、追補時点でギャップ区間補完（source候補から挿入）を実装済み。
+- 候補が存在しない区間は警告ログを出して継続する。
 
 ## 12. 前提
 - 本レポートは静的読解 + テスト結果（`PYTHONPATH=. pytest -q`）を根拠とする。
 - 「全計算処理」は `core` と `processing` を主対象、`gui/workers.py` は連携層として扱う。
-

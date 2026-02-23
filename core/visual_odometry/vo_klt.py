@@ -79,6 +79,8 @@ class KLTVisualOdometry:
         ransac_threshold: float = 1.0,
         center_roi_ratio: float = 0.6,
         downscale_long_edge: int = 1000,
+        fast_fail_inlier_ratio: float = 0.12,
+        step_proxy_clip_px: float = 80.0,
     ):
         self.max_features = int(max(50, max_features))
         self.quality_level = float(max(1e-4, quality_level))
@@ -87,6 +89,8 @@ class KLTVisualOdometry:
         self.ransac_threshold = float(max(0.1, ransac_threshold))
         self.center_roi_ratio = float(np.clip(center_roi_ratio, 0.05, 1.0))
         self.downscale_long_edge = int(max(0, downscale_long_edge))
+        self.fast_fail_inlier_ratio = float(np.clip(fast_fail_inlier_ratio, 0.0, 1.0))
+        self.step_proxy_clip_px = float(max(0.0, step_proxy_clip_px))
 
     def _resize_if_needed(
         self,
@@ -222,6 +226,9 @@ class KLTVisualOdometry:
         total_count = int(len(pts1_u))
         if inlier_count <= 0 or total_count <= 0:
             return _invalid_metrics()
+        inlier_ratio = float(np.clip(inlier_count / float(total_count), 0.0, 1.0))
+        if inlier_ratio < self.fast_fail_inlier_ratio:
+            return _invalid_metrics()
         inlier_mask = np.asarray(mask_pose).reshape(-1).astype(bool)
 
         trace_val = float(np.trace(r))
@@ -238,12 +245,14 @@ class KLTVisualOdometry:
             step_proxy = float(np.median(np.linalg.norm(delta, axis=1)))
         else:
             step_proxy = 0.0
+        if self.step_proxy_clip_px > 0.0:
+            step_proxy = min(step_proxy, self.step_proxy_clip_px)
         q_wxyz = _rotation_matrix_to_quaternion_wxyz(r)
 
         return VOMetrics(
             vo_valid=True,
             match_count=inlier_count,
-            inlier_ratio=float(np.clip(inlier_count / float(total_count), 0.0, 1.0)),
+            inlier_ratio=inlier_ratio,
             rotation_delta_deg=rot_deg,
             translation_delta_rel=t_norm,
             step_proxy=float(max(0.0, step_proxy)),

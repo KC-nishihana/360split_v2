@@ -136,7 +136,7 @@ def parse_arguments():
         "--equirectangular",
         action="store_true",
         default=False,
-        help="入力を360度Equirectangular動画として処理"
+        help="入力を360度Equirectangular動画として扱う（入力モード指定。出力変換を強制しない）"
     )
 
     parser.add_argument(
@@ -316,6 +316,30 @@ def parse_arguments():
         default=None,
         help="VO入力の長辺縮小ピクセル（速度優先）"
     )
+    parser.add_argument(
+        "--vo-frame-subsample",
+        type=int,
+        default=None,
+        help="VO計算をnフレームごとに実行（1で従来同等）"
+    )
+    parser.add_argument(
+        "--vo-adaptive-roi",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="VO中心ROIをフロー量に応じて動的調整する（--no-vo-adaptive-roi で無効化）"
+    )
+    parser.add_argument(
+        "--vo-fast-fail-inlier-ratio",
+        type=float,
+        default=None,
+        help="VO早期失敗判定の最小inlier比率（0.0-1.0）"
+    )
+    parser.add_argument(
+        "--vo-step-proxy-clip-px",
+        type=float,
+        default=None,
+        help="VO step_proxy の上限クリップ値（px）"
+    )
 
     parser.add_argument(
         "--verbose", "-v",
@@ -469,6 +493,14 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["vo_max_features"] = int(max(50, args.vo_max_features))
     if args.vo_downscale_long_edge is not None:
         config["vo_downscale_long_edge"] = int(max(0, args.vo_downscale_long_edge))
+    if args.vo_frame_subsample is not None:
+        config["vo_frame_subsample"] = int(max(1, args.vo_frame_subsample))
+    if args.vo_adaptive_roi is not None:
+        config["vo_adaptive_roi_enable"] = bool(args.vo_adaptive_roi)
+    if args.vo_fast_fail_inlier_ratio is not None:
+        config["vo_fast_fail_inlier_ratio"] = float(max(0.0, min(1.0, args.vo_fast_fail_inlier_ratio)))
+    if args.vo_step_proxy_clip_px is not None:
+        config["vo_step_proxy_clip_px"] = float(max(0.0, args.vo_step_proxy_clip_px))
     if args.equirectangular:
         config["projection_mode"] = "Equirectangular"
     if args.cubemap:

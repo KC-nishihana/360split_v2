@@ -224,6 +224,12 @@ class KeyframeSelector:
             'VO_DOWNSCALE_LONG_EDGE': 1000,
             'VO_MATCH_NORM_FACTOR': 120.0,
             'VO_T_SIGN': 1.0,
+            'VO_FRAME_SUBSAMPLE': 1,
+            'VO_ADAPTIVE_ROI_ENABLE': True,
+            'VO_ADAPTIVE_ROI_MIN': 0.45,
+            'VO_ADAPTIVE_ROI_MAX': 0.70,
+            'VO_FAST_FAIL_INLIER_RATIO': 0.12,
+            'VO_STEP_PROXY_CLIP_PX': 80.0,
             'CALIB_XML': '',
             'FRONT_CALIB_XML': '',
             'REAR_CALIB_XML': '',
@@ -311,6 +317,12 @@ class KeyframeSelector:
                 'vo_downscale_long_edge': 'VO_DOWNSCALE_LONG_EDGE',
                 'vo_match_norm_factor': 'VO_MATCH_NORM_FACTOR',
                 'vo_t_sign': 'VO_T_SIGN',
+                'vo_frame_subsample': 'VO_FRAME_SUBSAMPLE',
+                'vo_adaptive_roi_enable': 'VO_ADAPTIVE_ROI_ENABLE',
+                'vo_adaptive_roi_min': 'VO_ADAPTIVE_ROI_MIN',
+                'vo_adaptive_roi_max': 'VO_ADAPTIVE_ROI_MAX',
+                'vo_fast_fail_inlier_ratio': 'VO_FAST_FAIL_INLIER_RATIO',
+                'vo_step_proxy_clip_px': 'VO_STEP_PROXY_CLIP_PX',
                 'calib_xml': 'CALIB_XML',
                 'front_calib_xml': 'FRONT_CALIB_XML',
                 'rear_calib_xml': 'REAR_CALIB_XML',
@@ -379,6 +391,8 @@ class KeyframeSelector:
             ransac_threshold=float(self.config.get('VO_RANSAC_THRESHOLD', 1.0)),
             center_roi_ratio=float(self.config.get('VO_CENTER_ROI_RATIO', 0.6)),
             downscale_long_edge=int(self.config.get('VO_DOWNSCALE_LONG_EDGE', 1000)),
+            fast_fail_inlier_ratio=float(self.config.get('VO_FAST_FAIL_INLIER_RATIO', 0.12)),
+            step_proxy_clip_px=float(self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)),
         )
 
     def _load_inpaint_hook(self):
@@ -986,6 +1000,11 @@ class KeyframeSelector:
         calibration = getattr(metadata, 'rig_calibration', None)
         vo_calib = self._get_runtime_vo_calibration(is_paired=is_paired)
         vo_enabled = bool(self.config.get('VO_ENABLED', True)) and vo_calib is not None
+        vo_subsample = max(1, int(self.config.get('VO_FRAME_SUBSAMPLE', 1)))
+        adaptive_roi_enable = bool(self.config.get('VO_ADAPTIVE_ROI_ENABLE', True))
+        roi_min = float(np.clip(self.config.get('VO_ADAPTIVE_ROI_MIN', 0.45), 0.2, 1.0))
+        roi_max = float(np.clip(self.config.get('VO_ADAPTIVE_ROI_MAX', 0.70), roi_min, 1.0))
+        step_clip = float(max(0.0, self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)))
         if bool(self.config.get('VO_ENABLED', True)) and vo_calib is None:
             logger.warning("Stage0 VO disabled: calibration not available")
         projection_mode = str(self.config.get('PROJECTION_MODE', self.config.get('projection_mode', ''))).strip().lower()
@@ -1035,12 +1054,20 @@ class KeyframeSelector:
             flow_risk = float(np.clip(flow_mag / flow_norm_factor, 0.0, 1.0))
             ssim_change = float(np.clip(1.0 - ssim_light, 0.0, 1.0))
             motion_risk = float(np.clip(0.4 * texture_risk + 0.4 * flow_risk + 0.2 * ssim_change, 0.0, 1.0))
+            roi_ratio = float(self.config.get('VO_CENTER_ROI_RATIO', 0.6))
+            if adaptive_roi_enable:
+                flow_norm = float(np.clip(flow_mag / flow_norm_factor, 0.0, 1.0))
+                roi_ratio = float(np.clip(roi_min + (roi_max - roi_min) * flow_norm, roi_min, roi_max))
+            vo_should_run = bool(vo_enabled and prev_vo_frame is not None and (idx % vo_subsample == 0))
             vo = self.vo_estimator.estimate(
                 prev_vo_frame,
                 frame_vo_cur,
                 calibration=vo_calib,
-                center_roi_ratio=float(self.config.get('VO_CENTER_ROI_RATIO', 0.6)),
-            ) if (vo_enabled and prev_vo_frame is not None) else None
+                center_roi_ratio=roi_ratio,
+            ) if vo_should_run else None
+            step_proxy = float(vo.step_proxy if vo else 0.0)
+            if step_clip > 0.0:
+                step_proxy = min(step_proxy, step_clip)
 
             metrics[int(frame_idx)] = {
                 "flow_mag_light": flow_mag,
@@ -1048,7 +1075,7 @@ class KeyframeSelector:
                 "motion_risk": motion_risk,
                 "rotation_delta": float(vo.rotation_delta_deg if vo else 0.0),
                 "translation_delta": float(vo.translation_delta_rel if vo else 0.0),
-                "vo_step_proxy": float(vo.step_proxy if vo else 0.0),
+                "vo_step_proxy": step_proxy,
                 "vo_step_proxy_norm": 0.0,
                 "vo_rot_deg": float(vo.rotation_delta_deg if vo else 0.0),
                 "match_count": float(vo.match_count if vo else 0.0),
@@ -1109,6 +1136,8 @@ class KeyframeSelector:
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
         vo_calib = self._get_runtime_vo_calibration(is_paired=is_paired)
         vo_enabled = bool(self.config.get('VO_ENABLED', True)) and vo_calib is not None
+        vo_subsample = max(1, int(self.config.get('VO_FRAME_SUBSAMPLE', 1)))
+        step_clip = float(max(0.0, self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)))
         projection_mode = str(self.config.get('PROJECTION_MODE', self.config.get('projection_mode', ''))).strip().lower()
         if projection_mode in ("equirectangular", "cubemap") and vo_enabled:
             logger.warning("Stage3 VO skipped for panorama projection mode (future support)")
@@ -1196,12 +1225,13 @@ class KeyframeSelector:
                 prev_valid = False
                 continue
 
+            vo_should_run = bool(vo_enabled and (i % vo_subsample == 0))
             vo = self.vo_estimator.estimate(
                 prev_frame,
                 cur_frame,
                 calibration=vo_calib,
                 center_roi_ratio=float(self.config.get('VO_CENTER_ROI_RATIO', 0.6)),
-            ) if vo_enabled else None
+            ) if vo_should_run else None
             if vo is None or not vo.vo_valid:
                 trajectory_consistency[cur_idx] = 0.0
                 vo_step_proxy_norm[cur_idx] = 0.0
@@ -1222,6 +1252,8 @@ class KeyframeSelector:
                 continue
 
             step_val = float(max(0.0, getattr(vo, "step_proxy", 0.0)))
+            if step_clip > 0.0:
+                step_val = min(step_val, step_clip)
             dir_vec = np.asarray(getattr(vo, "t_dir", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
             dir_norm = float(np.linalg.norm(dir_vec))
             if dir_norm > 1e-12:
@@ -1474,6 +1506,7 @@ class KeyframeSelector:
         stage2_keyframes_pre_stage3 = self._enforce_max_interval(
             self._apply_nms(stage2_candidates),
             metadata.fps,
+            source_candidates=stage2_candidates,
         )
 
         # ===== Stage 3: 軌跡再評価 =====
@@ -1492,6 +1525,7 @@ class KeyframeSelector:
             keyframes = self._enforce_max_interval(
                 self._apply_nms(stage2_candidates),
                 metadata.fps,
+                source_candidates=stage2_candidates,
             )
             logger.info(f"Stage 3完了: {len(keyframes)}個")
             _stage_summary("3", keyframes=len(keyframes))
@@ -2230,8 +2264,12 @@ class KeyframeSelector:
 
         return selected
 
-    def _enforce_max_interval(self, keyframes: List[KeyframeInfo],
-                             fps: float) -> List[KeyframeInfo]:
+    def _enforce_max_interval(
+        self,
+        keyframes: List[KeyframeInfo],
+        fps: float,
+        source_candidates: Optional[List[KeyframeInfo]] = None,
+    ) -> List[KeyframeInfo]:
         """
         最大キーフレーム間隔制約を適用
 
@@ -2253,22 +2291,56 @@ class KeyframeSelector:
         if len(keyframes) < 2:
             return keyframes
 
-        max_interval = self.config['MAX_KEYFRAME_INTERVAL'] / fps
+        fps_safe = max(float(fps), 1e-6)
+        max_interval = self.config['MAX_KEYFRAME_INTERVAL'] / fps_safe
 
-        enforced_keyframes = [keyframes[0]]
+        selected_sorted = sorted(keyframes, key=lambda x: x.frame_index)
+        source_sorted = sorted(source_candidates or keyframes, key=lambda x: x.frame_index)
+        used_frames = {int(kf.frame_index) for kf in selected_sorted[:1]}
+        enforced_keyframes = [selected_sorted[0]]
 
-        for i in range(1, len(keyframes)):
-            current_kf = keyframes[i]
-            last_kf = enforced_keyframes[-1]
+        for i in range(1, len(selected_sorted)):
+            current_kf = selected_sorted[i]
 
-            time_diff = current_kf.timestamp - last_kf.timestamp
+            while True:
+                last_kf = enforced_keyframes[-1]
+                time_diff = current_kf.timestamp - last_kf.timestamp
+                if time_diff <= max_interval:
+                    break
 
-            if time_diff > max_interval:
                 logger.debug(
                     f"最大間隔超過: frame {last_kf.frame_index} → {current_kf.frame_index} "
                     f"(gap={time_diff:.2f}s > max={max_interval:.2f}s)"
                 )
-            enforced_keyframes.append(current_kf)
+
+                between = [
+                    c for c in source_sorted
+                    if last_kf.frame_index < c.frame_index < current_kf.frame_index
+                    and int(c.frame_index) not in used_frames
+                ]
+                if not between:
+                    logger.warning(
+                        "最大間隔超過を補完できません: "
+                        f"frame {last_kf.frame_index} → {current_kf.frame_index}"
+                    )
+                    break
+
+                # 目標時刻（last + max_interval）に近い候補を優先し、同距離なら高スコアを採用
+                target_time = last_kf.timestamp + max_interval
+                insert_kf = min(
+                    between,
+                    key=lambda c: (abs(c.timestamp - target_time), -float(c.combined_score)),
+                )
+                enforced_keyframes.append(insert_kf)
+                used_frames.add(int(insert_kf.frame_index))
+                logger.debug(
+                    f"最大間隔補完フレーム追加: frame={insert_kf.frame_index}, "
+                    f"score={insert_kf.combined_score:.3f}"
+                )
+
+            if int(current_kf.frame_index) not in used_frames:
+                enforced_keyframes.append(current_kf)
+                used_frames.add(int(current_kf.frame_index))
 
         return enforced_keyframes
 

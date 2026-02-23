@@ -166,7 +166,7 @@ python main.py --cli input.mp4 -v
 | `--max-keyframes N` | 最大キーフレーム数 | 自動決定 |
 | `--min-interval N` | 最小キーフレーム間隔（フレーム数） | `5` |
 | `--ssim-threshold F` | SSIM変化検知閾値 (0.0-1.0) | `0.85` |
-| `--equirectangular` | 360度Equirectangular動画として処理 | `false` |
+| `--equirectangular` | 入力をEquirectangularとして扱う（入力モード指定。出力変換は `--cubemap`/Perspective指定時） | `false` |
 | `--apply-mask` | 天底マスク処理を適用 | `false` |
 | `--cubemap` | Cubemap形式でも出力 | `false` |
 | `--remove-dynamic-objects` | Stage2動体除去を有効化 | `false` |
@@ -196,6 +196,10 @@ python main.py --cli input.mp4 -v
 | `--vo-center-roi-ratio F` | VOで使用する中心ROI比率（0.2-1.0） | `0.6` |
 | `--vo-max-features N` | VOの最大追跡特徴点数 | `600` |
 | `--vo-downscale-long-edge N` | VO入力を長辺N pxに縮小 | `1000` |
+| `--vo-frame-subsample N` | VOをNフレームごとに計算（1=従来同等） | `1` |
+| `--vo-adaptive-roi / --no-vo-adaptive-roi` | VO中心ROIの動的調整を有効/無効化 | `true` |
+| `--vo-fast-fail-inlier-ratio F` | VO早期失敗判定の最小inlier比率（0.0-1.0） | `0.12` |
+| `--vo-step-proxy-clip-px F` | VO step_proxyの上限クリップ値（px） | `80.0` |
 | `--config FILE` | 設定ファイル（JSON） | — |
 | `-v, --verbose` | 詳細ログ出力 | `false` |
 | `--rerun-stream` | 抽出中にRerunへストリーミング | `false` |
@@ -205,6 +209,7 @@ python main.py --cli input.mp4 -v
 入力モード:
 - `--cli` を指定すると単眼または `.osv`（ステレオ）を処理
 - `--front-video` と `--rear-video` を両方指定すると、前後魚眼2動画をステレオペアとして処理
+- `--equirectangular` は入力モード指定であり、単体では追加の再投影出力を有効化しません
 
 ### Rerunログ（キーフレーム検証）
 
@@ -597,6 +602,7 @@ output/
 - paired入力（OSV/front_rear）でもVOは代表レンズ（frame_a/front）のみで実行します。
 - `translation_delta` は互換メトリクスとして保持されますが、**実距離（meter）ではありません**。Stage0/Stage3の移動量評価には `vo_step_proxy`（inlier parallax）と `vo_step_proxy_norm`（median(step)=1 正規化）を使用します。
 - `world/trajectory` は単眼VOの相対軌跡（arbitrary scale）です。実スケール推定は行いません。
+- 高速化オプション（`vo_frame_subsample`, `vo_adaptive_roi`, `vo_fast_fail_inlier_ratio`, `vo_step_proxy_clip_px`）は速度向上と引き換えに、難シーンで `vo_valid` が減る可能性があります。
 
 
 ## ライセンス

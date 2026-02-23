@@ -480,7 +480,7 @@ class Accelerator:
         # CPU フォールバック: 個別計算
         from core.adaptive_selector import AdaptiveSelector
         selector = AdaptiveSelector()
-        return [selector.compute_ssim(ref=reference, frame=f) for f in frames]
+        return [selector.compute_ssim(reference, f) for f in frames]
 
     def _batch_ssim_torch(self, frames: list, reference: np.ndarray) -> list:
         """PyTorch GPUバッチSSIM"""

@@ -9,6 +9,7 @@ GUI/CLIではdict形式でオーバーライドできる。
 
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Tuple
+import numpy as np
 
 
 # =============================================================================
@@ -148,6 +149,12 @@ class KeyframeConfig:
     vo_downscale_long_edge: int = 1000
     vo_max_features: int = 600
     vo_t_sign: float = 1.0
+    vo_frame_subsample: int = 1
+    vo_adaptive_roi_enable: bool = True
+    vo_adaptive_roi_min: float = 0.45
+    vo_adaptive_roi_max: float = 0.70
+    vo_fast_fail_inlier_ratio: float = 0.12
+    vo_step_proxy_clip_px: float = 80.0
     calib_xml: str = ""
     front_calib_xml: str = ""
     rear_calib_xml: str = ""
@@ -232,6 +239,12 @@ class KeyframeConfig:
             'VO_DOWNSCALE_LONG_EDGE': self.vo_downscale_long_edge,
             'VO_MAX_FEATURES': self.vo_max_features,
             'VO_T_SIGN': self.vo_t_sign,
+            'VO_FRAME_SUBSAMPLE': self.vo_frame_subsample,
+            'VO_ADAPTIVE_ROI_ENABLE': self.vo_adaptive_roi_enable,
+            'VO_ADAPTIVE_ROI_MIN': self.vo_adaptive_roi_min,
+            'VO_ADAPTIVE_ROI_MAX': self.vo_adaptive_roi_max,
+            'VO_FAST_FAIL_INLIER_RATIO': self.vo_fast_fail_inlier_ratio,
+            'VO_STEP_PROXY_CLIP_PX': self.vo_step_proxy_clip_px,
             'CALIB_XML': self.calib_xml,
             'FRONT_CALIB_XML': self.front_calib_xml,
             'REAR_CALIB_XML': self.rear_calib_xml,
@@ -391,6 +404,12 @@ class KeyframeConfig:
         config.vo_downscale_long_edge = int(d.get('vo_downscale_long_edge', config.vo_downscale_long_edge))
         config.vo_max_features = int(d.get('vo_max_features', config.vo_max_features))
         config.vo_t_sign = float(d.get('vo_t_sign', config.vo_t_sign))
+        config.vo_frame_subsample = int(max(1, d.get('vo_frame_subsample', config.vo_frame_subsample)))
+        config.vo_adaptive_roi_enable = bool(d.get('vo_adaptive_roi_enable', config.vo_adaptive_roi_enable))
+        config.vo_adaptive_roi_min = float(np.clip(d.get('vo_adaptive_roi_min', config.vo_adaptive_roi_min), 0.2, 1.0))
+        config.vo_adaptive_roi_max = float(np.clip(d.get('vo_adaptive_roi_max', config.vo_adaptive_roi_max), config.vo_adaptive_roi_min, 1.0))
+        config.vo_fast_fail_inlier_ratio = float(np.clip(d.get('vo_fast_fail_inlier_ratio', config.vo_fast_fail_inlier_ratio), 0.0, 1.0))
+        config.vo_step_proxy_clip_px = float(max(0.0, d.get('vo_step_proxy_clip_px', config.vo_step_proxy_clip_px)))
         config.calib_xml = str(d.get('calib_xml', config.calib_xml) or "")
         config.front_calib_xml = str(d.get('front_calib_xml', config.front_calib_xml) or "")
         config.rear_calib_xml = str(d.get('rear_calib_xml', config.rear_calib_xml) or "")

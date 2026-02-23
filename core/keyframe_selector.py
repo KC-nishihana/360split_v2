@@ -20,6 +20,7 @@ from .adaptive_selector import AdaptiveSelector
 from .accelerator import get_accelerator
 from processing.fisheye_rig import FisheyeRigProcessor
 from processing.mask_processor import MaskProcessor
+from .visual_odometry import KLTVisualOdometry, calibration_from_dict
 from .exceptions import (
     GeometricDegeneracyError,
     EstimationFailureError,
@@ -213,6 +214,19 @@ class KeyframeSelector:
             'STAGE3_WEIGHT_BASE': 0.70,
             'STAGE3_WEIGHT_TRAJECTORY': 0.25,
             'STAGE3_WEIGHT_STAGE0_RISK': 0.05,
+            'VO_ENABLED': True,
+            'VO_CENTER_ROI_RATIO': 0.6,
+            'VO_MAX_FEATURES': 600,
+            'VO_QUALITY_LEVEL': 0.01,
+            'VO_MIN_DISTANCE': 8,
+            'VO_MIN_TRACK_POINTS': 24,
+            'VO_RANSAC_THRESHOLD': 1.0,
+            'VO_DOWNSCALE_LONG_EDGE': 1000,
+            'VO_MATCH_NORM_FACTOR': 120.0,
+            'CALIB_XML': '',
+            'FRONT_CALIB_XML': '',
+            'REAR_CALIB_XML': '',
+            'CALIB_MODEL': 'auto',
         }
 
         # 外部設定でオーバーライド
@@ -285,6 +299,20 @@ class KeyframeSelector:
                 'stage3_weight_base': 'STAGE3_WEIGHT_BASE',
                 'stage3_weight_trajectory': 'STAGE3_WEIGHT_TRAJECTORY',
                 'stage3_weight_stage0_risk': 'STAGE3_WEIGHT_STAGE0_RISK',
+                'projection_mode': 'PROJECTION_MODE',
+                'vo_enabled': 'VO_ENABLED',
+                'vo_center_roi_ratio': 'VO_CENTER_ROI_RATIO',
+                'vo_max_features': 'VO_MAX_FEATURES',
+                'vo_quality_level': 'VO_QUALITY_LEVEL',
+                'vo_min_distance': 'VO_MIN_DISTANCE',
+                'vo_min_track_points': 'VO_MIN_TRACK_POINTS',
+                'vo_ransac_threshold': 'VO_RANSAC_THRESHOLD',
+                'vo_downscale_long_edge': 'VO_DOWNSCALE_LONG_EDGE',
+                'vo_match_norm_factor': 'VO_MATCH_NORM_FACTOR',
+                'calib_xml': 'CALIB_XML',
+                'front_calib_xml': 'FRONT_CALIB_XML',
+                'rear_calib_xml': 'REAR_CALIB_XML',
+                'calib_model': 'CALIB_MODEL',
                 'analysis_mode': 'ANALYSIS_MODE',
             }
             for src, dst in alias_map.items():
@@ -341,6 +369,15 @@ class KeyframeSelector:
         self.rescue_mode_keyframes = []  # レスキューモードで選択されたキーフレーム
         self.target_mask_generator = self._build_target_mask_generator()
         self.mask_processor = MaskProcessor()
+        self.vo_estimator = KLTVisualOdometry(
+            max_features=int(self.config.get('VO_MAX_FEATURES', 600)),
+            quality_level=float(self.config.get('VO_QUALITY_LEVEL', 0.01)),
+            min_distance=float(self.config.get('VO_MIN_DISTANCE', 8.0)),
+            min_track_points=int(self.config.get('VO_MIN_TRACK_POINTS', 24)),
+            ransac_threshold=float(self.config.get('VO_RANSAC_THRESHOLD', 1.0)),
+            center_roi_ratio=float(self.config.get('VO_CENTER_ROI_RATIO', 0.6)),
+            downscale_long_edge=int(self.config.get('VO_DOWNSCALE_LONG_EDGE', 1000)),
+        )
 
     def _load_inpaint_hook(self):
         module_name = str(self.config.get('DYNAMIC_MASK_INPAINT_MODULE', '') or '').strip()
@@ -890,6 +927,33 @@ class KeyframeSelector:
             nearest = left if abs(frame_idx - left) <= abs(frame_idx - right) else right
         return stage0_metrics.get(nearest, {"flow_mag_light": 0.0, "ssim_light": 1.0, "motion_risk": 0.0})
 
+    def _get_runtime_vo_calibration(self, is_paired: bool):
+        runtime = self.config.get("calibration_runtime", {})
+        if not isinstance(runtime, dict):
+            return None
+        if is_paired:
+            front = calibration_from_dict(runtime.get("front"))
+            if front is not None:
+                return front
+            return calibration_from_dict(runtime.get("mono"))
+        return calibration_from_dict(runtime.get("mono"))
+
+    def _inject_stage0_vo_metrics_into_stage2_records(
+        self,
+        records: List[Stage2FrameRecord],
+        stage0_metrics: Dict[int, Dict[str, float]],
+    ) -> None:
+        if not records or not stage0_metrics:
+            return
+        for record in records:
+            m = self._lookup_stage0_metrics(int(record.frame_index), stage0_metrics)
+            if "translation_delta" in m:
+                record.metrics["translation_delta"] = float(m.get("translation_delta", record.metrics.get("translation_delta", 0.0)))
+            if "rotation_delta" in m:
+                record.metrics["rotation_delta"] = float(m.get("rotation_delta", record.metrics.get("rotation_delta", 0.0)))
+            if "match_count" in m:
+                record.metrics["match_count"] = float(m.get("match_count", record.metrics.get("match_count", 0.0)))
+
     def _stage0_lightweight_motion_scan(
         self,
         video_loader,
@@ -907,17 +971,30 @@ class KeyframeSelector:
         out_w = int(self.config.get('EQUIRECT_WIDTH', 4096))
         out_h = int(self.config.get('EQUIRECT_HEIGHT', 2048))
         calibration = getattr(metadata, 'rig_calibration', None)
+        vo_calib = self._get_runtime_vo_calibration(is_paired=is_paired)
+        vo_enabled = bool(self.config.get('VO_ENABLED', True)) and vo_calib is not None
+        if bool(self.config.get('VO_ENABLED', True)) and vo_calib is None:
+            logger.warning("Stage0 VO disabled: calibration not available")
+        projection_mode = str(self.config.get('PROJECTION_MODE', self.config.get('projection_mode', ''))).strip().lower()
+        if projection_mode in ("equirectangular", "cubemap") and vo_enabled:
+            logger.warning("Stage0 VO skipped for panorama projection mode (future support)")
+            vo_enabled = False
+        if use_rig and vo_enabled:
+            # TODO: panorama/equirect/cubemap VO will be supported in a future milestone.
+            logger.warning("Stage0 VO uses representative lens only (stitch/equirect VO is skipped by design)")
         lap_th = max(1.0, float(self.config.get('LAPLACIAN_THRESHOLD', 100.0)))
         flow_norm_factor = max(1e-6, float(self.normalization.OPTICAL_FLOW_NORM_FACTOR))
 
         metrics: Dict[int, Dict[str, float]] = {}
         prev_frame = None
+        prev_vo_frame = None
 
         for idx, frame_idx in enumerate(frame_indices):
             if is_paired:
                 frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
                 if frame_a is None or frame_b is None:
                     continue
+                frame_vo_cur = frame_a
                 if use_rig:
                     frame_cur, _ = self.rig_processor.stitch_to_equirect(
                         frame_a, frame_b, calibration, (out_w, out_h)
@@ -928,6 +1005,7 @@ class KeyframeSelector:
                 frame_cur = video_loader.get_frame(frame_idx)
                 if frame_cur is None:
                     continue
+                frame_vo_cur = frame_cur
 
             if prev_frame is None:
                 flow_mag = 0.0
@@ -944,13 +1022,25 @@ class KeyframeSelector:
             flow_risk = float(np.clip(flow_mag / flow_norm_factor, 0.0, 1.0))
             ssim_change = float(np.clip(1.0 - ssim_light, 0.0, 1.0))
             motion_risk = float(np.clip(0.4 * texture_risk + 0.4 * flow_risk + 0.2 * ssim_change, 0.0, 1.0))
+            vo = self.vo_estimator.estimate(
+                prev_vo_frame,
+                frame_vo_cur,
+                calibration=vo_calib,
+                center_roi_ratio=float(self.config.get('VO_CENTER_ROI_RATIO', 0.6)),
+            ) if (vo_enabled and prev_vo_frame is not None) else None
 
             metrics[int(frame_idx)] = {
                 "flow_mag_light": flow_mag,
                 "ssim_light": ssim_light,
                 "motion_risk": motion_risk,
+                "rotation_delta": float(vo.rotation_delta_deg if vo else 0.0),
+                "translation_delta": float(vo.translation_delta_rel if vo else 0.0),
+                "match_count": float(vo.match_count if vo else 0.0),
+                "vo_inlier_ratio": float(vo.inlier_ratio if vo else 0.0),
+                "vo_valid": 1.0 if (vo.vo_valid if vo else False) else 0.0,
             }
             prev_frame = frame_cur
+            prev_vo_frame = frame_vo_cur
 
             if progress_callback:
                 progress_callback(idx + 1, len(frame_indices))
@@ -989,12 +1079,14 @@ class KeyframeSelector:
             return stage2_candidates
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
-        use_rig = bool(is_paired and self.config.get('ENABLE_RIG_STITCHING', True))
-        out_w = int(self.config.get('EQUIRECT_WIDTH', 4096))
-        out_h = int(self.config.get('EQUIRECT_HEIGHT', 2048))
-        calibration = getattr(metadata, 'rig_calibration', None)
-        flow_norm_factor = max(1e-6, float(self.normalization.OPTICAL_FLOW_NORM_FACTOR))
-        match_norm_factor = max(1e-6, float(self.normalization.FEATURE_MATCH_NORM_FACTOR))
+        vo_calib = self._get_runtime_vo_calibration(is_paired=is_paired)
+        vo_enabled = bool(self.config.get('VO_ENABLED', True)) and vo_calib is not None
+        projection_mode = str(self.config.get('PROJECTION_MODE', self.config.get('projection_mode', ''))).strip().lower()
+        if projection_mode in ("equirectangular", "cubemap") and vo_enabled:
+            logger.warning("Stage3 VO skipped for panorama projection mode (future support)")
+            vo_enabled = False
+        if bool(self.config.get('VO_ENABLED', True)) and vo_calib is None:
+            logger.warning("Stage3 VO disabled: calibration not available")
 
         frame_cache: Dict[int, Optional[np.ndarray]] = {}
 
@@ -1006,60 +1098,59 @@ class KeyframeSelector:
                 if frame_a is None or frame_b is None:
                     frame_cache[frame_idx] = None
                     return None
-                if use_rig:
-                    stitched, _ = self.rig_processor.stitch_to_equirect(
-                        frame_a, frame_b, calibration, (out_w, out_h)
-                    )
-                    frame_cache[frame_idx] = stitched
-                else:
-                    frame_cache[frame_idx] = frame_a
+                frame_cache[frame_idx] = frame_a
                 return frame_cache[frame_idx]
             frame = video_loader.get_frame(frame_idx)
             frame_cache[frame_idx] = frame
             return frame
 
         trajectory_consistency: Dict[int, float] = {tracked_indices[0]: 0.5}
-        prev_flow_norm = None
+        if not vo_enabled:
+            for idx in tracked_indices[1:]:
+                trajectory_consistency[idx] = 0.5
+        prev_rot = None
+        prev_trans = None
+        prev_valid = False
+        match_norm_factor = max(1e-6, float(self.config.get('VO_MATCH_NORM_FACTOR', 120.0)))
         for i in range(1, len(tracked_indices)):
+            if not vo_enabled:
+                break
             prev_idx = tracked_indices[i - 1]
             cur_idx = tracked_indices[i]
             prev_frame = _get_eval_frame(prev_idx)
             cur_frame = _get_eval_frame(cur_idx)
             if prev_frame is None or cur_frame is None:
                 trajectory_consistency[cur_idx] = 0.0
-                prev_flow_norm = None
+                prev_valid = False
                 continue
 
-            try:
-                g_scores = self.geometric_evaluator.evaluate(
-                    prev_frame, cur_frame, frame1_idx=prev_idx, frame2_idx=cur_idx
-                )
-                gric = float(g_scores.get('gric', 0.0))
-                match_norm = float(np.clip(
-                    float(g_scores.get('feature_match_count', 0.0)) / match_norm_factor,
-                    0.0, 1.0
-                ))
-            except Exception:
-                gric = 0.0
-                match_norm = 0.0
+            vo = self.vo_estimator.estimate(
+                prev_frame,
+                cur_frame,
+                calibration=vo_calib,
+                center_roi_ratio=float(self.config.get('VO_CENTER_ROI_RATIO', 0.6)),
+            ) if vo_enabled else None
+            if vo is None or not vo.vo_valid:
+                trajectory_consistency[cur_idx] = 0.0
+                prev_valid = False
+                continue
 
-            a_scores = self.adaptive_selector.evaluate(prev_frame, cur_frame, frames_window=[prev_frame, cur_frame])
-            ssim = float(a_scores.get('ssim', 1.0))
-            flow = float(a_scores.get('optical_flow', 0.0))
-            flow_norm = float(np.clip(flow / flow_norm_factor, 0.0, 1.0))
-            if prev_flow_norm is None:
-                smooth_score = 0.5
+            match_norm = float(np.clip(float(vo.match_count) / match_norm_factor, 0.0, 1.0))
+            valid_flag = 1.0 if vo.vo_valid else 0.0
+            confidence = float(np.clip(0.45 * vo.inlier_ratio + 0.35 * match_norm + 0.20 * valid_flag, 0.0, 1.0))
+
+            if not prev_valid or prev_rot is None or prev_trans is None:
+                smoothness = 0.5
             else:
-                smooth_score = float(np.clip(1.0 - abs(flow_norm - prev_flow_norm), 0.0, 1.0))
-            prev_flow_norm = flow_norm
+                rot_term = float(np.clip(1.0 - abs(float(vo.rotation_delta_deg) - float(prev_rot)) / 10.0, 0.0, 1.0))
+                trans_term = float(np.clip(1.0 - abs(float(vo.translation_delta_rel) - float(prev_trans)) / 0.15, 0.0, 1.0))
+                smoothness = float(0.5 * rot_term + 0.5 * trans_term)
 
-            # しきい値近傍のSSIMは連続性が高いとみなす
-            ssim_centered = float(np.clip(1.0 - abs(ssim - 0.85) / 0.85, 0.0, 1.0))
-            consistency = float(np.clip(
-                0.40 * gric + 0.30 * match_norm + 0.20 * ssim_centered + 0.10 * smooth_score,
-                0.0, 1.0,
-            ))
-            trajectory_consistency[cur_idx] = consistency
+            traj = float(np.clip(0.75 * confidence + 0.25 * smoothness, 0.0, 1.0))
+            trajectory_consistency[cur_idx] = traj
+            prev_rot = float(vo.rotation_delta_deg)
+            prev_trans = float(vo.translation_delta_rel)
+            prev_valid = True
 
         w_base = float(self.config.get('STAGE3_WEIGHT_BASE', 0.70))
         w_traj = float(self.config.get('STAGE3_WEIGHT_TRAJECTORY', 0.25))
@@ -1219,6 +1310,8 @@ class KeyframeSelector:
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
         _stage_summary("2", candidates=len(stage2_candidates), records=len(stage2_records))
+
+        self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
 
         # 停止区間に対するソフト抑制を適用
         stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)

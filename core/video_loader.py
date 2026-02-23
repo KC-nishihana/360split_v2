@@ -58,6 +58,7 @@ class VideoMetadata:
     rig_type: str = "monocular"
     rig_calibration: Optional[RigCalibration] = None
     rig_transforms: RigTransforms = None
+    monocular_calibration: Optional[Dict] = None
 
     def __post_init__(self):
         if self.rig_transforms is None:

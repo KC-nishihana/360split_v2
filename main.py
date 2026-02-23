@@ -16,7 +16,7 @@ import sys
 import argparse
 import json
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 import cv2
 
 # プロジェクトルートをパスに追加
@@ -25,6 +25,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.logger import setup_logger, get_logger, set_log_level
 from utils.image_io import write_image
+from core.visual_odometry.calibration import (
+    calibration_from_dict,
+    calibration_to_dict,
+    load_calibration_xml,
+    log_calibration_summary,
+    summarize_calibration,
+)
+from core.visual_odometry.calibration_check import run_calibration_check
 
 # アプリケーション起動時にルートロガーを初期化
 setup_logger()
@@ -241,6 +249,73 @@ def parse_arguments():
         default=None,
         help="魚眼有効領域中心Yオフセット（px）"
     )
+    parser.add_argument(
+        "--calib-xml",
+        type=str,
+        default=None,
+        help="単眼または代表レンズ用キャリブレーションXML"
+    )
+    parser.add_argument(
+        "--calib-model",
+        type=str,
+        default=None,
+        choices=["auto", "opencv", "fisheye"],
+        help="キャリブレーションモデル種別（auto/opencv/fisheye）"
+    )
+    parser.add_argument(
+        "--front-calib-xml",
+        type=str,
+        default=None,
+        help="front/rear入力時のfrontキャリブレーションXML"
+    )
+    parser.add_argument(
+        "--rear-calib-xml",
+        type=str,
+        default=None,
+        help="front/rear入力時のrearキャリブレーションXML"
+    )
+    parser.add_argument(
+        "--calib-check",
+        action="store_true",
+        default=False,
+        help="キャリブレーション検証モード（キーフレーム抽出は実行しない）"
+    )
+    parser.add_argument(
+        "--calib-check-frame",
+        type=int,
+        default=None,
+        help="キャリブレーション検証に使うフレーム番号"
+    )
+    parser.add_argument(
+        "--calib-check-out",
+        type=str,
+        default=None,
+        help="キャリブレーション検証出力ディレクトリ"
+    )
+    parser.add_argument(
+        "--disable-vo",
+        action="store_true",
+        default=False,
+        help="VOを無効化する"
+    )
+    parser.add_argument(
+        "--vo-center-roi-ratio",
+        type=float,
+        default=None,
+        help="VO中心ROI比率（0.2-1.0）"
+    )
+    parser.add_argument(
+        "--vo-max-features",
+        type=int,
+        default=None,
+        help="VOの最大追跡特徴点数"
+    )
+    parser.add_argument(
+        "--vo-downscale-long-edge",
+        type=int,
+        default=None,
+        help="VO入力の長辺縮小ピクセル（速度優先）"
+    )
 
     parser.add_argument(
         "--verbose", "-v",
@@ -378,6 +453,26 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["fisheye_mask_center_offset_x"] = int(args.fisheye_mask_center_offset_x)
     if args.fisheye_mask_center_offset_y is not None:
         config["fisheye_mask_center_offset_y"] = int(args.fisheye_mask_center_offset_y)
+    if args.calib_xml:
+        config["calib_xml"] = str(args.calib_xml)
+    if args.calib_model:
+        config["calib_model"] = str(args.calib_model).strip().lower()
+    if args.front_calib_xml:
+        config["front_calib_xml"] = str(args.front_calib_xml)
+    if args.rear_calib_xml:
+        config["rear_calib_xml"] = str(args.rear_calib_xml)
+    if args.disable_vo:
+        config["vo_enabled"] = False
+    if args.vo_center_roi_ratio is not None:
+        config["vo_center_roi_ratio"] = float(max(0.2, min(1.0, args.vo_center_roi_ratio)))
+    if args.vo_max_features is not None:
+        config["vo_max_features"] = int(max(50, args.vo_max_features))
+    if args.vo_downscale_long_edge is not None:
+        config["vo_downscale_long_edge"] = int(max(0, args.vo_downscale_long_edge))
+    if args.equirectangular:
+        config["projection_mode"] = "Equirectangular"
+    if args.cubemap:
+        config["projection_mode"] = "Cubemap"
 
 
 def resolve_output_dir(video_path: str, output_arg: str = None) -> Path:
@@ -482,6 +577,46 @@ def round_json_friendly(value):
     return value
 
 
+def _load_calibrations_for_runtime(
+    config: dict,
+    meta,
+    is_front_rear: bool,
+    is_stereo_mode: bool,
+) -> dict:
+    model_hint = str(config.get("calib_model", "auto") or "auto").strip().lower()
+    fallback_size = (int(meta.width), int(meta.height))
+
+    mono_xml = str(config.get("calib_xml", "") or "").strip() or None
+    front_xml = str(config.get("front_calib_xml", "") or "").strip() or mono_xml
+    rear_xml = str(config.get("rear_calib_xml", "") or "").strip() or mono_xml
+
+    mono_calib = None
+    front_calib = None
+    rear_calib = None
+
+    if is_front_rear:
+        if front_xml:
+            front_calib = load_calibration_xml(front_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+            log_calibration_summary(logger, "front calibration", front_calib)
+        if rear_xml:
+            rear_calib = load_calibration_xml(rear_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+            log_calibration_summary(logger, "rear calibration", rear_calib)
+    else:
+        if mono_xml:
+            mono_calib = load_calibration_xml(mono_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+            log_calibration_summary(logger, "mono calibration", mono_calib)
+        elif is_stereo_mode:
+            logger.warning("stereo input detected without calibration XML: VO will be disabled")
+
+    runtime = {
+        "model_hint": model_hint,
+        "mono": calibration_to_dict(mono_calib),
+        "front": calibration_to_dict(front_calib),
+        "rear": calibration_to_dict(rear_calib),
+    }
+    return runtime
+
+
 def run_cli(args):
     """CLIモードでキーフレーム抽出を実行する。"""
     from core.keyframe_selector import KeyframeSelector
@@ -545,6 +680,35 @@ def run_cli(args):
     logger.info(f"動画情報: {meta.width}x{meta.height}, "
                 f"{meta.fps:.1f}fps, {meta.frame_count}フレーム, "
                 f"{meta.duration:.1f}秒")
+
+    calibration_runtime = _load_calibrations_for_runtime(
+        config=config,
+        meta=meta,
+        is_front_rear=is_front_rear,
+        is_stereo_mode=is_stereo_mode,
+    )
+    config["calibration_runtime"] = calibration_runtime
+    if not is_stereo_mode:
+        meta.monocular_calibration = calibration_runtime.get("mono")
+
+    if args.calib_check:
+        check_out_dir = Path(args.calib_check_out) if args.calib_check_out else output_dir / "calib_check"
+        check_out_dir.mkdir(parents=True, exist_ok=True)
+        report = run_calibration_check(
+            out_dir=str(check_out_dir),
+            video_path=None if is_front_rear else video_path,
+            calib=None if is_front_rear else calibration_from_dict(calibration_runtime.get("mono")),
+            front_video_path=args.front_video if is_front_rear else None,
+            rear_video_path=args.rear_video if is_front_rear else None,
+            front_calib=calibration_from_dict(calibration_runtime.get("front")) if is_front_rear else None,
+            rear_calib=calibration_from_dict(calibration_runtime.get("rear")) if is_front_rear else None,
+            frame_index=args.calib_check_frame,
+            roi_ratio=float(config.get("vo_center_roi_ratio", 0.6)),
+            logger=logger,
+        )
+        logger.info(f"キャリブレーション検証完了: {report.get('report_path')}")
+        loader.close()
+        return
 
     # キーフレーム選択
     selector = KeyframeSelector(config)
@@ -683,6 +847,11 @@ def run_cli(args):
         "duration": meta.duration,
         "resolution": f"{meta.width}x{meta.height}",
         "rig": serialize_rig_metadata(meta),
+        "calibration": {
+            "mono": summarize_calibration(calibration_from_dict(calibration_runtime.get("mono"))),
+            "front": summarize_calibration(calibration_from_dict(calibration_runtime.get("front"))),
+            "rear": summarize_calibration(calibration_from_dict(calibration_runtime.get("rear"))),
+        },
         "keyframe_count": len(keyframes),
         "settings": config,
         "keyframes": [

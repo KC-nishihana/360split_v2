@@ -143,6 +143,14 @@ class KeyframeConfig:
     stage3_weight_base: float = 0.70
     stage3_weight_trajectory: float = 0.25
     stage3_weight_stage0_risk: float = 0.05
+    vo_enabled: bool = True
+    vo_center_roi_ratio: float = 0.6
+    vo_downscale_long_edge: int = 1000
+    vo_max_features: int = 600
+    calib_xml: str = ""
+    front_calib_xml: str = ""
+    rear_calib_xml: str = ""
+    calib_model: str = "auto"
 
     def to_selector_dict(self) -> dict:
         """
@@ -218,6 +226,14 @@ class KeyframeConfig:
             'STAGE3_WEIGHT_BASE': self.stage3_weight_base,
             'STAGE3_WEIGHT_TRAJECTORY': self.stage3_weight_trajectory,
             'STAGE3_WEIGHT_STAGE0_RISK': self.stage3_weight_stage0_risk,
+            'VO_ENABLED': self.vo_enabled,
+            'VO_CENTER_ROI_RATIO': self.vo_center_roi_ratio,
+            'VO_DOWNSCALE_LONG_EDGE': self.vo_downscale_long_edge,
+            'VO_MAX_FEATURES': self.vo_max_features,
+            'CALIB_XML': self.calib_xml,
+            'FRONT_CALIB_XML': self.front_calib_xml,
+            'REAR_CALIB_XML': self.rear_calib_xml,
+            'CALIB_MODEL': self.calib_model,
         }
 
     @classmethod
@@ -368,6 +384,14 @@ class KeyframeConfig:
         config.stage3_weight_base = float(d.get('stage3_weight_base', config.stage3_weight_base))
         config.stage3_weight_trajectory = float(d.get('stage3_weight_trajectory', config.stage3_weight_trajectory))
         config.stage3_weight_stage0_risk = float(d.get('stage3_weight_stage0_risk', config.stage3_weight_stage0_risk))
+        config.vo_enabled = bool(d.get('vo_enabled', config.vo_enabled))
+        config.vo_center_roi_ratio = float(d.get('vo_center_roi_ratio', config.vo_center_roi_ratio))
+        config.vo_downscale_long_edge = int(d.get('vo_downscale_long_edge', config.vo_downscale_long_edge))
+        config.vo_max_features = int(d.get('vo_max_features', config.vo_max_features))
+        config.calib_xml = str(d.get('calib_xml', config.calib_xml) or "")
+        config.front_calib_xml = str(d.get('front_calib_xml', config.front_calib_xml) or "")
+        config.rear_calib_xml = str(d.get('rear_calib_xml', config.rear_calib_xml) or "")
+        config.calib_model = str(d.get('calib_model', config.calib_model) or "auto")
         return config
 
 

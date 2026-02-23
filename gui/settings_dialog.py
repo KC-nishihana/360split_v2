@@ -4,6 +4,10 @@
 """
 
 import json
+import os
+import platform
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +15,7 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QLabel, QSlider,
     QPushButton, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
     QFileDialog, QMessageBox, QGroupBox, QGridLayout
+    , QLineEdit
 )
 from PySide6.QtCore import Qt
 
@@ -375,6 +380,67 @@ class SettingsDialog(QDialog):
 
         stage03_group.setLayout(stage03_layout)
         layout.addWidget(stage03_group)
+
+        vo_group = QGroupBox("VO / Calibration")
+        vo_layout = QGridLayout()
+
+        self.vo_enabled = QCheckBox("VOを有効化")
+        self.vo_enabled.setChecked(bool(self.settings.get("vo_enabled", True)))
+        vo_layout.addWidget(self.vo_enabled, 0, 0, 1, 3)
+
+        vo_layout.addWidget(QLabel("Calib XML:"), 1, 0)
+        self.calib_xml = QLineEdit(str(self.settings.get("calib_xml", "")))
+        vo_layout.addWidget(self.calib_xml, 1, 1)
+        btn_calib = QPushButton("参照")
+        btn_calib.clicked.connect(lambda: self._pick_file_for_line_edit(self.calib_xml))
+        vo_layout.addWidget(btn_calib, 1, 2)
+
+        vo_layout.addWidget(QLabel("Front Calib XML:"), 2, 0)
+        self.front_calib_xml = QLineEdit(str(self.settings.get("front_calib_xml", "")))
+        vo_layout.addWidget(self.front_calib_xml, 2, 1)
+        btn_front_calib = QPushButton("参照")
+        btn_front_calib.clicked.connect(lambda: self._pick_file_for_line_edit(self.front_calib_xml))
+        vo_layout.addWidget(btn_front_calib, 2, 2)
+
+        vo_layout.addWidget(QLabel("Rear Calib XML:"), 3, 0)
+        self.rear_calib_xml = QLineEdit(str(self.settings.get("rear_calib_xml", "")))
+        vo_layout.addWidget(self.rear_calib_xml, 3, 1)
+        btn_rear_calib = QPushButton("参照")
+        btn_rear_calib.clicked.connect(lambda: self._pick_file_for_line_edit(self.rear_calib_xml))
+        vo_layout.addWidget(btn_rear_calib, 3, 2)
+
+        vo_layout.addWidget(QLabel("Calib model:"), 4, 0)
+        self.calib_model = QComboBox()
+        self.calib_model.addItems(["auto", "opencv", "fisheye"])
+        self.calib_model.setCurrentText(str(self.settings.get("calib_model", "auto")))
+        vo_layout.addWidget(self.calib_model, 4, 1)
+
+        vo_layout.addWidget(QLabel("VO中心ROI比率:"), 5, 0)
+        self.vo_center_roi_ratio = QDoubleSpinBox()
+        self.vo_center_roi_ratio.setRange(0.2, 1.0)
+        self.vo_center_roi_ratio.setSingleStep(0.05)
+        self.vo_center_roi_ratio.setDecimals(2)
+        self.vo_center_roi_ratio.setValue(float(self.settings.get("vo_center_roi_ratio", 0.6)))
+        vo_layout.addWidget(self.vo_center_roi_ratio, 5, 1)
+
+        vo_layout.addWidget(QLabel("VO縮小長辺(px):"), 6, 0)
+        self.vo_downscale_long_edge = QSpinBox()
+        self.vo_downscale_long_edge.setRange(320, 2000)
+        self.vo_downscale_long_edge.setValue(int(self.settings.get("vo_downscale_long_edge", 1000)))
+        vo_layout.addWidget(self.vo_downscale_long_edge, 6, 1)
+
+        vo_layout.addWidget(QLabel("VO最大特徴点数:"), 7, 0)
+        self.vo_max_features = QSpinBox()
+        self.vo_max_features.setRange(100, 2000)
+        self.vo_max_features.setValue(int(self.settings.get("vo_max_features", 600)))
+        vo_layout.addWidget(self.vo_max_features, 7, 1)
+
+        self.calib_check_button = QPushButton("Calibration Check を実行")
+        self.calib_check_button.clicked.connect(self._run_calibration_check_from_gui)
+        vo_layout.addWidget(self.calib_check_button, 8, 0, 1, 3)
+
+        vo_group.setLayout(vo_layout)
+        layout.addWidget(vo_group)
         layout.addStretch()
         return widget
 
@@ -875,6 +941,14 @@ class SettingsDialog(QDialog):
             'stage3_weight_base': 0.70,
             'stage3_weight_trajectory': 0.25,
             'stage3_weight_stage0_risk': 0.05,
+            'vo_enabled': True,
+            'vo_center_roi_ratio': 0.6,
+            'vo_downscale_long_edge': 1000,
+            'vo_max_features': 600,
+            'calib_xml': '',
+            'front_calib_xml': '',
+            'rear_calib_xml': '',
+            'calib_model': 'auto',
         })
 
         try:
@@ -959,6 +1033,14 @@ class SettingsDialog(QDialog):
             'stage3_weight_base': self.stage3_weight_base.value(),
             'stage3_weight_trajectory': self.stage3_weight_trajectory.value(),
             'stage3_weight_stage0_risk': self.stage3_weight_stage0_risk.value(),
+            'vo_enabled': self.vo_enabled.isChecked(),
+            'vo_center_roi_ratio': self.vo_center_roi_ratio.value(),
+            'vo_downscale_long_edge': self.vo_downscale_long_edge.value(),
+            'vo_max_features': self.vo_max_features.value(),
+            'calib_xml': self.calib_xml.text().strip(),
+            'front_calib_xml': self.front_calib_xml.text().strip(),
+            'rear_calib_xml': self.rear_calib_xml.text().strip(),
+            'calib_model': self.calib_model.currentText(),
         }
 
         try:
@@ -1106,6 +1188,14 @@ class SettingsDialog(QDialog):
             self.stage3_weight_stage0_risk.setValue(
                 float(params.get('stage3_weight_stage0_risk', 0.05))
             )
+            self.vo_enabled.setChecked(bool(params.get('vo_enabled', True)))
+            self.vo_center_roi_ratio.setValue(float(params.get('vo_center_roi_ratio', 0.6)))
+            self.vo_downscale_long_edge.setValue(int(params.get('vo_downscale_long_edge', 1000)))
+            self.vo_max_features.setValue(int(params.get('vo_max_features', 600)))
+            self.calib_xml.setText(str(params.get('calib_xml', '')))
+            self.front_calib_xml.setText(str(params.get('front_calib_xml', '')))
+            self.rear_calib_xml.setText(str(params.get('rear_calib_xml', '')))
+            self.calib_model.setCurrentText(str(params.get('calib_model', 'auto')))
 
             logger.info(f"プリセット '{preset_id}' ({preset_info.name}) を適用しました")
 
@@ -1183,6 +1273,14 @@ class SettingsDialog(QDialog):
             self.stage3_weight_base.setValue(0.70)
             self.stage3_weight_trajectory.setValue(0.25)
             self.stage3_weight_stage0_risk.setValue(0.05)
+            self.vo_enabled.setChecked(True)
+            self.vo_center_roi_ratio.setValue(0.6)
+            self.vo_downscale_long_edge.setValue(1000)
+            self.vo_max_features.setValue(600)
+            self.calib_xml.setText("")
+            self.front_calib_xml.setText("")
+            self.rear_calib_xml.setText("")
+            self.calib_model.setCurrentText("auto")
 
             QMessageBox.information(self, "完了", "設定をデフォルト値にリセットしました")
 
@@ -1198,3 +1296,81 @@ class SettingsDialog(QDialog):
 
         if directory:
             self.output_dir_label.setText(directory)
+
+    def _pick_file_for_line_edit(self, line_edit: QLineEdit):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "キャリブレーションXMLを選択",
+            str(Path.home()),
+            "XML Files (*.xml);;All Files (*)",
+        )
+        if path:
+            line_edit.setText(path)
+
+    def _run_calibration_check_from_gui(self):
+        out_dir = Path.home() / ".360split" / "calib_check"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        script_path = Path(__file__).resolve().parent.parent / "scripts" / "calibration_check.py"
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--out",
+            str(out_dir),
+            "--calib-model",
+            self.calib_model.currentText(),
+            "--roi-ratio",
+            str(self.vo_center_roi_ratio.value()),
+        ]
+        calib = self.calib_xml.text().strip()
+        front_calib = self.front_calib_xml.text().strip()
+        rear_calib = self.rear_calib_xml.text().strip()
+
+        parent = self.parent()
+        video_path = getattr(parent, "video_path", None) if parent is not None else None
+        is_stereo = bool(getattr(parent, "is_stereo", False)) if parent is not None else False
+        left_path = getattr(parent, "stereo_left_path", None) if parent is not None else None
+        right_path = getattr(parent, "stereo_right_path", None) if parent is not None else None
+
+        if is_stereo and left_path and right_path:
+            cmd.extend(["--front-video", str(left_path), "--rear-video", str(right_path)])
+            if front_calib:
+                cmd.extend(["--front-calib-xml", front_calib])
+            if rear_calib:
+                cmd.extend(["--rear-calib-xml", rear_calib])
+            if calib and not front_calib:
+                cmd.extend(["--front-calib-xml", calib])
+            if calib and not rear_calib:
+                cmd.extend(["--rear-calib-xml", calib])
+        elif video_path:
+            cmd.extend(["--video", str(video_path)])
+            if calib:
+                cmd.extend(["--calib-xml", calib])
+        else:
+            QMessageBox.warning(self, "警告", "先に動画を読み込んでください。")
+            return
+
+        try:
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(Path(__file__).resolve().parent.parent),
+                env=env,
+            )
+            if result.returncode == 0:
+                logger.info(f"Calibration Check complete: {out_dir}")
+                QMessageBox.information(self, "完了", f"Calibration Check 完了: {out_dir}")
+                if platform.system() == "Darwin":
+                    subprocess.Popen(["open", str(out_dir)])
+                elif platform.system() == "Windows":
+                    os.startfile(str(out_dir))  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["xdg-open", str(out_dir)])
+            else:
+                logger.warning(f"Calibration Check failed: {result.stderr}")
+                QMessageBox.warning(self, "エラー", f"Calibration Check 失敗:\n{result.stderr or result.stdout}")
+        except Exception as e:
+            logger.exception(f"Calibration Check execution error: {e}")
+            QMessageBox.warning(self, "エラー", f"Calibration Check 実行エラー:\n{e}")

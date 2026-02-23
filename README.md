@@ -132,6 +132,15 @@ python main.py --cli input.mp4 --disable-stage3-refinement
 # 魚眼外周マスクを調整（ステレオ入力時）
 python main.py --cli input.osv --fisheye-mask-radius-ratio 0.92 --fisheye-mask-center-offset-x 12
 
+# キャリブレーションXMLを指定してVOを有効化（Stage0/Stage3）
+python main.py --cli input.mp4 --calib-xml cam.xml --calib-model auto
+
+# キャリブレーション検証モード（抽出は行わない）
+python main.py --cli input.mp4 --calib-xml cam.xml --calib-check --calib-check-out ./calib_check
+python main.py --front-video front.mp4 --rear-video rear.mp4 \
+  --front-calib-xml front.xml --rear-calib-xml rear.xml \
+  --calib-check --calib-check-out ./calib_check_pair
+
 # 設定ファイルを指定
 python main.py --cli input.mp4 --config settings.json
 
@@ -176,6 +185,17 @@ python main.py --cli input.mp4 -v
 | `--fisheye-mask-radius-ratio F` | 魚眼有効領域の半径比（0.0-1.0） | `0.94` |
 | `--fisheye-mask-center-offset-x N` | 魚眼有効領域中心Xオフセット（px） | `0` |
 | `--fisheye-mask-center-offset-y N` | 魚眼有効領域中心Yオフセット（px） | `0` |
+| `--calib-xml PATH` | 単眼/代表レンズ用キャリブレーションXML | — |
+| `--calib-model {auto,opencv,fisheye}` | キャリブレーションモデル（autoはdist係数長で推定） | `auto` |
+| `--front-calib-xml PATH` | front/rear入力時のfront XML | — |
+| `--rear-calib-xml PATH` | front/rear入力時のrear XML | — |
+| `--calib-check` | キャリブレーション検証モード（キーフレーム抽出をスキップ） | `false` |
+| `--calib-check-frame N` | 検証に使用するフレーム番号 | サンプル複数 |
+| `--calib-check-out DIR` | 検証画像出力先 | `output/calib_check` |
+| `--disable-vo` | VOを無効化 | `false` |
+| `--vo-center-roi-ratio F` | VOで使用する中心ROI比率（0.2-1.0） | `0.6` |
+| `--vo-max-features N` | VOの最大追跡特徴点数 | `600` |
+| `--vo-downscale-long-edge N` | VO入力を長辺N pxに縮小 | `1000` |
 | `--config FILE` | 設定ファイル（JSON） | — |
 | `-v, --verbose` | 詳細ログ出力 | `false` |
 | `--rerun-stream` | 抽出中にRerunへストリーミング | `false` |
@@ -558,39 +578,15 @@ output/
 ### メタデータ (keyframe_metadata.json)
 
 各キーフレームのスコア詳細を含むJSONファイルが自動生成されます。フォトグラメトリソフトウェアとの連携や後処理スクリプトの入力として利用できます。
+`calibration` セクションと `settings.calibration_runtime` に、実際に使われた `K/dist/model/image_size/xml_path` が保存されます（再現性確保用）。
 
 
-## 実験的機能（開発中）
+## VO実装範囲（今回）
 
-### Visual Odometry（カメラ軌跡推定）
-
-`test/`ディレクトリに、360度動画からカメラの3D軌跡を推定するVisual Odometry（VO）モジュールが開発されています。
-
-**主な機能:**
-- モノキュラーVisual Odometry（単眼カメラによる自己位置推定）
-- 既存の`GeometricEvaluator`を活用した特徴点検出・マッチング
-- Essential Matrix推定によるカメラ姿勢計算
-- IMU融合による絶対スケール推定（開発中）
-- 3D軌跡の可視化
-
-**使用方法:**
-
-```bash
-cd test/
-
-# VO単独実行
-python3 vo_only_test.py
-
-# VO+IMU融合実行（IMUデータ準備後）
-python3 vo_imu_fusion.py
-```
-
-**詳細:**
-- `test/VO開発完了レポート.md` - 技術詳細とアーキテクチャ
-- `test/3D軌跡解析レポート.md` - 解析結果レポート
-- `test/OSVファイル_メタデータ調査レポート.md` - センサーデータ調査
-
-**注意:** この機能は実験的なものであり、メインシステムへの統合は今後予定されています。
+- VOは Stage0 / Stage3 のみで計算されます（Stage2で新規VO計算はしません）。
+- Stage2のstationary判定は Stage0由来の `translation_delta / rotation_delta / match_count` を参照します。
+- パノラマVO（equirect/cubemap/stitch_to_equirect）は今回対象外です。該当ケースでは警告ログを出してスキップします。
+- paired入力（OSV/front_rear）でもVOは代表レンズ（frame_a/front）のみで実行します。
 
 
 ## ライセンス

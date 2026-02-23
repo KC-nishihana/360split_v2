@@ -16,6 +16,7 @@
 
 import json
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -66,6 +67,9 @@ class MainWindow(QMainWindow):
         self._trajectory_left: bool = False
         self._active_stage_mode_label: str = "解析"
         self._analysis_run_id: Optional[str] = None
+        self._last_vo_summary: Dict[str, object] = {}
+        self._trajectory_runtime_counter: int = 0
+        self._trajectory_runtime_stride: int = 5
 
         # ステレオ（OSV）対応
         self.is_stereo: bool = False
@@ -335,6 +339,7 @@ class MainWindow(QMainWindow):
             self.timeline.set_stationary_ranges([])
             self.timeline.set_score_data([], [])
             self.trajectory.set_frame_data([], [])
+            self.trajectory.reset_runtime_trajectory()
             self.video_player.set_keyframe_indices([])
 
             self.video_path = path
@@ -424,6 +429,8 @@ class MainWindow(QMainWindow):
         self._stop_workers()
         self._stage1_scores.clear()
         self._analysis_masks.clear()
+        self._trajectory_runtime_counter = 0
+        self.trajectory.reset_runtime_trajectory()
 
         config = self.settings_panel.get_selector_dict()
         # GUI統合モードでは常に Stage0->1->2->3 を実行する
@@ -447,6 +454,7 @@ class MainWindow(QMainWindow):
         self._analysis_worker.stage1_batch.connect(self._on_stage1_batch)
         self._analysis_worker.stage1_finished.connect(self._on_stage1_finished)
         self._analysis_worker.frame_scores_updated.connect(self._on_scores_updated)
+        self._analysis_worker.trajectory_updated.connect(self._on_trajectory_updated)
         self._analysis_worker.keyframes_found.connect(self._on_keyframes_found)
         self._analysis_worker.analysis_finished.connect(self._on_analysis_finished)
         self._analysis_worker.error.connect(self._on_error)
@@ -477,7 +485,9 @@ class MainWindow(QMainWindow):
         sharpness = [min(s.sharpness / norm_factor, 1.0) for s in all_scores]
         self.timeline.set_score_data(indices, sharpness)
         self.timeline.set_stationary_ranges([])
-        self.trajectory.set_frame_data(all_scores, self.keyframe_list.keyframe_frames)
+        vo_summary = self._compute_vo_summary(all_scores)
+        self._last_vo_summary = vo_summary
+        self.trajectory.set_frame_data(all_scores, self.keyframe_list.keyframe_frames, vo_summary=vo_summary)
 
         self.statusBar().showMessage(
             f"Stage 1 完了: {len(all_scores)} フレームをスキャン。"
@@ -503,9 +513,12 @@ class MainWindow(QMainWindow):
             ssim_change=ssim_change if has_ssim else None
         )
         self.timeline.set_stationary_ranges(self._extract_stationary_ranges(updated))
-        self.trajectory.set_frame_data(updated, self.keyframe_list.keyframe_frames)
+        vo_summary = self._compute_vo_summary(updated)
+        self._last_vo_summary = vo_summary
+        self.trajectory.set_frame_data(updated, self.keyframe_list.keyframe_frames, vo_summary=vo_summary)
 
     def _on_analysis_finished(self):
+        self.trajectory.flush_runtime_trajectory()
         self._progress_bar.setVisible(False)
         n = len(self.keyframe_list.keyframe_frames)
         logger.info(
@@ -514,8 +527,20 @@ class MainWindow(QMainWindow):
             f" stage_mode={self._active_stage_mode_label},"
             f" keyframes={n}"
         )
-        self.statusBar().showMessage(f"解析完了: {n} キーフレーム検出")
-        QMessageBox.information(self, "完了", f"解析完了: {n} キーフレームを検出しました")
+        attempts = int(self._last_vo_summary.get("attempted", 0))
+        valid = int(self._last_vo_summary.get("valid", 0))
+        pose_valid = int(self._last_vo_summary.get("pose_valid", 0))
+        ratio = (valid / attempts) if attempts > 0 else 0.0
+        self.statusBar().showMessage(
+            f"解析完了: {n} キーフレーム検出 / VO有効率 {ratio:.1%} ({valid}/{attempts}), pose={pose_valid}"
+        )
+        QMessageBox.information(
+            self,
+            "完了",
+            f"解析完了: {n} キーフレームを検出しました\n"
+            f"VO有効率: {ratio:.1%} ({valid}/{attempts})\n"
+            f"VO pose有効点: {pose_valid}",
+        )
 
     # ==================================================================
     # 共通コールバック
@@ -541,7 +566,14 @@ class MainWindow(QMainWindow):
         self.timeline.set_keyframes(frames, scores)
         self.keyframe_list.set_keyframes(frames, scores)
         self.video_player.set_keyframe_indices(frames)
-        self.trajectory.set_frame_data(self._stage1_scores, frames)
+        self.trajectory.set_frame_data(self._stage1_scores, frames, vo_summary=self._compute_vo_summary(self._stage1_scores))
+
+    def _on_trajectory_updated(self, payload: dict):
+        self._trajectory_runtime_counter += 1
+        stride = max(1, int(self._trajectory_runtime_stride))
+        is_keyframe = bool(payload.get("is_keyframe", False))
+        force = is_keyframe or (self._trajectory_runtime_counter % stride == 0)
+        self.trajectory.append_runtime_pose(payload, force=force)
 
     def _on_error(self, msg: str):
         self._progress_bar.setVisible(False)
@@ -560,7 +592,11 @@ class MainWindow(QMainWindow):
                 self.keyframe_list.keyframe_scores
             )
             self.video_player.set_keyframe_indices(self.keyframe_list.keyframe_frames)
-            self.trajectory.set_frame_data(self._stage1_scores, self.keyframe_list.keyframe_frames)
+            self.trajectory.set_frame_data(
+                self._stage1_scores,
+                self.keyframe_list.keyframe_frames,
+                vo_summary=self._compute_vo_summary(self._stage1_scores),
+            )
 
     # ==================================================================
     # Live Preview
@@ -614,6 +650,40 @@ class MainWindow(QMainWindow):
         if start_idx is not None and end_idx is not None:
             ranges.append((start_idx, end_idx))
         return ranges
+
+    @staticmethod
+    def _compute_vo_summary(scores: List[FrameScoreData]) -> Dict[str, object]:
+        if not scores:
+            return {
+                "runtime_enabled": False,
+                "runtime_reason": "not_evaluated",
+                "attempted": 0,
+                "valid": 0,
+                "pose_valid": 0,
+                "reason_counts": {},
+            }
+        attempted = 0
+        valid = 0
+        pose_valid = 0
+        reasons = Counter()
+        for score in scores:
+            attempted += 1 if bool(getattr(score, "vo_attempted", False)) else 0
+            valid += 1 if bool(getattr(score, "vo_valid", False)) else 0
+            pose_valid += 1 if bool(getattr(score, "vo_pose_valid", False)) else 0
+            reasons[str(getattr(score, "vo_status_reason", "unknown"))] += 1
+        top_reason = reasons.most_common(1)[0][0] if reasons else "unknown"
+        runtime_enabled = any(
+            reason not in {"calibration_unavailable", "projection_mode_unsupported", "vo_disabled_by_config"}
+            for reason in reasons.keys()
+        )
+        return {
+            "runtime_enabled": bool(runtime_enabled),
+            "runtime_reason": str(top_reason),
+            "attempted": int(attempted),
+            "valid": int(valid),
+            "pose_valid": int(pose_valid),
+            "reason_counts": dict(reasons),
+        }
 
     # ==================================================================
     # エクスポート

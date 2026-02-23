@@ -101,7 +101,7 @@ class Stage2FrameRecord:
     quality_scores: Dict[str, float]
     geometric_scores: Dict[str, float]
     adaptive_scores: Dict[str, float]
-    metrics: Dict[str, float]
+    metrics: Dict[str, Any]
     is_candidate: bool = False
     is_keyframe: bool = False
     t_xyz: Optional[List[float]] = None
@@ -931,8 +931,8 @@ class KeyframeSelector:
     @staticmethod
     def _lookup_stage0_metrics(
         frame_idx: int,
-        stage0_metrics: Dict[int, Dict[str, float]],
-    ) -> Dict[str, float]:
+        stage0_metrics: Dict[int, Dict[str, Any]],
+    ) -> Dict[str, Any]:
         if not stage0_metrics:
             return {"flow_mag_light": 0.0, "ssim_light": 1.0, "motion_risk": 0.0}
         if frame_idx in stage0_metrics:
@@ -957,10 +957,36 @@ class KeyframeSelector:
             return calibration_from_dict(runtime.get("mono"))
         return calibration_from_dict(runtime.get("mono"))
 
+    def _resolve_vo_runtime(self, is_paired: bool, stage_label: str) -> Tuple[bool, Optional[object], str]:
+        if not bool(self.config.get('VO_ENABLED', True)):
+            return False, None, "vo_disabled_by_config"
+
+        vo_calib = self._get_runtime_vo_calibration(is_paired=is_paired)
+        if vo_calib is None:
+            logger.warning(f"{stage_label} VO disabled: calibration not available")
+            return False, None, "calibration_unavailable"
+
+        projection_mode = str(
+            self.config.get('PROJECTION_MODE', self.config.get('projection_mode', ''))
+        ).strip().lower()
+        if (not is_paired) and projection_mode in ("equirectangular", "cubemap"):
+            logger.warning(f"{stage_label} VO skipped for panorama projection mode (future support)")
+            return False, vo_calib, "projection_mode_unsupported"
+
+        return True, vo_calib, "enabled"
+
+    def get_vo_runtime_status(self, is_paired: bool) -> Dict[str, Any]:
+        enabled, calib, reason = self._resolve_vo_runtime(is_paired=is_paired, stage_label="Runtime")
+        return {
+            "enabled": bool(enabled),
+            "reason": str(reason),
+            "calibration_loaded": bool(calib is not None),
+        }
+
     def _inject_stage0_vo_metrics_into_stage2_records(
         self,
         records: List[Stage2FrameRecord],
-        stage0_metrics: Dict[int, Dict[str, float]],
+        stage0_metrics: Dict[int, Dict[str, Any]],
     ) -> None:
         if not records or not stage0_metrics:
             return
@@ -980,13 +1006,16 @@ class KeyframeSelector:
                 record.metrics["vo_inlier_ratio"] = float(m.get("vo_inlier_ratio", 0.0))
             if "vo_rot_deg" in m:
                 record.metrics["vo_rot_deg"] = float(m.get("vo_rot_deg", 0.0))
+            if "vo_status_reason" in m:
+                record.metrics["vo_status_reason"] = str(m.get("vo_status_reason", "unknown"))
 
     def _stage0_lightweight_motion_scan(
         self,
         video_loader,
         metadata: VideoMetadata,
         progress_callback: Optional[Callable[[int, int], None]],
-    ) -> Dict[int, Dict[str, float]]:
+        frame_log_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[int, Dict[str, Any]]:
         total_frames = max(0, int(metadata.frame_count))
         stride = max(1, int(self.config.get('STAGE0_STRIDE', 5)))
         frame_indices = list(range(0, total_frames, stride))
@@ -998,28 +1027,25 @@ class KeyframeSelector:
         out_w = int(self.config.get('EQUIRECT_WIDTH', 4096))
         out_h = int(self.config.get('EQUIRECT_HEIGHT', 2048))
         calibration = getattr(metadata, 'rig_calibration', None)
-        vo_calib = self._get_runtime_vo_calibration(is_paired=is_paired)
-        vo_enabled = bool(self.config.get('VO_ENABLED', True)) and vo_calib is not None
+        vo_enabled, vo_calib, vo_status_reason = self._resolve_vo_runtime(
+            is_paired=is_paired,
+            stage_label="Stage0",
+        )
         vo_subsample = max(1, int(self.config.get('VO_FRAME_SUBSAMPLE', 1)))
         adaptive_roi_enable = bool(self.config.get('VO_ADAPTIVE_ROI_ENABLE', True))
         roi_min = float(np.clip(self.config.get('VO_ADAPTIVE_ROI_MIN', 0.45), 0.2, 1.0))
         roi_max = float(np.clip(self.config.get('VO_ADAPTIVE_ROI_MAX', 0.70), roi_min, 1.0))
         step_clip = float(max(0.0, self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)))
-        if bool(self.config.get('VO_ENABLED', True)) and vo_calib is None:
-            logger.warning("Stage0 VO disabled: calibration not available")
-        projection_mode = str(self.config.get('PROJECTION_MODE', self.config.get('projection_mode', ''))).strip().lower()
-        if projection_mode in ("equirectangular", "cubemap") and vo_enabled:
-            logger.warning("Stage0 VO skipped for panorama projection mode (future support)")
-            vo_enabled = False
         if use_rig and vo_enabled:
             # TODO: panorama/equirect/cubemap VO will be supported in a future milestone.
             logger.warning("Stage0 VO uses representative lens only (stitch/equirect VO is skipped by design)")
         lap_th = max(1.0, float(self.config.get('LAPLACIAN_THRESHOLD', 100.0)))
         flow_norm_factor = max(1e-6, float(self.normalization.OPTICAL_FLOW_NORM_FACTOR))
 
-        metrics: Dict[int, Dict[str, float]] = {}
+        metrics: Dict[int, Dict[str, Any]] = {}
         prev_frame = None
         prev_vo_frame = None
+        trajectory_samples: List[Dict[str, Any]] = []
 
         for idx, frame_idx in enumerate(frame_indices):
             if is_paired:
@@ -1065,9 +1091,21 @@ class KeyframeSelector:
                 calibration=vo_calib,
                 center_roi_ratio=roi_ratio,
             ) if vo_should_run else None
+            vo_valid = bool(vo.vo_valid) if vo is not None else False
             step_proxy = float(vo.step_proxy if vo else 0.0)
             if step_clip > 0.0:
                 step_proxy = min(step_proxy, step_clip)
+            t_dir = [float(x) for x in getattr(vo, "t_dir", [0.0, 0.0, 0.0])] if vo_valid else [0.0, 0.0, 0.0]
+            r_rel_q = [float(x) for x in getattr(vo, "r_rel_q_wxyz", [1.0, 0.0, 0.0, 0.0])] if vo_valid else [1.0, 0.0, 0.0, 0.0]
+            trajectory_samples.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "vo_valid": bool(vo_valid),
+                    "t_dir": t_dir,
+                    "step_proxy": float(step_proxy),
+                    "r_rel_q_wxyz": r_rel_q,
+                }
+            )
 
             metrics[int(frame_idx)] = {
                 "flow_mag_light": flow_mag,
@@ -1080,7 +1118,15 @@ class KeyframeSelector:
                 "vo_rot_deg": float(vo.rotation_delta_deg if vo else 0.0),
                 "match_count": float(vo.match_count if vo else 0.0),
                 "vo_inlier_ratio": float(vo.inlier_ratio if vo else 0.0),
-                "vo_valid": 1.0 if (vo.vo_valid if vo else False) else 0.0,
+                "vo_valid": 1.0 if vo_valid else 0.0,
+                "vo_attempted": 1.0 if vo_should_run else 0.0,
+                "vo_pose_valid": 0.0,
+                "vo_t_dir": t_dir,
+                "vo_r_rel_q_wxyz": r_rel_q,
+                "vo_status_reason": (
+                    "frame_subsample_skip" if (vo_enabled and prev_vo_frame is not None and not vo_should_run)
+                    else ("enabled" if vo_valid else ("estimate_failed_or_low_inlier" if vo_should_run else vo_status_reason))
+                ),
             }
             prev_frame = frame_cur
             prev_vo_frame = frame_vo_cur
@@ -1100,6 +1146,41 @@ class KeyframeSelector:
             step = float(m.get("vo_step_proxy", 0.0))
             m["vo_step_proxy_norm"] = float(step / step_median) if step > 0.0 else 0.0
 
+        trajectory_map = integrate_relative_trajectory(
+            trajectory_samples,
+            t_sign=float(self.config.get("VO_T_SIGN", 1.0)),
+        )
+        for frame_idx, m in metrics.items():
+            pose = trajectory_map.get(int(frame_idx))
+            if pose is None:
+                m["t_xyz"] = None
+                m["q_wxyz"] = None
+                m["vo_pose_valid"] = 0.0
+                continue
+            m["t_xyz"] = [float(x) for x in pose.get("t_xyz", [0.0, 0.0, 0.0])]
+            m["q_wxyz"] = [float(x) for x in pose.get("q_wxyz", [1.0, 0.0, 0.0, 0.0])]
+            m["vo_pose_valid"] = 1.0
+
+        if frame_log_callback:
+            for frame_idx in sorted(metrics.keys()):
+                m = metrics[int(frame_idx)]
+                self._emit_frame_log(
+                    frame_log_callback,
+                    {
+                        "frame_index": int(frame_idx),
+                        "frame": None,
+                        "is_keyframe": False,
+                        "metrics": dict(m),
+                        "quality_scores": {},
+                        "geometric_scores": {},
+                        "adaptive_scores": {},
+                        "t_xyz": m.get("t_xyz"),
+                        "q_wxyz": m.get("q_wxyz"),
+                        "points_world": None,
+                        "stage_label": "Stage0",
+                    },
+                )
+
         return metrics
 
     def _stage3_refine_with_trajectory(
@@ -1108,7 +1189,7 @@ class KeyframeSelector:
         stage2_candidates: List[KeyframeInfo],
         stage2_final: List[KeyframeInfo],
         stage2_records: List[Stage2FrameRecord],
-        stage0_metrics: Dict[int, Dict[str, float]],
+        stage0_metrics: Dict[int, Dict[str, Any]],
         video_loader=None,
     ) -> List[KeyframeInfo]:
         if not stage2_candidates:
@@ -1134,16 +1215,12 @@ class KeyframeSelector:
             return stage2_candidates
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
-        vo_calib = self._get_runtime_vo_calibration(is_paired=is_paired)
-        vo_enabled = bool(self.config.get('VO_ENABLED', True)) and vo_calib is not None
+        vo_enabled, vo_calib, vo_status_reason = self._resolve_vo_runtime(
+            is_paired=is_paired,
+            stage_label="Stage3",
+        )
         vo_subsample = max(1, int(self.config.get('VO_FRAME_SUBSAMPLE', 1)))
         step_clip = float(max(0.0, self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)))
-        projection_mode = str(self.config.get('PROJECTION_MODE', self.config.get('projection_mode', ''))).strip().lower()
-        if projection_mode in ("equirectangular", "cubemap") and vo_enabled:
-            logger.warning("Stage3 VO skipped for panorama projection mode (future support)")
-            vo_enabled = False
-        if bool(self.config.get('VO_ENABLED', True)) and vo_calib is None:
-            logger.warning("Stage3 VO disabled: calibration not available")
 
         frame_cache: Dict[int, Optional[np.ndarray]] = {}
 
@@ -1175,7 +1252,11 @@ class KeyframeSelector:
             }
         ]
         per_frame_vo: Dict[int, Dict[str, float]] = {
-            int(tracked_indices[0]): {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+            int(tracked_indices[0]): {
+                "vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0,
+                "vo_status_reason": "init",
+                "vo_attempted": 0.0,
+            }
         }
         step_proxy_raw: Dict[int, float] = {tracked_indices[0]: 0.0}
         valid_count = 0
@@ -1200,6 +1281,8 @@ class KeyframeSelector:
                     }
                 )
                 per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+                per_frame_vo[int(cur_idx)]["vo_status_reason"] = vo_status_reason
+                per_frame_vo[int(cur_idx)]["vo_attempted"] = 0.0
                 step_proxy_raw[int(cur_idx)] = 0.0
                 continue
             prev_idx = tracked_indices[i - 1]
@@ -1221,6 +1304,8 @@ class KeyframeSelector:
                     }
                 )
                 per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+                per_frame_vo[int(cur_idx)]["vo_status_reason"] = "frame_unavailable"
+                per_frame_vo[int(cur_idx)]["vo_attempted"] = 0.0
                 step_proxy_raw[int(cur_idx)] = 0.0
                 prev_valid = False
                 continue
@@ -1232,6 +1317,28 @@ class KeyframeSelector:
                 calibration=vo_calib,
                 center_roi_ratio=float(self.config.get('VO_CENTER_ROI_RATIO', 0.6)),
             ) if vo_should_run else None
+            if not vo_should_run:
+                trajectory_consistency[cur_idx] = 0.0
+                vo_step_proxy_norm[cur_idx] = 0.0
+                vo_dir_cos_prev[cur_idx] = 0.5
+                vo_rot_deg[cur_idx] = 0.0
+                trajectory_samples.append(
+                    {
+                        "frame_idx": int(cur_idx),
+                        "vo_valid": False,
+                        "t_dir": [0.0, 0.0, 0.0],
+                        "step_proxy": 0.0,
+                        "r_rel_q_wxyz": [1.0, 0.0, 0.0, 0.0],
+                    }
+                )
+                per_frame_vo[int(cur_idx)] = {
+                    "vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0,
+                    "vo_status_reason": "frame_subsample_skip",
+                    "vo_attempted": 0.0,
+                }
+                step_proxy_raw[int(cur_idx)] = 0.0
+                prev_valid = False
+                continue
             if vo is None or not vo.vo_valid:
                 trajectory_consistency[cur_idx] = 0.0
                 vo_step_proxy_norm[cur_idx] = 0.0
@@ -1246,7 +1353,11 @@ class KeyframeSelector:
                         "r_rel_q_wxyz": [1.0, 0.0, 0.0, 0.0],
                     }
                 )
-                per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+                per_frame_vo[int(cur_idx)] = {
+                    "vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0,
+                    "vo_status_reason": "estimate_failed_or_low_inlier",
+                    "vo_attempted": 1.0,
+                }
                 step_proxy_raw[int(cur_idx)] = 0.0
                 prev_valid = False
                 continue
@@ -1296,6 +1407,8 @@ class KeyframeSelector:
                 "step_proxy": float(step_val),
                 "inlier_ratio": float(getattr(vo, "inlier_ratio", 0.0)),
                 "rot_deg": float(vo.rotation_delta_deg),
+                "vo_status_reason": "enabled",
+                "vo_attempted": 1.0,
             }
             step_proxy_raw[int(cur_idx)] = float(step_val)
             prev_rot = float(vo.rotation_delta_deg)
@@ -1358,6 +1471,8 @@ class KeyframeSelector:
             if pose is not None:
                 record.t_xyz = [float(x) for x in pose.get("t_xyz", [0.0, 0.0, 0.0])]
                 record.q_wxyz = [float(x) for x in pose.get("q_wxyz", [1.0, 0.0, 0.0, 0.0])]
+            pose_direct = bool(int(idx) in trajectory_map)
+            record.metrics["vo_pose_valid"] = 1.0 if pose_direct else 0.0
             vo_info = per_frame_vo.get(int(idx), {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0})
             record.metrics["vo_valid"] = float(vo_info.get("vo_valid", record.metrics.get("vo_valid", 0.0)))
             record.metrics["vo_inlier_ratio"] = float(vo_info.get("inlier_ratio", record.metrics.get("vo_inlier_ratio", 0.0)))
@@ -1365,6 +1480,8 @@ class KeyframeSelector:
             record.metrics["vo_step_proxy_norm"] = float(vo_step_proxy_norm.get(int(idx), 0.0))
             record.metrics["vo_dir_cos_prev"] = float(vo_dir_cos_prev.get(int(idx), 0.5))
             record.metrics["vo_rot_deg"] = float(vo_rot_deg.get(int(idx), vo_info.get("rot_deg", 0.0)))
+            record.metrics["vo_status_reason"] = str(vo_info.get("vo_status_reason", vo_status_reason))
+            record.metrics["vo_attempted"] = float(vo_info.get("vo_attempted", 0.0))
 
         return stage2_candidates
 
@@ -1446,12 +1563,12 @@ class KeyframeSelector:
             mode_enable_stage3 = True
 
         # ===== Stage 0: 軽量走査 =====
-        stage0_metrics: Dict[int, Dict[str, float]] = {}
+        stage0_metrics: Dict[int, Dict[str, Any]] = {}
         if mode_enable_stage0:
             _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
             logger.info("Stage 0: 軽量運動量走査開始")
             stage0_metrics = self._stage0_lightweight_motion_scan(
-                video_loader, metadata, progress_callback
+                video_loader, metadata, progress_callback, frame_log_callback
             )
             logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
             _stage_summary("0", samples=len(stage0_metrics))
@@ -1696,7 +1813,7 @@ class KeyframeSelector:
         stage1_candidates: List[Dict],
         progress_callback: Optional[Callable[[int, int], None]],
         frame_log_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-        stage0_metrics: Optional[Dict[int, Dict[str, float]]] = None,
+        stage0_metrics: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> Tuple[List[KeyframeInfo], List[Stage2FrameRecord]]:
         """
         Stage 2: 精密評価（候補フレームのみ）
@@ -1756,7 +1873,8 @@ class KeyframeSelector:
             combined: float,
             is_keyframe_flag: float = 0.0,
             stage0_motion_risk: float = 0.0,
-        ) -> Dict[str, float]:
+            vo_status_reason: str = "not_evaluated",
+        ) -> Dict[str, Any]:
             ssim = float(a_scores.get("ssim", 1.0))
             flow_mag = float(a_scores.get("optical_flow", 0.0))
             return {
@@ -1784,6 +1902,9 @@ class KeyframeSelector:
                 "combined_stage2": float(combined),
                 "combined_stage3": float(combined),
                 "stage3_selected_flag": 0.0,
+                "vo_status_reason": str(vo_status_reason),
+                "vo_pose_valid": 0.0,
+                "vo_attempted": 0.0,
             }
 
         def _append_record(
@@ -1817,6 +1938,7 @@ class KeyframeSelector:
                 quality_scores = candidate_info['quality_scores']
                 stage0_entry = self._lookup_stage0_metrics(frame_idx, stage0_metrics or {})
                 stage0_motion_risk = float(np.clip(stage0_entry.get("motion_risk", 0.0), 0.0, 1.0))
+                vo_status_reason = str(stage0_entry.get("vo_status_reason", "not_evaluated"))
 
                 if progress_callback:
                     progress_callback(idx, len(stage1_candidates))
@@ -1870,7 +1992,7 @@ class KeyframeSelector:
                     combined = float(self._compute_combined_score(quality_scores, {}, {}))
                     metrics = _build_metrics(
                         quality_scores, geometric_scores, adaptive_scores, combined,
-                        is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk
+                        is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk, vo_status_reason=vo_status_reason
                     )
                     _append_record(
                         frame_idx=frame_idx,
@@ -1975,7 +2097,7 @@ class KeyframeSelector:
                             combined = float(self._compute_combined_score(quality_scores, {}, {}))
                             metrics = _build_metrics(
                                 quality_scores, geometric_scores, adaptive_scores, combined,
-                                is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk
+                                is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk, vo_status_reason=vo_status_reason
                             )
                             _append_record(
                                 frame_idx=frame_idx,
@@ -2015,7 +2137,7 @@ class KeyframeSelector:
                         combined = float(self._compute_combined_score(quality_scores, geometric_scores, adaptive_scores))
                         metrics = _build_metrics(
                             quality_scores, geometric_scores, adaptive_scores, combined,
-                            is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk
+                            is_keyframe_flag=0.0, stage0_motion_risk=stage0_motion_risk, vo_status_reason=vo_status_reason
                         )
                         _append_record(
                             frame_idx=frame_idx,
@@ -2070,6 +2192,7 @@ class KeyframeSelector:
                     float(combined_score),
                     is_keyframe_flag=1.0 if is_selected else 0.0,
                     stage0_motion_risk=stage0_motion_risk,
+                    vo_status_reason=vo_status_reason,
                 )
                 _append_record(
                     frame_idx=frame_idx,

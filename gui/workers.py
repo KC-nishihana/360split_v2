@@ -13,6 +13,7 @@ ExportWorker:
 
 import cv2
 import numpy as np
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -23,6 +24,10 @@ from PySide6.QtCore import QThread, Signal, QObject
 from utils.logger import get_logger
 from utils.image_io import write_image
 from utils.rerun_logger import RerunKeyframeLogger
+from core.visual_odometry.calibration import (
+    calibration_to_dict,
+    load_calibration_xml,
+)
 logger = get_logger(__name__)
 
 
@@ -54,6 +59,10 @@ class FrameScoreData:
     is_keyframe: bool = False
     t_xyz: Optional[List[float]] = None
     q_wxyz: Optional[List[float]] = None
+    vo_status_reason: str = "not_evaluated"
+    vo_pose_valid: bool = False
+    vo_attempted: bool = False
+    vo_valid: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +209,7 @@ class Stage2Worker(QThread):
     progress = Signal(int, int, str)
     keyframes_found = Signal(list)
     frame_scores_updated = Signal(list)
+    trajectory_updated = Signal(dict)
     analysis_finished = Signal()
     error = Signal(str)
 
@@ -216,7 +226,7 @@ class Stage2Worker(QThread):
 
     def run(self):
         try:
-            from core.video_loader import VideoLoader
+            from core.video_loader import VideoLoader, DualVideoLoader
             from core.keyframe_selector import KeyframeSelector
             stage_label = str(self.config.get("analysis_stage_label", "Stage 2"))
             logger.info(
@@ -230,8 +240,14 @@ class Stage2Worker(QThread):
                 f" stage0_stride={int(self.config.get('stage0_stride', self.config.get('STAGE0_STRIDE', 5)))}"
             )
 
-            loader = VideoLoader()
-            loader.load(self.video_path)
+            if str(self.video_path).lower().endswith(".osv"):
+                loader = DualVideoLoader()
+                loader.load(self.video_path)
+                logger.info("Stage2Worker: OSV入力をDualVideoLoaderで解析します（paired mode）")
+            else:
+                loader = VideoLoader()
+                loader.load(self.video_path)
+            _ensure_runtime_calibration(self.config, loader)
 
             selector = KeyframeSelector(config=self.config)
             rerun_logger = None
@@ -258,10 +274,22 @@ class Stage2Worker(QThread):
                 metrics_map[frame_idx] = dict(payload.get("metrics", {}))
                 t_xyz = payload.get("t_xyz")
                 q_wxyz = payload.get("q_wxyz")
+                t_xyz_list = [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None
+                q_wxyz_list = [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None
                 pose_map[frame_idx] = {
-                    "t_xyz": [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None,
-                    "q_wxyz": [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None,
+                    "t_xyz": t_xyz_list,
+                    "q_wxyz": q_wxyz_list,
                 }
+                if t_xyz_list is not None:
+                    self.trajectory_updated.emit(
+                        {
+                            "frame_index": frame_idx,
+                            "t_xyz": t_xyz_list,
+                            "q_wxyz": q_wxyz_list,
+                            "is_keyframe": bool(payload.get("is_keyframe", False)),
+                            "is_stationary": bool(float(metrics_map[frame_idx].get("is_stationary", 0.0)) > 0.5),
+                        }
+                    )
                 if rerun_logger is None or not rerun_logger.enabled:
                     return
                 rerun_logger.log_frame(
@@ -311,6 +339,10 @@ class Stage2Worker(QThread):
                 fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
                 fsd.t_xyz = p.get("t_xyz")
                 fsd.q_wxyz = p.get("q_wxyz")
+                fsd.vo_status_reason = str(m.get('vo_status_reason', 'not_evaluated'))
+                fsd.vo_pose_valid = bool(float(m.get('vo_pose_valid', 0.0)) > 0.5)
+                fsd.vo_attempted = bool(float(m.get('vo_attempted', 0.0)) > 0.5)
+                fsd.vo_valid = bool(float(m.get('vo_valid', 0.0)) > 0.5)
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
@@ -363,6 +395,7 @@ class UnifiedAnalysisWorker(QThread):
     stage1_batch = Signal(list)
     stage1_finished = Signal(list)
     frame_scores_updated = Signal(list)
+    trajectory_updated = Signal(dict)
     keyframes_found = Signal(list)
     analysis_finished = Signal()
     error = Signal(str)
@@ -379,7 +412,7 @@ class UnifiedAnalysisWorker(QThread):
 
     def run(self):
         try:
-            from core.video_loader import VideoLoader
+            from core.video_loader import VideoLoader, DualVideoLoader
             from core.keyframe_selector import KeyframeSelector
             from core.quality_evaluator import QualityEvaluator
             run_id = str(self.config.get("analysis_run_id", "n/a"))
@@ -454,8 +487,14 @@ class UnifiedAnalysisWorker(QThread):
             self.progress.emit(50, 100, "Stage 1 完了。Stage 2/3 開始...")
 
             # ----- Stage 2: 精密評価 -----
-            loader = VideoLoader()
-            loader.load(self.video_path)
+            if str(self.video_path).lower().endswith(".osv"):
+                loader = DualVideoLoader()
+                loader.load(self.video_path)
+                logger.info("UnifiedAnalysisWorker: OSV入力をDualVideoLoaderで解析します（paired mode）")
+            else:
+                loader = VideoLoader()
+                loader.load(self.video_path)
+            _ensure_runtime_calibration(self.config, loader)
 
             selector = KeyframeSelector(config=self.config)
             rerun_logger = None
@@ -483,10 +522,22 @@ class UnifiedAnalysisWorker(QThread):
                 metrics_map[frame_idx] = dict(payload.get("metrics", {}))
                 t_xyz = payload.get("t_xyz")
                 q_wxyz = payload.get("q_wxyz")
+                t_xyz_list = [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None
+                q_wxyz_list = [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None
                 pose_map[frame_idx] = {
-                    "t_xyz": [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None,
-                    "q_wxyz": [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None,
+                    "t_xyz": t_xyz_list,
+                    "q_wxyz": q_wxyz_list,
                 }
+                if t_xyz_list is not None:
+                    self.trajectory_updated.emit(
+                        {
+                            "frame_index": frame_idx,
+                            "t_xyz": t_xyz_list,
+                            "q_wxyz": q_wxyz_list,
+                            "is_keyframe": bool(payload.get("is_keyframe", False)),
+                            "is_stationary": bool(float(metrics_map[frame_idx].get("is_stationary", 0.0)) > 0.5),
+                        }
+                    )
                 if rerun_logger is None or not rerun_logger.enabled:
                     return
                 rerun_logger.log_frame(
@@ -533,6 +584,10 @@ class UnifiedAnalysisWorker(QThread):
                 fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
                 fsd.t_xyz = p.get("t_xyz")
                 fsd.q_wxyz = p.get("q_wxyz")
+                fsd.vo_status_reason = str(m.get('vo_status_reason', 'not_evaluated'))
+                fsd.vo_pose_valid = bool(float(m.get('vo_pose_valid', 0.0)) > 0.5)
+                fsd.vo_attempted = bool(float(m.get('vo_attempted', 0.0)) > 0.5)
+                fsd.vo_valid = bool(float(m.get('vo_valid', 0.0)) > 0.5)
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
@@ -561,6 +616,124 @@ class UnifiedAnalysisWorker(QThread):
 class FullAnalysisWorker(UnifiedAnalysisWorker):
     """後方互換ラッパー。GUIは UnifiedAnalysisWorker を使用する。"""
     pass
+
+
+def _normalize_path_value(raw_path: object) -> str:
+    s = str(raw_path or "").strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1].strip()
+    if not s:
+        return ""
+    if os.name != "nt" and "\\" in s:
+        s = s.replace("\\", "/")
+    s = os.path.expandvars(os.path.expanduser(s))
+    return s
+
+
+def _resolve_calibration_path(raw_path: object, search_roots: List[Path]) -> str:
+    norm = _normalize_path_value(raw_path)
+    if not norm:
+        return ""
+    p = Path(norm)
+    candidates: List[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.extend([root / p for root in search_roots])
+        candidates.append(Path.cwd() / p)
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+    # Fallback: keep expanded input for logger/load attempt
+    return str(p)
+
+
+def _build_runtime_calibration(config: dict, loader) -> Dict[str, object]:
+    """GUI解析用に calibration_runtime を構築する（CLIと同等の最小構成）。"""
+    meta = loader.get_metadata()
+    if meta is None:
+        return {"model_hint": "auto", "mono": None, "front": None, "rear": None}
+
+    model_hint = str(config.get("calib_model", config.get("CALIB_MODEL", "auto")) or "auto").strip().lower()
+    fallback_size = (int(meta.width), int(meta.height))
+    video_path = str(getattr(loader, "_video_path", "") or "")
+    search_roots = [Path.cwd(), Path(__file__).resolve().parent.parent]
+    if video_path:
+        search_roots.append(Path(video_path).expanduser().resolve().parent)
+
+    mono_xml_raw = config.get("calib_xml", config.get("CALIB_XML", ""))
+    front_xml_raw = config.get("front_calib_xml", config.get("FRONT_CALIB_XML", ""))
+    rear_xml_raw = config.get("rear_calib_xml", config.get("REAR_CALIB_XML", ""))
+    mono_xml = _resolve_calibration_path(mono_xml_raw, search_roots) or None
+    front_xml = _resolve_calibration_path(front_xml_raw, search_roots) or mono_xml
+    rear_xml = _resolve_calibration_path(rear_xml_raw, search_roots) or mono_xml
+
+    mono = None
+    front = None
+    rear = None
+
+    is_paired = bool(getattr(loader, "is_paired", False))
+    if is_paired:
+        if front_xml:
+            front = load_calibration_xml(front_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+        if rear_xml:
+            rear = load_calibration_xml(rear_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+        if front is None and mono_xml:
+            front = load_calibration_xml(mono_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+        if rear is None and mono_xml:
+            rear = load_calibration_xml(mono_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+    else:
+        if mono_xml:
+            mono = load_calibration_xml(mono_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+
+    return {
+        "model_hint": model_hint,
+        "mono": calibration_to_dict(mono),
+        "front": calibration_to_dict(front),
+        "rear": calibration_to_dict(rear),
+    }
+
+
+def _log_runtime_calibration_status(runtime: Dict[str, object]) -> None:
+    mono_ok = runtime.get("mono") is not None
+    front_ok = runtime.get("front") is not None
+    rear_ok = runtime.get("rear") is not None
+    logger.info(
+        "gui calibration_runtime: "
+        f"mono={'OK' if mono_ok else 'NONE'}, "
+        f"front={'OK' if front_ok else 'NONE'}, "
+        f"rear={'OK' if rear_ok else 'NONE'}"
+    )
+
+
+def _log_runtime_calibration_inputs(config: dict) -> None:
+    mono_xml = _normalize_path_value(config.get("calib_xml", config.get("CALIB_XML", "")))
+    front_xml = _normalize_path_value(config.get("front_calib_xml", config.get("FRONT_CALIB_XML", "")))
+    rear_xml = _normalize_path_value(config.get("rear_calib_xml", config.get("REAR_CALIB_XML", "")))
+    model = str(config.get("calib_model", config.get("CALIB_MODEL", "auto")) or "auto")
+    logger.info(
+        "gui calibration inputs: "
+        f"calib_model={model}, mono='{mono_xml or '-'}', front='{front_xml or '-'}', rear='{rear_xml or '-'}'"
+    )
+
+
+def _ensure_runtime_calibration(config: dict, loader) -> None:
+    _log_runtime_calibration_inputs(config)
+    projection_mode = str(config.get("projection_mode", config.get("PROJECTION_MODE", "")) or "").strip().lower()
+    if projection_mode in {"cubemap", "equirectangular"}:
+        # GUI設定の projection_mode は主にエクスポート指定。
+        # 解析時VOは元フレーム上で計算するため、VO無効化条件としては扱わない。
+        config["_analysis_projection_mode_original"] = projection_mode
+        config["projection_mode"] = "auto"
+        config["PROJECTION_MODE"] = "auto"
+        logger.info(
+            f"gui analysis: projection_mode '{projection_mode}' is treated as export setting; "
+            "VO runtime check uses 'auto'"
+        )
+
+    runtime = _build_runtime_calibration(config, loader)
+    config["calibration_runtime"] = runtime
+    _log_runtime_calibration_status(runtime)
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ PySide6>=6.5.0      # GUI フレームワーク
 opencv-python>=4.8.0  # 画像処理、特徴点検出、光学フロー
 numpy>=1.24.0       # 数値計算
 pyqtgraph>=0.13.0   # タイムラインスコアグラフ
+PyOpenGL>=3.1.7     # pyqtgraph.opengl による3D軌跡表示
 rerun-sdk>=0.18.0   # Rerun可視化（キーフレーム検証ログ）
 
 # === GPU高速化（オプショナル） ===

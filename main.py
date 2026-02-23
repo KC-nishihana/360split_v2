@@ -15,8 +15,11 @@ Usage:
 import sys
 import argparse
 import json
+import csv
+import os
+from collections import Counter
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 
 # プロジェクトルートをパスに追加
@@ -609,6 +612,111 @@ def round_json_friendly(value):
     return value
 
 
+def summarize_vo_diagnostics(frame_metrics_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    reason_counter: Counter = Counter()
+    vo_attempted = 0
+    vo_valid = 0
+    vo_pose_valid = 0
+    with_pose = 0
+    for rec in frame_metrics_records:
+        metrics = rec.get("metrics", {}) if isinstance(rec, dict) else {}
+        reason = str(metrics.get("vo_status_reason", "unknown"))
+        reason_counter[reason] += 1
+        vo_attempted += 1 if float(metrics.get("vo_attempted", 0.0)) > 0.5 else 0
+        vo_valid += 1 if float(metrics.get("vo_valid", 0.0)) > 0.5 else 0
+        vo_pose_valid += 1 if float(metrics.get("vo_pose_valid", 0.0)) > 0.5 else 0
+        with_pose += 1 if isinstance(rec.get("t_xyz"), list) and len(rec.get("t_xyz")) == 3 else 0
+
+    dominant_reason = reason_counter.most_common(1)[0][0] if reason_counter else "unknown"
+    valid_ratio = float(vo_valid / vo_attempted) if vo_attempted > 0 else 0.0
+    return {
+        "total_records": int(len(frame_metrics_records)),
+        "vo_attempted_frames": int(vo_attempted),
+        "vo_valid_frames": int(vo_valid),
+        "vo_valid_ratio": float(valid_ratio),
+        "vo_pose_valid_frames": int(vo_pose_valid),
+        "trajectory_points": int(with_pose),
+        "vo_status_reason_counts": dict(reason_counter),
+        "dominant_vo_status_reason": str(dominant_reason),
+    }
+
+
+def write_vo_diagnostics(output_dir: Path, frame_metrics_records: List[Dict[str, Any]]) -> Tuple[Path, Path, Dict[str, Any]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    diagnostics = summarize_vo_diagnostics(frame_metrics_records)
+    diagnostics_path = output_dir / "vo_diagnostics.json"
+    with open(diagnostics_path, "w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, ensure_ascii=False, indent=2)
+
+    trajectory_path = output_dir / "vo_trajectory.csv"
+    with open(trajectory_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "frame_idx",
+                "t_x",
+                "t_y",
+                "t_z",
+                "q_w",
+                "q_x",
+                "q_y",
+                "q_z",
+                "vo_valid",
+                "vo_inlier_ratio",
+                "vo_step_proxy",
+            ],
+        )
+        writer.writeheader()
+        for rec in sorted(frame_metrics_records, key=lambda x: int(x.get("frame_index", 0))):
+            metrics = rec.get("metrics", {}) if isinstance(rec, dict) else {}
+            t_xyz = rec.get("t_xyz") if isinstance(rec.get("t_xyz"), list) else [None, None, None]
+            q_wxyz = rec.get("q_wxyz") if isinstance(rec.get("q_wxyz"), list) else [None, None, None, None]
+            writer.writerow(
+                {
+                    "frame_idx": int(rec.get("frame_index", 0)),
+                    "t_x": t_xyz[0] if len(t_xyz) == 3 else None,
+                    "t_y": t_xyz[1] if len(t_xyz) == 3 else None,
+                    "t_z": t_xyz[2] if len(t_xyz) == 3 else None,
+                    "q_w": q_wxyz[0] if len(q_wxyz) == 4 else None,
+                    "q_x": q_wxyz[1] if len(q_wxyz) == 4 else None,
+                    "q_y": q_wxyz[2] if len(q_wxyz) == 4 else None,
+                    "q_z": q_wxyz[3] if len(q_wxyz) == 4 else None,
+                    "vo_valid": float(metrics.get("vo_valid", 0.0)),
+                    "vo_inlier_ratio": float(metrics.get("vo_inlier_ratio", 0.0)),
+                    "vo_step_proxy": float(metrics.get("vo_step_proxy", 0.0)),
+                }
+            )
+    return diagnostics_path, trajectory_path, diagnostics
+
+
+def _normalize_path_value(raw_path: object) -> str:
+    s = str(raw_path or "").strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1].strip()
+    if not s:
+        return ""
+    if os.name != "nt" and "\\" in s:
+        s = s.replace("\\", "/")
+    return os.path.expandvars(os.path.expanduser(s))
+
+
+def _resolve_calibration_path(raw_path: object, search_roots: List[Path]) -> Optional[str]:
+    norm = _normalize_path_value(raw_path)
+    if not norm:
+        return None
+    p = Path(norm)
+    candidates: List[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.extend([root / p for root in search_roots])
+        candidates.append(Path.cwd() / p)
+    for c in candidates:
+        if c.exists():
+            return str(c.resolve())
+    return str(p)
+
+
 def _load_calibrations_for_runtime(
     config: dict,
     meta,
@@ -617,10 +725,16 @@ def _load_calibrations_for_runtime(
 ) -> dict:
     model_hint = str(config.get("calib_model", "auto") or "auto").strip().lower()
     fallback_size = (int(meta.width), int(meta.height))
+    search_roots = [Path.cwd(), PROJECT_ROOT]
+    if hasattr(meta, "video_path") and getattr(meta, "video_path", None):
+        try:
+            search_roots.append(Path(str(meta.video_path)).expanduser().resolve().parent)
+        except Exception:
+            pass
 
-    mono_xml = str(config.get("calib_xml", "") or "").strip() or None
-    front_xml = str(config.get("front_calib_xml", "") or "").strip() or mono_xml
-    rear_xml = str(config.get("rear_calib_xml", "") or "").strip() or mono_xml
+    mono_xml = _resolve_calibration_path(config.get("calib_xml", ""), search_roots)
+    front_xml = _resolve_calibration_path(config.get("front_calib_xml", ""), search_roots) or mono_xml
+    rear_xml = _resolve_calibration_path(config.get("rear_calib_xml", ""), search_roots) or mono_xml
 
     mono_calib = None
     front_calib = None
@@ -709,6 +823,10 @@ def run_cli(args):
     loader = create_loader(video_path, args, is_front_rear, is_osv)
 
     meta = loader.get_metadata()
+    try:
+        setattr(meta, "video_path", str(video_path))
+    except Exception:
+        pass
     logger.info(f"動画情報: {meta.width}x{meta.height}, "
                 f"{meta.fps:.1f}fps, {meta.frame_count}フレーム, "
                 f"{meta.duration:.1f}秒")
@@ -744,6 +862,15 @@ def run_cli(args):
 
     # キーフレーム選択
     selector = KeyframeSelector(config)
+    vo_runtime = selector.get_vo_runtime_status(is_paired=bool(getattr(loader, "is_paired", False)))
+    if vo_runtime["enabled"]:
+        logger.info(
+            f"VO runtime: enabled (reason={vo_runtime['reason']}, calibration_loaded={vo_runtime['calibration_loaded']})"
+        )
+    else:
+        logger.warning(
+            f"VO runtime: disabled (reason={vo_runtime['reason']}, calibration_loaded={vo_runtime['calibration_loaded']})"
+        )
     rerun_enabled = bool(args.rerun_stream or args.rerun_save)
     rerun_logger = None
     frame_metrics_records = []
@@ -918,6 +1045,17 @@ def run_cli(args):
         with open(frame_metrics_path, "w", encoding="utf-8") as f:
             json.dump({"records": frame_metrics_records}, f, ensure_ascii=False, indent=2)
         logger.info(f"フレームメトリクス: {frame_metrics_path}")
+        vo_diag_path, vo_traj_path, vo_diag = write_vo_diagnostics(output_dir, frame_metrics_records)
+        logger.info(f"VO diagnostics: {vo_diag_path}")
+        logger.info(f"VO trajectory: {vo_traj_path}")
+        logger.info(
+            "VO summary: "
+            f"attempted={vo_diag['vo_attempted_frames']}, "
+            f"valid={vo_diag['vo_valid_frames']}, "
+            f"valid_ratio={vo_diag['vo_valid_ratio']:.3f}, "
+            f"pose_valid={vo_diag['vo_pose_valid_frames']}, "
+            f"reason={vo_diag['dominant_vo_status_reason']}"
+        )
 
     logger.info("-" * 60)
     logger.info(f"完了: {len(keyframes)} キーフレームを出力しました")

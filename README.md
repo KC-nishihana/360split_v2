@@ -604,6 +604,32 @@ output/
 - `world/trajectory` は単眼VOの相対軌跡（arbitrary scale）です。実スケール推定は行いません。
 - 高速化オプション（`vo_frame_subsample`, `vo_adaptive_roi`, `vo_fast_fail_inlier_ratio`, `vo_step_proxy_clip_px`）は速度向上と引き換えに、難シーンで `vo_valid` が減る可能性があります。
 
+### VOが見えない場合の確認手順
+
+1. キャリブレーションXMLを指定してください（未指定時はVO無効）。
+2. 実行後に `vo_diagnostics.json` を確認してください。
+3. 軌跡の詳細は `vo_trajectory.csv` を確認してください。
+
+CLI例:
+```bash
+python main.py --cli test/CAM_20260205141214_0023_D.OSV \
+  --calib-xml test/camcalib1.xml --calib-model auto \
+  --output /tmp/vo_check
+```
+
+`vo_diagnostics.json` の主要項目:
+- `vo_attempted_frames`: VO推定を試行したフレーム数
+- `vo_valid_frames`: `vo_valid=1` のフレーム数
+- `vo_valid_ratio`: `vo_valid_frames / vo_attempted_frames`
+- `vo_pose_valid_frames`: Stage3統合で姿勢 `t_xyz` が直接付与されたフレーム数
+- `vo_status_reason_counts`: 無効理由・状態の内訳（例: `calibration_unavailable`）
+
+`vo_trajectory.csv` の列:
+- `frame_idx,t_x,t_y,t_z,q_w,q_x,q_y,q_z,vo_valid,vo_inlier_ratio,vo_step_proxy`
+
+注意:
+- 単眼VOのためスケールは相対値です。`t_x/t_y/t_z` は実距離（m）ではありません。
+
 
 ## ライセンス
 

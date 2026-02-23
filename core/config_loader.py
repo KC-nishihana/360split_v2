@@ -181,6 +181,7 @@ class ConfigManager:
             "vo_ransac_threshold": 1.0,
             "vo_downscale_long_edge": 1000,
             "vo_match_norm_factor": 120.0,
+            "vo_t_sign": 1.0,
             "calib_xml": "",
             "front_calib_xml": "",
             "rear_calib_xml": "",

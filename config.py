@@ -147,6 +147,7 @@ class KeyframeConfig:
     vo_center_roi_ratio: float = 0.6
     vo_downscale_long_edge: int = 1000
     vo_max_features: int = 600
+    vo_t_sign: float = 1.0
     calib_xml: str = ""
     front_calib_xml: str = ""
     rear_calib_xml: str = ""
@@ -230,6 +231,7 @@ class KeyframeConfig:
             'VO_CENTER_ROI_RATIO': self.vo_center_roi_ratio,
             'VO_DOWNSCALE_LONG_EDGE': self.vo_downscale_long_edge,
             'VO_MAX_FEATURES': self.vo_max_features,
+            'VO_T_SIGN': self.vo_t_sign,
             'CALIB_XML': self.calib_xml,
             'FRONT_CALIB_XML': self.front_calib_xml,
             'REAR_CALIB_XML': self.rear_calib_xml,
@@ -388,6 +390,7 @@ class KeyframeConfig:
         config.vo_center_roi_ratio = float(d.get('vo_center_roi_ratio', config.vo_center_roi_ratio))
         config.vo_downscale_long_edge = int(d.get('vo_downscale_long_edge', config.vo_downscale_long_edge))
         config.vo_max_features = int(d.get('vo_max_features', config.vo_max_features))
+        config.vo_t_sign = float(d.get('vo_t_sign', config.vo_t_sign))
         config.calib_xml = str(d.get('calib_xml', config.calib_xml) or "")
         config.front_calib_xml = str(d.get('front_calib_xml', config.front_calib_xml) or "")
         config.rear_calib_xml = str(d.get('rear_calib_xml', config.rear_calib_xml) or "")

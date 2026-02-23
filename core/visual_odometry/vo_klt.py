@@ -16,7 +16,9 @@ class VOMetrics:
     inlier_ratio: float
     rotation_delta_deg: float
     translation_delta_rel: float
+    step_proxy: float
     t_dir: List[float]
+    r_rel_q_wxyz: List[float]
 
 
 def _invalid_metrics() -> VOMetrics:
@@ -26,8 +28,45 @@ def _invalid_metrics() -> VOMetrics:
         inlier_ratio=0.0,
         rotation_delta_deg=0.0,
         translation_delta_rel=0.0,
+        step_proxy=0.0,
         t_dir=[0.0, 0.0, 0.0],
+        r_rel_q_wxyz=[1.0, 0.0, 0.0, 0.0],
     )
+
+
+def _rotation_matrix_to_quaternion_wxyz(r: np.ndarray) -> List[float]:
+    m = np.asarray(r, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(m))
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(max(1e-12, 1.0 + m[0, 0] - m[1, 1] - m[2, 2])) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(max(1e-12, 1.0 + m[1, 1] - m[0, 0] - m[2, 2])) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(max(1e-12, 1.0 + m[2, 2] - m[0, 0] - m[1, 1])) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    q = np.asarray([w, x, y, z], dtype=np.float64)
+    n = float(np.linalg.norm(q))
+    if n <= 1e-12:
+        return [1.0, 0.0, 0.0, 0.0]
+    q = q / n
+    return [float(q[0]), float(q[1]), float(q[2]), float(q[3])]
 
 
 class KLTVisualOdometry:
@@ -183,6 +222,7 @@ class KLTVisualOdometry:
         total_count = int(len(pts1_u))
         if inlier_count <= 0 or total_count <= 0:
             return _invalid_metrics()
+        inlier_mask = np.asarray(mask_pose).reshape(-1).astype(bool)
 
         trace_val = float(np.trace(r))
         cos_theta = float(np.clip((trace_val - 1.0) * 0.5, -1.0, 1.0))
@@ -193,6 +233,12 @@ class KLTVisualOdometry:
             t_dir = (t_vec / t_norm).tolist()
         else:
             t_dir = [0.0, 0.0, 0.0]
+        if np.count_nonzero(inlier_mask) > 0:
+            delta = np.asarray(pts2[inlier_mask] - pts1[inlier_mask], dtype=np.float64)
+            step_proxy = float(np.median(np.linalg.norm(delta, axis=1)))
+        else:
+            step_proxy = 0.0
+        q_wxyz = _rotation_matrix_to_quaternion_wxyz(r)
 
         return VOMetrics(
             vo_valid=True,
@@ -200,6 +246,7 @@ class KLTVisualOdometry:
             inlier_ratio=float(np.clip(inlier_count / float(total_count), 0.0, 1.0)),
             rotation_delta_deg=rot_deg,
             translation_delta_rel=t_norm,
+            step_proxy=float(max(0.0, step_proxy)),
             t_dir=[float(x) for x in t_dir],
+            r_rel_q_wxyz=q_wxyz,
         )
-

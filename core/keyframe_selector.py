@@ -20,7 +20,7 @@ from .adaptive_selector import AdaptiveSelector
 from .accelerator import get_accelerator
 from processing.fisheye_rig import FisheyeRigProcessor
 from processing.mask_processor import MaskProcessor
-from .visual_odometry import KLTVisualOdometry, calibration_from_dict
+from .visual_odometry import KLTVisualOdometry, calibration_from_dict, integrate_relative_trajectory
 from .exceptions import (
     GeometricDegeneracyError,
     EstimationFailureError,
@@ -223,6 +223,7 @@ class KeyframeSelector:
             'VO_RANSAC_THRESHOLD': 1.0,
             'VO_DOWNSCALE_LONG_EDGE': 1000,
             'VO_MATCH_NORM_FACTOR': 120.0,
+            'VO_T_SIGN': 1.0,
             'CALIB_XML': '',
             'FRONT_CALIB_XML': '',
             'REAR_CALIB_XML': '',
@@ -309,6 +310,7 @@ class KeyframeSelector:
                 'vo_ransac_threshold': 'VO_RANSAC_THRESHOLD',
                 'vo_downscale_long_edge': 'VO_DOWNSCALE_LONG_EDGE',
                 'vo_match_norm_factor': 'VO_MATCH_NORM_FACTOR',
+                'vo_t_sign': 'VO_T_SIGN',
                 'calib_xml': 'CALIB_XML',
                 'front_calib_xml': 'FRONT_CALIB_XML',
                 'rear_calib_xml': 'REAR_CALIB_XML',
@@ -782,7 +784,10 @@ class KeyframeSelector:
                 record.metrics["stationary_penalty_applied"] = 0.0
             return {"mask": np.zeros(0, dtype=bool), "boundary_mask": np.zeros(0, dtype=bool)}
 
-        trans = np.asarray([r.metrics.get("translation_delta", np.nan) for r in records], dtype=np.float64)
+        trans = np.asarray(
+            [r.metrics.get("vo_step_proxy_norm", r.metrics.get("translation_delta", np.nan)) for r in records],
+            dtype=np.float64,
+        )
         rot = np.asarray([r.metrics.get("rotation_delta", np.nan) for r in records], dtype=np.float64)
         flow = np.asarray([r.metrics.get("flow_mag", np.nan) for r in records], dtype=np.float64)
         match_count = np.asarray([r.metrics.get("match_count", np.nan) for r in records], dtype=np.float64)
@@ -953,6 +958,14 @@ class KeyframeSelector:
                 record.metrics["rotation_delta"] = float(m.get("rotation_delta", record.metrics.get("rotation_delta", 0.0)))
             if "match_count" in m:
                 record.metrics["match_count"] = float(m.get("match_count", record.metrics.get("match_count", 0.0)))
+            if "vo_step_proxy" in m:
+                record.metrics["vo_step_proxy"] = float(m.get("vo_step_proxy", 0.0))
+            if "vo_step_proxy_norm" in m:
+                record.metrics["vo_step_proxy_norm"] = float(m.get("vo_step_proxy_norm", 0.0))
+            if "vo_inlier_ratio" in m:
+                record.metrics["vo_inlier_ratio"] = float(m.get("vo_inlier_ratio", 0.0))
+            if "vo_rot_deg" in m:
+                record.metrics["vo_rot_deg"] = float(m.get("vo_rot_deg", 0.0))
 
     def _stage0_lightweight_motion_scan(
         self,
@@ -1035,6 +1048,9 @@ class KeyframeSelector:
                 "motion_risk": motion_risk,
                 "rotation_delta": float(vo.rotation_delta_deg if vo else 0.0),
                 "translation_delta": float(vo.translation_delta_rel if vo else 0.0),
+                "vo_step_proxy": float(vo.step_proxy if vo else 0.0),
+                "vo_step_proxy_norm": 0.0,
+                "vo_rot_deg": float(vo.rotation_delta_deg if vo else 0.0),
                 "match_count": float(vo.match_count if vo else 0.0),
                 "vo_inlier_ratio": float(vo.inlier_ratio if vo else 0.0),
                 "vo_valid": 1.0 if (vo.vo_valid if vo else False) else 0.0,
@@ -1044,6 +1060,18 @@ class KeyframeSelector:
 
             if progress_callback:
                 progress_callback(idx + 1, len(frame_indices))
+
+        step_values = [
+            float(v.get("vo_step_proxy", 0.0))
+            for v in metrics.values()
+            if float(v.get("vo_valid", 0.0)) > 0.5 and float(v.get("vo_step_proxy", 0.0)) > 0.0
+        ]
+        step_median = float(np.median(np.asarray(step_values, dtype=np.float64))) if step_values else 1.0
+        if step_median <= 1e-12:
+            step_median = 1.0
+        for m in metrics.values():
+            step = float(m.get("vo_step_proxy", 0.0))
+            m["vo_step_proxy_norm"] = float(step / step_median) if step > 0.0 else 0.0
 
         return metrics
 
@@ -1105,22 +1133,66 @@ class KeyframeSelector:
             return frame
 
         trajectory_consistency: Dict[int, float] = {tracked_indices[0]: 0.5}
-        if not vo_enabled:
-            for idx in tracked_indices[1:]:
-                trajectory_consistency[idx] = 0.5
+        vo_step_proxy_norm: Dict[int, float] = {tracked_indices[0]: 0.0}
+        vo_dir_cos_prev: Dict[int, float] = {tracked_indices[0]: 0.5}
+        vo_rot_deg: Dict[int, float] = {tracked_indices[0]: 0.0}
+        trajectory_samples: List[Dict[str, Any]] = [
+            {
+                "frame_idx": int(tracked_indices[0]),
+                "vo_valid": False,
+                "t_dir": [0.0, 0.0, 0.0],
+                "step_proxy": 0.0,
+                "r_rel_q_wxyz": [1.0, 0.0, 0.0, 0.0],
+            }
+        ]
+        per_frame_vo: Dict[int, Dict[str, float]] = {
+            int(tracked_indices[0]): {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+        }
+        step_proxy_raw: Dict[int, float] = {tracked_indices[0]: 0.0}
+        valid_count = 0
         prev_rot = None
-        prev_trans = None
+        prev_step = None
+        prev_dir = None
         prev_valid = False
-        match_norm_factor = max(1e-6, float(self.config.get('VO_MATCH_NORM_FACTOR', 120.0)))
         for i in range(1, len(tracked_indices)):
             if not vo_enabled:
-                break
+                cur_idx = tracked_indices[i]
+                trajectory_consistency[cur_idx] = 0.5
+                vo_step_proxy_norm[cur_idx] = 0.0
+                vo_dir_cos_prev[cur_idx] = 0.5
+                vo_rot_deg[cur_idx] = 0.0
+                trajectory_samples.append(
+                    {
+                        "frame_idx": int(cur_idx),
+                        "vo_valid": False,
+                        "t_dir": [0.0, 0.0, 0.0],
+                        "step_proxy": 0.0,
+                        "r_rel_q_wxyz": [1.0, 0.0, 0.0, 0.0],
+                    }
+                )
+                per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+                step_proxy_raw[int(cur_idx)] = 0.0
+                continue
             prev_idx = tracked_indices[i - 1]
             cur_idx = tracked_indices[i]
             prev_frame = _get_eval_frame(prev_idx)
             cur_frame = _get_eval_frame(cur_idx)
             if prev_frame is None or cur_frame is None:
                 trajectory_consistency[cur_idx] = 0.0
+                vo_step_proxy_norm[cur_idx] = 0.0
+                vo_dir_cos_prev[cur_idx] = 0.5
+                vo_rot_deg[cur_idx] = 0.0
+                trajectory_samples.append(
+                    {
+                        "frame_idx": int(cur_idx),
+                        "vo_valid": False,
+                        "t_dir": [0.0, 0.0, 0.0],
+                        "step_proxy": 0.0,
+                        "r_rel_q_wxyz": [1.0, 0.0, 0.0, 0.0],
+                    }
+                )
+                per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+                step_proxy_raw[int(cur_idx)] = 0.0
                 prev_valid = False
                 continue
 
@@ -1132,25 +1204,85 @@ class KeyframeSelector:
             ) if vo_enabled else None
             if vo is None or not vo.vo_valid:
                 trajectory_consistency[cur_idx] = 0.0
+                vo_step_proxy_norm[cur_idx] = 0.0
+                vo_dir_cos_prev[cur_idx] = 0.5
+                vo_rot_deg[cur_idx] = 0.0
+                trajectory_samples.append(
+                    {
+                        "frame_idx": int(cur_idx),
+                        "vo_valid": False,
+                        "t_dir": [0.0, 0.0, 0.0],
+                        "step_proxy": 0.0,
+                        "r_rel_q_wxyz": [1.0, 0.0, 0.0, 0.0],
+                    }
+                )
+                per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
+                step_proxy_raw[int(cur_idx)] = 0.0
                 prev_valid = False
                 continue
 
-            match_norm = float(np.clip(float(vo.match_count) / match_norm_factor, 0.0, 1.0))
-            valid_flag = 1.0 if vo.vo_valid else 0.0
-            confidence = float(np.clip(0.45 * vo.inlier_ratio + 0.35 * match_norm + 0.20 * valid_flag, 0.0, 1.0))
-
-            if not prev_valid or prev_rot is None or prev_trans is None:
-                smoothness = 0.5
+            step_val = float(max(0.0, getattr(vo, "step_proxy", 0.0)))
+            dir_vec = np.asarray(getattr(vo, "t_dir", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+            dir_norm = float(np.linalg.norm(dir_vec))
+            if dir_norm > 1e-12:
+                dir_vec = dir_vec / dir_norm
             else:
-                rot_term = float(np.clip(1.0 - abs(float(vo.rotation_delta_deg) - float(prev_rot)) / 10.0, 0.0, 1.0))
-                trans_term = float(np.clip(1.0 - abs(float(vo.translation_delta_rel) - float(prev_trans)) / 0.15, 0.0, 1.0))
-                smoothness = float(0.5 * rot_term + 0.5 * trans_term)
+                dir_vec = np.zeros(3, dtype=np.float64)
+            valid_count += 1
+            valid_ratio = float(np.clip(valid_count / float(i), 0.0, 1.0))
+            if not prev_valid or prev_rot is None or prev_step is None or prev_dir is None:
+                dir_term = 0.5
+                rot_term = 0.5
+                step_term = 0.5
+            else:
+                dot_dir = float(np.clip(float(np.dot(dir_vec, prev_dir)), -1.0, 1.0))
+                dir_term = float(np.clip((dot_dir + 1.0) * 0.5, 0.0, 1.0))
+                rot_term = float(np.clip(1.0 - abs(float(vo.rotation_delta_deg) - float(prev_rot)) / 15.0, 0.0, 1.0))
+                if step_val > 1e-12 and prev_step > 1e-12:
+                    step_term = float(
+                        np.clip(1.0 - abs(np.log(step_val) - np.log(float(prev_step))) / 1.0, 0.0, 1.0)
+                    )
+                else:
+                    step_term = 0.5
 
-            traj = float(np.clip(0.75 * confidence + 0.25 * smoothness, 0.0, 1.0))
+            traj = float(np.clip(0.40 * valid_ratio + 0.20 * dir_term + 0.20 * rot_term + 0.20 * step_term, 0.0, 1.0))
             trajectory_consistency[cur_idx] = traj
+            vo_step_proxy_norm[cur_idx] = 0.0
+            vo_dir_cos_prev[cur_idx] = float(dir_term)
+            vo_rot_deg[cur_idx] = float(vo.rotation_delta_deg)
+            trajectory_samples.append(
+                {
+                    "frame_idx": int(cur_idx),
+                    "vo_valid": True,
+                    "t_dir": [float(x) for x in dir_vec.tolist()],
+                    "step_proxy": float(step_val),
+                    "r_rel_q_wxyz": [float(x) for x in getattr(vo, "r_rel_q_wxyz", [1.0, 0.0, 0.0, 0.0])],
+                }
+            )
+            per_frame_vo[int(cur_idx)] = {
+                "vo_valid": 1.0,
+                "step_proxy": float(step_val),
+                "inlier_ratio": float(getattr(vo, "inlier_ratio", 0.0)),
+                "rot_deg": float(vo.rotation_delta_deg),
+            }
+            step_proxy_raw[int(cur_idx)] = float(step_val)
             prev_rot = float(vo.rotation_delta_deg)
-            prev_trans = float(vo.translation_delta_rel)
+            prev_step = float(step_val)
+            prev_dir = dir_vec.copy()
             prev_valid = True
+
+        step_values = [v for v in step_proxy_raw.values() if v > 0.0]
+        step_median = float(np.median(np.asarray(step_values, dtype=np.float64))) if step_values else 1.0
+        if step_median <= 1e-12:
+            step_median = 1.0
+        for idx in tracked_indices:
+            raw = float(step_proxy_raw.get(int(idx), 0.0))
+            vo_step_proxy_norm[int(idx)] = float(raw / step_median) if raw > 0.0 else 0.0
+
+        trajectory_map = integrate_relative_trajectory(
+            trajectory_samples,
+            t_sign=float(self.config.get("VO_T_SIGN", 1.0)),
+        )
 
         w_base = float(self.config.get('STAGE3_WEIGHT_BASE', 0.70))
         w_traj = float(self.config.get('STAGE3_WEIGHT_TRAJECTORY', 0.25))
@@ -1179,6 +1311,28 @@ class KeyframeSelector:
                 record.metrics["combined_stage2"] = base_score
                 record.metrics["combined_stage3"] = combined_stage3
                 record.metrics["stage0_motion_risk"] = risk
+
+        pose_keys = sorted(int(k) for k in trajectory_map.keys())
+        for idx, record in record_map.items():
+            pose = trajectory_map.get(int(idx))
+            if pose is None and pose_keys:
+                insert = int(np.searchsorted(pose_keys, int(idx)))
+                lookup_idx = pose_keys[max(0, min(len(pose_keys) - 1, insert))]
+                if insert > 0 and insert < len(pose_keys):
+                    left = pose_keys[insert - 1]
+                    right = pose_keys[insert]
+                    lookup_idx = left if abs(int(idx) - left) <= abs(int(idx) - right) else right
+                pose = trajectory_map.get(int(lookup_idx))
+            if pose is not None:
+                record.t_xyz = [float(x) for x in pose.get("t_xyz", [0.0, 0.0, 0.0])]
+                record.q_wxyz = [float(x) for x in pose.get("q_wxyz", [1.0, 0.0, 0.0, 0.0])]
+            vo_info = per_frame_vo.get(int(idx), {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0})
+            record.metrics["vo_valid"] = float(vo_info.get("vo_valid", record.metrics.get("vo_valid", 0.0)))
+            record.metrics["vo_inlier_ratio"] = float(vo_info.get("inlier_ratio", record.metrics.get("vo_inlier_ratio", 0.0)))
+            record.metrics["vo_step_proxy"] = float(vo_info.get("step_proxy", 0.0))
+            record.metrics["vo_step_proxy_norm"] = float(vo_step_proxy_norm.get(int(idx), 0.0))
+            record.metrics["vo_dir_cos_prev"] = float(vo_dir_cos_prev.get(int(idx), 0.5))
+            record.metrics["vo_rot_deg"] = float(vo_rot_deg.get(int(idx), vo_info.get("rot_deg", 0.0)))
 
         return stage2_candidates
 
@@ -1575,6 +1729,11 @@ class KeyframeSelector:
                 "translation_delta": flow_mag,
                 "rotation_delta": float(max(0.0, 1.0 - ssim) * 180.0),
                 "flow_mag": flow_mag,
+                "vo_step_proxy": 0.0,
+                "vo_step_proxy_norm": 0.0,
+                "vo_inlier_ratio": 0.0,
+                "vo_rot_deg": float(max(0.0, 1.0 - ssim) * 180.0),
+                "vo_dir_cos_prev": 0.5,
                 "laplacian_var": float(q_scores.get("sharpness", 0.0)),
                 "match_count": float(g_scores.get("feature_match_count", q_scores.get("seam_features_cur", 0.0))),
                 "overlap_ratio": float(g_scores.get("gric", 0.0)),

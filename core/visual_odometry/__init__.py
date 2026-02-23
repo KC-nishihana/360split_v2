@@ -7,6 +7,7 @@ from .calibration import (
     load_calibration_xml,
     summarize_calibration,
 )
+from .trajectory_integrator import integrate_relative_trajectory
 from .vo_klt import KLTVisualOdometry, VOMetrics
 
 __all__ = [
@@ -17,5 +18,5 @@ __all__ = [
     "summarize_calibration",
     "KLTVisualOdometry",
     "VOMetrics",
+    "integrate_relative_trajectory",
 ]
-

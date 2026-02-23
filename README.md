@@ -227,6 +227,11 @@ python main.py --cli input.mp4 --rerun-stream --rerun-spawn --rerun-save ./logs/
 - `world/trajectory`
 - `world/keyframes`
 - `metrics/translation_delta`
+- `metrics/vo_step_proxy`
+- `metrics/vo_step_proxy_norm`
+- `metrics/vo_inlier_ratio`
+- `metrics/vo_rot_deg`
+- `metrics/vo_dir_cos_prev`
 - `metrics/rotation_delta`
 - `metrics/flow_mag`
 - `metrics/laplacian_var`
@@ -258,6 +263,9 @@ python scripts/rerun_offline_replay.py \
 - `is_keyframe` または `keyframe_flag`
 - `metrics`（辞書）または `translation_delta` などの列
 - `points_world` または `points_path`（`.npy`、任意）
+
+CLI実行時は `output/frame_metrics.json` が出力され、`records` 配列内に
+`frame_index / is_keyframe / t_xyz / q_wxyz / metrics` が保存されます。
 
 
 ## 環境プリセット機能
@@ -584,9 +592,11 @@ output/
 ## VO実装範囲（今回）
 
 - VOは Stage0 / Stage3 のみで計算されます（Stage2で新規VO計算はしません）。
-- Stage2のstationary判定は Stage0由来の `translation_delta / rotation_delta / match_count` を参照します。
+- Stage2のstationary判定は Stage0由来の `vo_step_proxy_norm / rotation_delta / match_count` を優先参照します（`vo_step_proxy_norm` が無い場合のみ `translation_delta` をフォールバック）。
 - パノラマVO（equirect/cubemap/stitch_to_equirect）は今回対象外です。該当ケースでは警告ログを出してスキップします。
 - paired入力（OSV/front_rear）でもVOは代表レンズ（frame_a/front）のみで実行します。
+- `translation_delta` は互換メトリクスとして保持されますが、**実距離（meter）ではありません**。Stage0/Stage3の移動量評価には `vo_step_proxy`（inlier parallax）と `vo_step_proxy_norm`（median(step)=1 正規化）を使用します。
+- `world/trajectory` は単眼VOの相対軌跡（arbitrary scale）です。実スケール推定は行いません。
 
 
 ## ライセンス

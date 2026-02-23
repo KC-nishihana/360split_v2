@@ -105,7 +105,7 @@ class RerunKeyframeLogger:
         if self._rr is None:
             return
 
-        translation = _as_float32_vec3(t_xyz, fallback=(float(frame_idx), 0.0, 0.0))
+        translation = _as_float32_vec3(t_xyz, fallback=(0.0, 0.0, 0.0))
         quat_wxyz = _as_float32_quat_wxyz(q_wxyz)
 
         self._set_frame_time(frame_idx)
@@ -124,7 +124,13 @@ class RerunKeyframeLogger:
         self._trajectory.append(translation.astype(np.float32))
         traj = np.asarray(self._trajectory, dtype=np.float32)
         traj_colors = np.tile(np.asarray([[70, 130, 255]], dtype=np.uint8), (traj.shape[0], 1))
-        self._rr.log("world/trajectory", self._rr.Points3D(traj, colors=traj_colors))
+        if hasattr(self._rr, "LineStrips3D"):
+            try:
+                self._rr.log("world/trajectory", self._rr.LineStrips3D([traj], colors=np.asarray([[70, 130, 255]], dtype=np.uint8)))
+            except Exception:
+                self._rr.log("world/trajectory", self._rr.Points3D(traj, colors=traj_colors))
+        else:
+            self._rr.log("world/trajectory", self._rr.Points3D(traj, colors=traj_colors))
 
         if is_keyframe:
             self._keyframes.append(translation.astype(np.float32))

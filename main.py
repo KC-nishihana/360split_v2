@@ -714,6 +714,7 @@ def run_cli(args):
     selector = KeyframeSelector(config)
     rerun_enabled = bool(args.rerun_stream or args.rerun_save)
     rerun_logger = None
+    frame_metrics_records = []
     if rerun_enabled:
         rerun_logger = RerunKeyframeLogger(
             app_id="keyframe_check",
@@ -734,11 +735,20 @@ def run_cli(args):
 
     logger.info("キーフレーム解析を開始...")
     def frame_log_callback(payload: dict):
+        frame_idx = int(payload.get("frame_index", 0))
+        metrics = payload.get("metrics", {})
+        frame_metrics_records.append(
+            {
+                "frame_index": frame_idx,
+                "is_keyframe": bool(payload.get("is_keyframe", False)),
+                "t_xyz": round_json_friendly(payload.get("t_xyz")) if payload.get("t_xyz") is not None else None,
+                "q_wxyz": round_json_friendly(payload.get("q_wxyz")) if payload.get("q_wxyz") is not None else None,
+                "metrics": round_json_friendly(metrics) if isinstance(metrics, dict) else {},
+            }
+        )
         if rerun_logger is None or not rerun_logger.enabled:
             return
-        frame_idx = int(payload.get("frame_index", 0))
         frame = payload.get("frame")
-        metrics = payload.get("metrics", {})
         rerun_logger.log_frame(
             frame_idx=frame_idx,
             img=frame,
@@ -752,7 +762,7 @@ def run_cli(args):
     keyframes = selector.select_keyframes(
         loader,
         progress_callback=progress_callback,
-        frame_log_callback=frame_log_callback if rerun_enabled else None,
+        frame_log_callback=frame_log_callback,
     )
 
     if not keyframes:
@@ -871,6 +881,11 @@ def run_cli(args):
     metadata_path = output_dir / "keyframe_metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
+    if frame_metrics_records:
+        frame_metrics_path = output_dir / "frame_metrics.json"
+        with open(frame_metrics_path, "w", encoding="utf-8") as f:
+            json.dump({"records": frame_metrics_records}, f, ensure_ascii=False, indent=2)
+        logger.info(f"フレームメトリクス: {frame_metrics_path}")
 
     logger.info("-" * 60)
     logger.info(f"完了: {len(keyframes)} キーフレームを出力しました")

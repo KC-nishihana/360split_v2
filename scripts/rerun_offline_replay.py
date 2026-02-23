@@ -99,6 +99,11 @@ def _extract_metrics(record: Dict) -> Dict[str, float]:
 
     metric_keys = (
         "translation_delta",
+        "vo_step_proxy",
+        "vo_step_proxy_norm",
+        "vo_inlier_ratio",
+        "vo_rot_deg",
+        "vo_dir_cos_prev",
         "rotation_delta",
         "flow_mag",
         "laplacian_var",

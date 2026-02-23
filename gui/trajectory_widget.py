@@ -1,6 +1,6 @@
 """
-擬似軌跡ビュー - 360Split v2 GUI
-translation_delta / rotation_delta からデバッグ用の擬似軌跡を描画する。
+軌跡ビュー - 360Split v2 GUI
+VO相対軌跡（t_xyz）があればそれを優先し、無い場合は擬似軌跡を描画する。
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ except ImportError:
 
 
 class TrajectoryWidget(QWidget):
-    """擬似軌跡を表示する簡易ビュー。"""
+    """軌跡を表示する簡易ビュー。"""
 
     frameSelected = Signal(int)
 
@@ -37,9 +37,9 @@ class TrajectoryWidget(QWidget):
         layout.setSpacing(4)
 
         head = QHBoxLayout()
-        label = QLabel("擬似軌跡（VO実測ではありません）")
-        label.setStyleSheet("color: #aaa; font-size: 11px;")
-        head.addWidget(label)
+        self._title_label = QLabel("擬似軌跡（VO実測ではありません）")
+        self._title_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        head.addWidget(self._title_label)
         head.addStretch()
 
         self._axis_combo = QComboBox()
@@ -91,28 +91,50 @@ class TrajectoryWidget(QWidget):
             self._redraw()
             return
 
-        flow_mag = np.asarray([float(getattr(s, 'flow_mag', 0.0)) for s in frame_scores], dtype=np.float32)
-        rotation = np.asarray([float(getattr(s, 'rotation_delta', 0.0)) for s in frame_scores], dtype=np.float32)
         self._is_stationary = [bool(getattr(s, 'is_stationary', False)) for s in frame_scores]
         self._keyframe_set = {int(i) for i in keyframe_indices}
 
-        # 擬似軌跡: flow を移動量、rotation を方位変化として積分
-        dist = np.clip(flow_mag, 0.0, np.percentile(flow_mag, 95) if flow_mag.size > 0 else 0.0)
-        dist = dist * 0.03
-        dtheta = np.deg2rad(np.clip(rotation, 0.0, 30.0))
+        coords = np.full((len(frame_scores), 3), np.nan, dtype=np.float32)
+        valid_pose_count = 0
+        for i, s in enumerate(frame_scores):
+            t_xyz = getattr(s, 't_xyz', None)
+            if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3:
+                arr = np.asarray(t_xyz, dtype=np.float32).reshape(3)
+                if np.all(np.isfinite(arr)):
+                    coords[i] = arr
+                    valid_pose_count += 1
 
-        x = np.zeros_like(dist)
-        y = np.zeros_like(dist)
-        z = np.zeros_like(dist)
-        theta = 0.0
-        for i in range(1, len(dist)):
-            theta += float(dtheta[i])
-            step = float(dist[i])
-            x[i] = x[i - 1] + step * np.cos(theta)
-            z[i] = z[i - 1] + step * np.sin(theta)
-            y[i] = y[i - 1] + step * np.sin(theta * 0.25) * 0.5
-
-        self._coords = np.column_stack([x, y, z]).astype(np.float32)
+        if valid_pose_count >= 2:
+            self._title_label.setText("相対軌跡（VO）")
+            if np.any(np.isfinite(coords[0])):
+                first = coords[0].copy()
+            else:
+                first = np.zeros(3, dtype=np.float32)
+            last = first.copy()
+            for i in range(coords.shape[0]):
+                if np.all(np.isfinite(coords[i])):
+                    last = coords[i]
+                else:
+                    coords[i] = last
+            self._coords = coords - first
+        else:
+            self._title_label.setText("擬似軌跡（VO実測ではありません）")
+            flow_mag = np.asarray([float(getattr(s, 'flow_mag', 0.0)) for s in frame_scores], dtype=np.float32)
+            rotation = np.asarray([float(getattr(s, 'rotation_delta', 0.0)) for s in frame_scores], dtype=np.float32)
+            dist = np.clip(flow_mag, 0.0, np.percentile(flow_mag, 95) if flow_mag.size > 0 else 0.0)
+            dist = dist * 0.03
+            dtheta = np.deg2rad(np.clip(rotation, 0.0, 30.0))
+            x = np.zeros_like(dist)
+            y = np.zeros_like(dist)
+            z = np.zeros_like(dist)
+            theta = 0.0
+            for i in range(1, len(dist)):
+                theta += float(dtheta[i])
+                step = float(dist[i])
+                x[i] = x[i - 1] + step * np.cos(theta)
+                z[i] = z[i - 1] + step * np.sin(theta)
+                y[i] = y[i - 1] + step * np.sin(theta * 0.25) * 0.5
+            self._coords = np.column_stack([x, y, z]).astype(np.float32)
         self._redraw()
 
     def _selected_plane(self) -> tuple[np.ndarray, np.ndarray]:

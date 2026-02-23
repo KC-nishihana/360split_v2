@@ -52,6 +52,8 @@ class FrameScoreData:
     stage3_selected: bool = False
     is_stationary: bool = False
     is_keyframe: bool = False
+    t_xyz: Optional[List[float]] = None
+    q_wxyz: Optional[List[float]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +236,7 @@ class Stage2Worker(QThread):
             selector = KeyframeSelector(config=self.config)
             rerun_logger = None
             metrics_map: Dict[int, Dict[str, float]] = {}
+            pose_map: Dict[int, Dict[str, Optional[List[float]]]] = {}
             if bool(self.config.get("enable_rerun_logging", False)):
                 rerun_logger = RerunKeyframeLogger(
                     app_id="keyframe_check_gui_stage2",
@@ -253,6 +256,12 @@ class Stage2Worker(QThread):
                     return
                 frame_idx = int(payload.get("frame_index", 0))
                 metrics_map[frame_idx] = dict(payload.get("metrics", {}))
+                t_xyz = payload.get("t_xyz")
+                q_wxyz = payload.get("q_wxyz")
+                pose_map[frame_idx] = {
+                    "t_xyz": [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None,
+                    "q_wxyz": [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None,
+                }
                 if rerun_logger is None or not rerun_logger.enabled:
                     return
                 rerun_logger.log_frame(
@@ -289,6 +298,7 @@ class Stage2Worker(QThread):
                     motion_blur=s1.motion_blur,
                 )
                 m = metrics_map.get(s1.frame_index, {})
+                p = pose_map.get(s1.frame_index, {})
                 fsd.flow_mag = float(m.get('flow_mag', 0.0))
                 fsd.translation_delta = float(m.get('translation_delta', 0.0))
                 fsd.rotation_delta = float(m.get('rotation_delta', 0.0))
@@ -299,6 +309,8 @@ class Stage2Worker(QThread):
                 fsd.combined_stage3 = float(m.get('combined_stage3', fsd.combined))
                 fsd.stage3_selected = bool(float(m.get('stage3_selected_flag', 0.0)) > 0.5)
                 fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
+                fsd.t_xyz = p.get("t_xyz")
+                fsd.q_wxyz = p.get("q_wxyz")
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
@@ -448,6 +460,7 @@ class UnifiedAnalysisWorker(QThread):
             selector = KeyframeSelector(config=self.config)
             rerun_logger = None
             metrics_map: Dict[int, Dict[str, float]] = {}
+            pose_map: Dict[int, Dict[str, Optional[List[float]]]] = {}
             if bool(self.config.get("enable_rerun_logging", False)):
                 rerun_logger = RerunKeyframeLogger(
                     app_id="keyframe_check_gui_full",
@@ -468,6 +481,12 @@ class UnifiedAnalysisWorker(QThread):
                     return
                 frame_idx = int(payload.get("frame_index", 0))
                 metrics_map[frame_idx] = dict(payload.get("metrics", {}))
+                t_xyz = payload.get("t_xyz")
+                q_wxyz = payload.get("q_wxyz")
+                pose_map[frame_idx] = {
+                    "t_xyz": [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None,
+                    "q_wxyz": [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None,
+                }
                 if rerun_logger is None or not rerun_logger.enabled:
                     return
                 rerun_logger.log_frame(
@@ -501,6 +520,7 @@ class UnifiedAnalysisWorker(QThread):
                     motion_blur=s1.motion_blur,
                 )
                 m = metrics_map.get(s1.frame_index, {})
+                p = pose_map.get(s1.frame_index, {})
                 fsd.flow_mag = float(m.get('flow_mag', 0.0))
                 fsd.translation_delta = float(m.get('translation_delta', 0.0))
                 fsd.rotation_delta = float(m.get('rotation_delta', 0.0))
@@ -511,6 +531,8 @@ class UnifiedAnalysisWorker(QThread):
                 fsd.combined_stage3 = float(m.get('combined_stage3', fsd.combined))
                 fsd.stage3_selected = bool(float(m.get('stage3_selected_flag', 0.0)) > 0.5)
                 fsd.is_stationary = bool(float(m.get('is_stationary', 0.0)) > 0.5)
+                fsd.t_xyz = p.get("t_xyz")
+                fsd.q_wxyz = p.get("q_wxyz")
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)

@@ -768,6 +768,7 @@ class MainWindow(QMainWindow):
                 if idx in self._analysis_masks
             },
             use_precomputed_analysis_masks=bool(s.get("enable_dynamic_mask_removal", False)),
+            export_runtime_config=s,
         )
 
         # ステレオ（OSV）対応: 左右ストリームパスを設定

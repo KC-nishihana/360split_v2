@@ -591,6 +591,105 @@ class SettingsDialog(QDialog):
         fisheye_group.setLayout(fisheye_layout)
         layout.addWidget(fisheye_group)
 
+        # === 魚眼分割出力（cross5） ===
+        split_group = QGroupBox("魚眼分割出力（OSV cross5）")
+        split_layout = QGridLayout()
+
+        self.enable_split_views = QCheckBox("分割画像を出力する")
+        self.enable_split_views.setChecked(bool(self.settings.get("enable_split_views", True)))
+        split_layout.addWidget(self.enable_split_views, 0, 0, 1, 2)
+
+        split_layout.addWidget(QLabel("分割サイズ (px):"), 1, 0)
+        self.split_view_size = QSpinBox()
+        self.split_view_size.setMinimum(128)
+        self.split_view_size.setMaximum(8192)
+        self.split_view_size.setValue(int(self.settings.get("split_view_size", 1600)))
+        split_layout.addWidget(self.split_view_size, 1, 1)
+
+        split_layout.addWidget(QLabel("HFOV (deg):"), 2, 0)
+        self.split_view_hfov = QDoubleSpinBox()
+        self.split_view_hfov.setMinimum(1.0)
+        self.split_view_hfov.setMaximum(179.0)
+        self.split_view_hfov.setSingleStep(1.0)
+        self.split_view_hfov.setDecimals(1)
+        self.split_view_hfov.setValue(float(self.settings.get("split_view_hfov", 80.0)))
+        split_layout.addWidget(self.split_view_hfov, 2, 1)
+
+        split_layout.addWidget(QLabel("VFOV (deg):"), 3, 0)
+        self.split_view_vfov = QDoubleSpinBox()
+        self.split_view_vfov.setMinimum(1.0)
+        self.split_view_vfov.setMaximum(179.0)
+        self.split_view_vfov.setSingleStep(1.0)
+        self.split_view_vfov.setDecimals(1)
+        self.split_view_vfov.setValue(float(self.settings.get("split_view_vfov", 80.0)))
+        split_layout.addWidget(self.split_view_vfov, 3, 1)
+
+        split_layout.addWidget(QLabel("cross yaw (deg):"), 4, 0)
+        self.split_cross_yaw_deg = QDoubleSpinBox()
+        self.split_cross_yaw_deg.setMinimum(0.0)
+        self.split_cross_yaw_deg.setMaximum(180.0)
+        self.split_cross_yaw_deg.setSingleStep(0.5)
+        self.split_cross_yaw_deg.setDecimals(1)
+        self.split_cross_yaw_deg.setValue(float(self.settings.get("split_cross_yaw_deg", 50.5)))
+        split_layout.addWidget(self.split_cross_yaw_deg, 4, 1)
+
+        split_layout.addWidget(QLabel("cross pitch (deg):"), 5, 0)
+        self.split_cross_pitch_deg = QDoubleSpinBox()
+        self.split_cross_pitch_deg.setMinimum(0.0)
+        self.split_cross_pitch_deg.setMaximum(180.0)
+        self.split_cross_pitch_deg.setSingleStep(0.5)
+        self.split_cross_pitch_deg.setDecimals(1)
+        self.split_cross_pitch_deg.setValue(float(self.settings.get("split_cross_pitch_deg", 50.5)))
+        split_layout.addWidget(self.split_cross_pitch_deg, 5, 1)
+
+        split_layout.addWidget(QLabel("cross inward (deg):"), 6, 0)
+        self.split_cross_inward_deg = QDoubleSpinBox()
+        self.split_cross_inward_deg.setMinimum(0.0)
+        self.split_cross_inward_deg.setMaximum(90.0)
+        self.split_cross_inward_deg.setSingleStep(1.0)
+        self.split_cross_inward_deg.setDecimals(1)
+        self.split_cross_inward_deg.setValue(float(self.settings.get("split_cross_inward_deg", 10.0)))
+        split_layout.addWidget(self.split_cross_inward_deg, 6, 1)
+
+        split_layout.addWidget(QLabel("inward up/down (deg):"), 7, 0)
+        inward_ud_row = QHBoxLayout()
+        self.split_inward_up_deg = QDoubleSpinBox()
+        self.split_inward_up_deg.setMinimum(0.0)
+        self.split_inward_up_deg.setMaximum(90.0)
+        self.split_inward_up_deg.setSingleStep(1.0)
+        self.split_inward_up_deg.setDecimals(1)
+        self.split_inward_up_deg.setValue(float(self.settings.get("split_inward_up_deg", 25.0)))
+        inward_ud_row.addWidget(self.split_inward_up_deg)
+        self.split_inward_down_deg = QDoubleSpinBox()
+        self.split_inward_down_deg.setMinimum(0.0)
+        self.split_inward_down_deg.setMaximum(90.0)
+        self.split_inward_down_deg.setSingleStep(1.0)
+        self.split_inward_down_deg.setDecimals(1)
+        self.split_inward_down_deg.setValue(float(self.settings.get("split_inward_down_deg", 25.0)))
+        inward_ud_row.addWidget(self.split_inward_down_deg)
+        split_layout.addLayout(inward_ud_row, 7, 1)
+
+        split_layout.addWidget(QLabel("inward left/right (deg):"), 8, 0)
+        inward_lr_row = QHBoxLayout()
+        self.split_inward_left_deg = QDoubleSpinBox()
+        self.split_inward_left_deg.setMinimum(0.0)
+        self.split_inward_left_deg.setMaximum(90.0)
+        self.split_inward_left_deg.setSingleStep(1.0)
+        self.split_inward_left_deg.setDecimals(1)
+        self.split_inward_left_deg.setValue(float(self.settings.get("split_inward_left_deg", 25.0)))
+        inward_lr_row.addWidget(self.split_inward_left_deg)
+        self.split_inward_right_deg = QDoubleSpinBox()
+        self.split_inward_right_deg.setMinimum(0.0)
+        self.split_inward_right_deg.setMaximum(90.0)
+        self.split_inward_right_deg.setSingleStep(1.0)
+        self.split_inward_right_deg.setDecimals(1)
+        self.split_inward_right_deg.setValue(float(self.settings.get("split_inward_right_deg", 25.0)))
+        inward_lr_row.addWidget(self.split_inward_right_deg)
+        split_layout.addLayout(inward_lr_row, 8, 1)
+
+        split_group.setLayout(split_layout)
+        layout.addWidget(split_group)
+
         # === ナディアマスク ===
         nadir_group = QGroupBox("ナディアマスク処理")
         nadir_layout = QGridLayout()
@@ -910,6 +1009,17 @@ class SettingsDialog(QDialog):
             'fisheye_mask_radius_ratio': 0.94,
             'fisheye_mask_center_offset_x': 0,
             'fisheye_mask_center_offset_y': 0,
+            'enable_split_views': True,
+            'split_view_size': 1600,
+            'split_view_hfov': 80.0,
+            'split_view_vfov': 80.0,
+            'split_cross_yaw_deg': 50.5,
+            'split_cross_pitch_deg': 50.5,
+            'split_cross_inward_deg': 10.0,
+            'split_inward_up_deg': 25.0,
+            'split_inward_down_deg': 25.0,
+            'split_inward_left_deg': 25.0,
+            'split_inward_right_deg': 25.0,
             'enable_nadir_mask': False,
             'nadir_mask_radius': 100,
             'enable_equipment_detection': False,
@@ -995,6 +1105,17 @@ class SettingsDialog(QDialog):
             'fisheye_mask_radius_ratio': self.fisheye_mask_radius_ratio.value(),
             'fisheye_mask_center_offset_x': self.fisheye_mask_center_offset_x.value(),
             'fisheye_mask_center_offset_y': self.fisheye_mask_center_offset_y.value(),
+            'enable_split_views': self.enable_split_views.isChecked(),
+            'split_view_size': self.split_view_size.value(),
+            'split_view_hfov': self.split_view_hfov.value(),
+            'split_view_vfov': self.split_view_vfov.value(),
+            'split_cross_yaw_deg': self.split_cross_yaw_deg.value(),
+            'split_cross_pitch_deg': self.split_cross_pitch_deg.value(),
+            'split_cross_inward_deg': self.split_cross_inward_deg.value(),
+            'split_inward_up_deg': self.split_inward_up_deg.value(),
+            'split_inward_down_deg': self.split_inward_down_deg.value(),
+            'split_inward_left_deg': self.split_inward_left_deg.value(),
+            'split_inward_right_deg': self.split_inward_right_deg.value(),
             'enable_nadir_mask': self.enable_nadir_mask.isChecked(),
             'nadir_mask_radius': self.nadir_mask_radius.value(),
             'enable_equipment_detection': self.enable_equipment_detection.isChecked(),
@@ -1170,6 +1291,17 @@ class SettingsDialog(QDialog):
             self.fisheye_mask_center_offset_y.setValue(
                 int(params.get('fisheye_mask_center_offset_y', 0))
             )
+            self.enable_split_views.setChecked(bool(params.get('enable_split_views', True)))
+            self.split_view_size.setValue(int(params.get('split_view_size', 1600)))
+            self.split_view_hfov.setValue(float(params.get('split_view_hfov', 80.0)))
+            self.split_view_vfov.setValue(float(params.get('split_view_vfov', 80.0)))
+            self.split_cross_yaw_deg.setValue(float(params.get('split_cross_yaw_deg', 50.5)))
+            self.split_cross_pitch_deg.setValue(float(params.get('split_cross_pitch_deg', 50.5)))
+            self.split_cross_inward_deg.setValue(float(params.get('split_cross_inward_deg', 10.0)))
+            self.split_inward_up_deg.setValue(float(params.get('split_inward_up_deg', 25.0)))
+            self.split_inward_down_deg.setValue(float(params.get('split_inward_down_deg', 25.0)))
+            self.split_inward_left_deg.setValue(float(params.get('split_inward_left_deg', 25.0)))
+            self.split_inward_right_deg.setValue(float(params.get('split_inward_right_deg', 25.0)))
             self.enable_stage0_scan.setChecked(
                 params.get('enable_stage0_scan', True)
             )
@@ -1251,6 +1383,17 @@ class SettingsDialog(QDialog):
             self.fisheye_mask_radius_ratio.setValue(0.94)
             self.fisheye_mask_center_offset_x.setValue(0)
             self.fisheye_mask_center_offset_y.setValue(0)
+            self.enable_split_views.setChecked(True)
+            self.split_view_size.setValue(1600)
+            self.split_view_hfov.setValue(80.0)
+            self.split_view_vfov.setValue(80.0)
+            self.split_cross_yaw_deg.setValue(50.5)
+            self.split_cross_pitch_deg.setValue(50.5)
+            self.split_cross_inward_deg.setValue(10.0)
+            self.split_inward_up_deg.setValue(25.0)
+            self.split_inward_down_deg.setValue(25.0)
+            self.split_inward_left_deg.setValue(25.0)
+            self.split_inward_right_deg.setValue(25.0)
             self.enable_nadir_mask.setChecked(False)
             self.nadir_mask_radius.setValue(100)
             self.enable_equipment_detection.setChecked(False)

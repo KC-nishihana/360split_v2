@@ -28,6 +28,7 @@ from core.visual_odometry.calibration import (
     calibration_to_dict,
     load_calibration_xml,
 )
+from processing.fisheye_splitter import Cross5FisheyeSplitter, Cross5SplitConfig
 logger = get_logger(__name__)
 
 
@@ -808,6 +809,7 @@ class ExportWorker(QThread):
                  dynamic_mask_inpaint_module: str = "",
                  precomputed_analysis_masks: Optional[Dict[int, np.ndarray]] = None,
                  use_precomputed_analysis_masks: bool = False,
+                 export_runtime_config: Optional[Dict[str, object]] = None,
                  parent: QObject = None):
         super().__init__(parent)
         self.video_path = video_path
@@ -866,6 +868,7 @@ class ExportWorker(QThread):
         self.dynamic_mask_inpaint_module = str(dynamic_mask_inpaint_module or "").strip()
         self.precomputed_analysis_masks = dict(precomputed_analysis_masks or {})
         self.use_precomputed_analysis_masks = bool(use_precomputed_analysis_masks)
+        self.export_runtime_config = dict(export_runtime_config or {})
         self._sparse_frame_export = False
         self._effective_motion_diff = self.dynamic_mask_use_motion_diff
 
@@ -884,6 +887,72 @@ class ExportWorker(QThread):
 
     def stop(self):
         self._is_running = False
+
+    def _build_export_calibration_runtime(self, frame_size: tuple[int, int]) -> Dict[str, object]:
+        runtime = self.export_runtime_config.get("calibration_runtime")
+        if isinstance(runtime, dict):
+            return runtime
+
+        cfg = self.export_runtime_config if isinstance(self.export_runtime_config, dict) else {}
+        model_hint = str(cfg.get("calib_model", cfg.get("CALIB_MODEL", "auto")) or "auto").strip().lower()
+        mono_xml_raw = cfg.get("calib_xml", cfg.get("CALIB_XML", ""))
+        front_xml_raw = cfg.get("front_calib_xml", cfg.get("FRONT_CALIB_XML", ""))
+        rear_xml_raw = cfg.get("rear_calib_xml", cfg.get("REAR_CALIB_XML", ""))
+        search_roots = [Path.cwd(), Path(__file__).resolve().parent.parent]
+        if self.video_path:
+            search_roots.append(Path(self.video_path).expanduser().resolve().parent)
+        mono_xml = _resolve_calibration_path(mono_xml_raw, search_roots) or None
+        front_xml = _resolve_calibration_path(front_xml_raw, search_roots) or mono_xml
+        rear_xml = _resolve_calibration_path(rear_xml_raw, search_roots) or mono_xml
+
+        mono = load_calibration_xml(mono_xml, model_hint=model_hint, fallback_image_size=frame_size, logger=logger) if mono_xml else None
+        front = load_calibration_xml(front_xml, model_hint=model_hint, fallback_image_size=frame_size, logger=logger) if front_xml else None
+        rear = load_calibration_xml(rear_xml, model_hint=model_hint, fallback_image_size=frame_size, logger=logger) if rear_xml else None
+        if front is None and mono is not None:
+            front = mono
+        if rear is None and mono is not None:
+            rear = mono
+        return {
+            "model_hint": model_hint,
+            "mono": calibration_to_dict(mono),
+            "front": calibration_to_dict(front),
+            "rear": calibration_to_dict(rear),
+        }
+
+    def _create_cross5_splitters(self, frame_size: tuple[int, int]) -> Dict[str, Cross5FisheyeSplitter]:
+        if not self.is_stereo:
+            return {}
+        split_enabled = bool(self.export_runtime_config.get("enable_split_views", True))
+        if not split_enabled:
+            logger.info("Export cross5 splitter: 分割出力は無効")
+            return {}
+        split_cfg = Cross5SplitConfig(
+            size=int(self.export_runtime_config.get("split_view_size", 1600)),
+            hfov=float(self.export_runtime_config.get("split_view_hfov", 80.0)),
+            vfov=float(self.export_runtime_config.get("split_view_vfov", 80.0)),
+            cross_yaw_deg=float(self.export_runtime_config.get("split_cross_yaw_deg", 50.5)),
+            cross_pitch_deg=float(self.export_runtime_config.get("split_cross_pitch_deg", 50.5)),
+            cross_inward_deg=float(self.export_runtime_config.get("split_cross_inward_deg", 10.0)),
+            inward_up_deg=float(self.export_runtime_config.get("split_inward_up_deg", 25.0)),
+            inward_down_deg=float(self.export_runtime_config.get("split_inward_down_deg", 25.0)),
+            inward_left_deg=float(self.export_runtime_config.get("split_inward_left_deg", 25.0)),
+            inward_right_deg=float(self.export_runtime_config.get("split_inward_right_deg", 25.0)),
+        )
+        runtime = self._build_export_calibration_runtime(frame_size)
+        front_dict = runtime.get("front") or runtime.get("mono")
+        rear_dict = runtime.get("rear") or runtime.get("mono")
+        splitters: Dict[str, Cross5FisheyeSplitter] = {}
+        try:
+            if front_dict:
+                splitters["_L"] = Cross5FisheyeSplitter(front_dict, cfg=split_cfg)
+            if rear_dict:
+                splitters["_R"] = Cross5FisheyeSplitter(rear_dict, cfg=split_cfg)
+        except Exception as e:
+            logger.warning(f"Export cross5 splitter初期化失敗: {e}")
+            return {}
+        if not splitters:
+            logger.warning("Export cross5 splitter: キャリブレーション未設定のため分割をスキップ")
+        return splitters
 
     def _save_target_mask(
         self,
@@ -962,6 +1031,14 @@ class ExportWorker(QThread):
             )
         return write_image(mask_path, binary_mask)
 
+    def _build_flat_split_mask_path(self, masks_root: Path, split_image_path: Path) -> Path:
+        stem = f"{split_image_path.stem}{self.mask_suffix}" if self.mask_add_suffix else split_image_path.stem
+        if self.mask_output_format == "same":
+            ext = split_image_path.suffix
+        else:
+            ext = f".{self.mask_output_format.lstrip('.')}"
+        return masks_root / f"{stem}{ext}"
+
     def run(self):
         try:
             output_path = Path(self.output_dir)
@@ -1033,6 +1110,7 @@ class ExportWorker(QThread):
                 self._effective_motion_diff = False
 
             target_mask_generator = None
+            target_mask_cls = None
             if self.enable_target_mask_generation:
                 try:
                     needs_reanalysis = bool(self.enable_cubemap or self.enable_perspective or self.is_stereo)
@@ -1055,6 +1133,7 @@ class ExportWorker(QThread):
                                     f"missing={len(missing)}"
                                 )
                         from processing.target_mask_generator import TargetMaskGenerator
+                        target_mask_cls = TargetMaskGenerator
                         inpaint_hook = None
                         if self.dynamic_mask_inpaint_enabled and self.dynamic_mask_inpaint_module:
                             try:
@@ -1086,6 +1165,15 @@ class ExportWorker(QThread):
                 except Exception as e:
                     logger.warning(f"対象マスク生成の初期化に失敗したため無効化します: {e}")
                     self.enable_target_mask_generation = False
+
+            splitters: Dict[str, Cross5FisheyeSplitter] = {}
+            if self.is_stereo:
+                frame_size = (
+                    int(cap_l.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap_l is not None else 0,
+                    int(cap_l.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap_l is not None else 0,
+                )
+                if frame_size[0] > 0 and frame_size[1] > 0:
+                    splitters = self._create_cross5_splitters((frame_size[0], frame_size[1]))
 
             total = len(self.frame_indices)
             exported = 0
@@ -1167,6 +1255,7 @@ class ExportWorker(QThread):
                             logger.warning(f"保存失敗（フレーム {frame_idx}{suffix}）: {filepath}")
                             continue
 
+                        fisheye_mask_path = None
                         if self.enable_target_mask_generation:
                             try:
                                 history_key = suffix or "mono"
@@ -1192,8 +1281,54 @@ class ExportWorker(QThread):
                                     flatten_stereo_lr=True,
                                 ):
                                     logger.warning(f"対象マスク保存失敗: {filepath}")
+                                elif target_mask_cls is not None:
+                                    fisheye_mask_path = target_mask_cls.build_mask_path(
+                                        image_path=filepath,
+                                        images_root=stereo_images_root,
+                                        masks_root=masks_root,
+                                        add_suffix=self.mask_add_suffix,
+                                        suffix=self.mask_suffix,
+                                        mask_ext=self.mask_output_format,
+                                        flatten_stereo_lr=True,
+                                    )
                             except Exception as e:
                                 logger.warning(f"対象マスク生成エラー（フレーム {frame_idx}{suffix}）: {e}")
+
+                        splitter = splitters.get(suffix)
+                        if splitter is not None:
+                            try:
+                                split_views = splitter.split_image_with_valid_mask(processed_frame)
+                                projected_masks = {}
+                                if fisheye_mask_path is not None and fisheye_mask_path.exists():
+                                    fisheye_mask_img = cv2.imread(str(fisheye_mask_path), cv2.IMREAD_GRAYSCALE)
+                                    if fisheye_mask_img is not None:
+                                        projected_masks = splitter.project_mask(fisheye_mask_img)
+                                for view_name, (view_img, _valid) in split_views.items():
+                                    split_dir = stereo_images_root / f"{suffix.strip('_')}_{view_name}"
+                                    split_dir.mkdir(parents=True, exist_ok=True)
+                                    split_path = split_dir / f"{self.prefix}_{frame_idx:06d}{suffix}_{view_name}.{ext}"
+                                    if ext == 'jpg':
+                                        saved_split = write_image(
+                                            split_path,
+                                            view_img,
+                                            [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+                                        )
+                                    else:
+                                        saved_split = write_image(split_path, view_img)
+                                    if not saved_split:
+                                        logger.warning(f"分割画像保存失敗: {split_path}")
+                                        continue
+                                    if not projected_masks or target_mask_cls is None:
+                                        continue
+                                    split_mask = projected_masks.get(view_name)
+                                    if split_mask is None:
+                                        continue
+                                    split_mask_path = self._build_flat_split_mask_path(masks_root, split_path)
+                                    split_mask_path.parent.mkdir(parents=True, exist_ok=True)
+                                    if not write_image(split_mask_path, split_mask):
+                                        logger.warning(f"分割マスク保存失敗: {split_mask_path}")
+                            except Exception as e:
+                                logger.warning(f"cross5分割出力エラー（フレーム {frame_idx}{suffix}）: {e}")
 
                         exported += 1
                         continue  # ステレオの場合はここで次のフレームへ

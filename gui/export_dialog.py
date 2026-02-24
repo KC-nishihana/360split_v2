@@ -283,6 +283,21 @@ class ExportDialog(QDialog):
             "dynamic_mask_dilation_size": int(g.get("dynamic_mask_dilation_size", 5)),
             "dynamic_mask_inpaint_enabled": bool(g.get("dynamic_mask_inpaint_enabled", False)),
             "dynamic_mask_inpaint_module": str(g.get("dynamic_mask_inpaint_module", "")),
+            "calib_xml": str(g.get("calib_xml", "")),
+            "front_calib_xml": str(g.get("front_calib_xml", "")),
+            "rear_calib_xml": str(g.get("rear_calib_xml", "")),
+            "calib_model": str(g.get("calib_model", "auto")),
+            "enable_split_views": bool(g.get("enable_split_views", True)),
+            "split_view_size": int(g.get("split_view_size", 1600)),
+            "split_view_hfov": float(g.get("split_view_hfov", 80.0)),
+            "split_view_vfov": float(g.get("split_view_vfov", 80.0)),
+            "split_cross_yaw_deg": float(g.get("split_cross_yaw_deg", 50.5)),
+            "split_cross_pitch_deg": float(g.get("split_cross_pitch_deg", 50.5)),
+            "split_cross_inward_deg": float(g.get("split_cross_inward_deg", 10.0)),
+            "split_inward_up_deg": float(g.get("split_inward_up_deg", 25.0)),
+            "split_inward_down_deg": float(g.get("split_inward_down_deg", 25.0)),
+            "split_inward_left_deg": float(g.get("split_inward_left_deg", 25.0)),
+            "split_inward_right_deg": float(g.get("split_inward_right_deg", 25.0)),
         }
 
     def _on_accept(self):

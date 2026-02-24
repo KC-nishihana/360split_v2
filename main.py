@@ -17,10 +17,11 @@ import argparse
 import json
 import csv
 import os
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import cv2
+import numpy as np
 
 # プロジェクトルートをパスに追加
 PROJECT_ROOT = Path(__file__).parent
@@ -253,6 +254,22 @@ def parse_arguments():
         help="魚眼有効領域中心Yオフセット（px）"
     )
     parser.add_argument(
+        "--split-views",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="OSV出力時にcross5分割画像を出力する（--no-split-viewsで無効化）"
+    )
+    parser.add_argument("--split-view-size", type=int, default=None, help="cross5分割画像サイズ(px)")
+    parser.add_argument("--split-view-hfov", type=float, default=None, help="cross5分割HFOV(deg)")
+    parser.add_argument("--split-view-vfov", type=float, default=None, help="cross5分割VFOV(deg)")
+    parser.add_argument("--split-cross-yaw-deg", type=float, default=None, help="cross5横方向基準角(deg)")
+    parser.add_argument("--split-cross-pitch-deg", type=float, default=None, help="cross5縦方向基準角(deg)")
+    parser.add_argument("--split-cross-inward-deg", type=float, default=None, help="cross5内向き調整角(deg)")
+    parser.add_argument("--split-inward-up-deg", type=float, default=None, help="cross5 up内向き角(deg)")
+    parser.add_argument("--split-inward-down-deg", type=float, default=None, help="cross5 down内向き角(deg)")
+    parser.add_argument("--split-inward-left-deg", type=float, default=None, help="cross5 left内向き角(deg)")
+    parser.add_argument("--split-inward-right-deg", type=float, default=None, help="cross5 right内向き角(deg)")
+    parser.add_argument(
         "--calib-xml",
         type=str,
         default=None,
@@ -480,6 +497,28 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["fisheye_mask_center_offset_x"] = int(args.fisheye_mask_center_offset_x)
     if args.fisheye_mask_center_offset_y is not None:
         config["fisheye_mask_center_offset_y"] = int(args.fisheye_mask_center_offset_y)
+    if args.split_views is not None:
+        config["enable_split_views"] = bool(args.split_views)
+    if args.split_view_size is not None:
+        config["split_view_size"] = int(max(128, args.split_view_size))
+    if args.split_view_hfov is not None:
+        config["split_view_hfov"] = float(max(1.0, min(179.0, args.split_view_hfov)))
+    if args.split_view_vfov is not None:
+        config["split_view_vfov"] = float(max(1.0, min(179.0, args.split_view_vfov)))
+    if args.split_cross_yaw_deg is not None:
+        config["split_cross_yaw_deg"] = float(max(0.0, args.split_cross_yaw_deg))
+    if args.split_cross_pitch_deg is not None:
+        config["split_cross_pitch_deg"] = float(max(0.0, args.split_cross_pitch_deg))
+    if args.split_cross_inward_deg is not None:
+        config["split_cross_inward_deg"] = float(max(0.0, args.split_cross_inward_deg))
+    if args.split_inward_up_deg is not None:
+        config["split_inward_up_deg"] = float(max(0.0, args.split_inward_up_deg))
+    if args.split_inward_down_deg is not None:
+        config["split_inward_down_deg"] = float(max(0.0, args.split_inward_down_deg))
+    if args.split_inward_left_deg is not None:
+        config["split_inward_left_deg"] = float(max(0.0, args.split_inward_left_deg))
+    if args.split_inward_right_deg is not None:
+        config["split_inward_right_deg"] = float(max(0.0, args.split_inward_right_deg))
     if args.calib_xml:
         config["calib_xml"] = str(args.calib_xml)
     if args.calib_model:
@@ -751,7 +790,18 @@ def _load_calibrations_for_runtime(
         if mono_xml:
             mono_calib = load_calibration_xml(mono_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
             log_calibration_summary(logger, "mono calibration", mono_calib)
-        elif is_stereo_mode:
+        if is_stereo_mode:
+            if front_xml:
+                front_calib = load_calibration_xml(front_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+                log_calibration_summary(logger, "stereo-front calibration", front_calib)
+            if rear_xml:
+                rear_calib = load_calibration_xml(rear_xml, model_hint=model_hint, fallback_image_size=fallback_size, logger=logger)
+                log_calibration_summary(logger, "stereo-rear calibration", rear_calib)
+            if front_calib is None and mono_calib is not None:
+                front_calib = mono_calib
+            if rear_calib is None and mono_calib is not None:
+                rear_calib = mono_calib
+        if is_stereo_mode and front_calib is None and rear_calib is None and mono_calib is None:
             logger.warning("stereo input detected without calibration XML: VO will be disabled")
 
     runtime = {
@@ -767,7 +817,9 @@ def run_cli(args):
     """CLIモードでキーフレーム抽出を実行する。"""
     from core.keyframe_selector import KeyframeSelector
     from processing.equirectangular import EquirectangularProcessor
+    from processing.fisheye_splitter import Cross5FisheyeSplitter, Cross5SplitConfig
     from processing.mask_processor import MaskProcessor
+    from processing.target_mask_generator import TargetMaskGenerator
     from utils.rerun_logger import RerunKeyframeLogger
 
     video_path, is_front_rear, is_osv = resolve_cli_input(args)
@@ -804,6 +856,19 @@ def run_cli(args):
             f"(ratio={config.get('fisheye_mask_radius_ratio', 0.94):.2f}, "
             f"dx={int(config.get('fisheye_mask_center_offset_x', 0))}, "
             f"dy={int(config.get('fisheye_mask_center_offset_y', 0))})"
+        )
+    if is_osv:
+        logger.info(
+            "cross5分割: "
+            f"{'ON' if bool(config.get('enable_split_views', True)) else 'OFF'} "
+            f"(size={int(config.get('split_view_size', 1600))}, "
+            f"hfov={float(config.get('split_view_hfov', 80.0)):.1f}, "
+            f"vfov={float(config.get('split_view_vfov', 80.0)):.1f}, "
+            f"inward={float(config.get('split_cross_inward_deg', 10.0)):.1f}, "
+            f"u={float(config.get('split_inward_up_deg', 25.0)):.1f}, "
+            f"d={float(config.get('split_inward_down_deg', 25.0)):.1f}, "
+            f"l={float(config.get('split_inward_left_deg', 25.0)):.1f}, "
+            f"r={float(config.get('split_inward_right_deg', 25.0)):.1f})"
         )
     if config.get("enable_dynamic_mask_removal", False):
         logger.info(
@@ -935,12 +1000,93 @@ def run_cli(args):
     # マスク処理
     mask_processor = MaskProcessor() if args.apply_mask else None
     equirect_processor = EquirectangularProcessor() if args.equirectangular else None
+    mask_output_dirname = str(config.get("mask_output_dirname", "masks") or "masks")
+    mask_add_suffix = bool(config.get("mask_add_suffix", True))
+    mask_suffix = str(config.get("mask_suffix", "_mask") or "_mask")
+    mask_output_format = str(config.get("mask_output_format", "same") or "same").lower()
+    masks_root = output_dir / mask_output_dirname
+    fisheye_mask_export_enabled = bool(config.get("enable_dynamic_mask_removal", False)) and is_stereo_mode
+
+    target_mask_generator = None
+    if fisheye_mask_export_enabled:
+        try:
+            inpaint_hook = None
+            if bool(config.get("dynamic_mask_inpaint_enabled", False)) and str(config.get("dynamic_mask_inpaint_module", "")).strip():
+                try:
+                    mod = __import__(str(config.get("dynamic_mask_inpaint_module")).strip(), fromlist=["inpaint_frame"])
+                    hook = getattr(mod, "inpaint_frame", None)
+                    if callable(hook):
+                        inpaint_hook = hook
+                except Exception as e:
+                    logger.warning(f"CLIマスク出力: インペイントモジュール読み込み失敗: {e}")
+            target_mask_generator = TargetMaskGenerator(
+                yolo_model_path=str(config.get("yolo_model_path", "yolo26n-seg.pt")),
+                sam_model_path=str(config.get("sam_model_path", "sam3_t.pt")),
+                confidence_threshold=float(config.get("confidence_threshold", 0.25)),
+                device=str(config.get("detection_device", "auto")),
+                enable_motion_detection=bool(config.get("dynamic_mask_use_motion_diff", True)),
+                motion_history_frames=max(2, int(config.get("dynamic_mask_motion_frames", 3))),
+                motion_threshold=int(config.get("dynamic_mask_motion_threshold", 30)),
+                motion_mask_dilation_size=max(0, int(config.get("dynamic_mask_dilation_size", 5))),
+                enable_mask_inpaint=bool(config.get("dynamic_mask_inpaint_enabled", False)),
+                inpaint_hook=inpaint_hook,
+            )
+            logger.info("CLIマスク出力: 魚眼マスク生成を有効化しました")
+        except Exception as e:
+            logger.warning(f"CLIマスク出力: 初期化失敗のため無効化します: {e}")
+            target_mask_generator = None
+            fisheye_mask_export_enabled = False
+
+    splitters = {}
+    split_views_enabled = bool(config.get("enable_split_views", True))
+    split_cfg = Cross5SplitConfig(
+        size=int(config.get("split_view_size", 1600)),
+        hfov=float(config.get("split_view_hfov", 80.0)),
+        vfov=float(config.get("split_view_vfov", 80.0)),
+        cross_yaw_deg=float(config.get("split_cross_yaw_deg", 50.5)),
+        cross_pitch_deg=float(config.get("split_cross_pitch_deg", 50.5)),
+        cross_inward_deg=float(config.get("split_cross_inward_deg", 10.0)),
+        inward_up_deg=float(config.get("split_inward_up_deg", 25.0)),
+        inward_down_deg=float(config.get("split_inward_down_deg", 25.0)),
+        inward_left_deg=float(config.get("split_inward_left_deg", 25.0)),
+        inward_right_deg=float(config.get("split_inward_right_deg", 25.0)),
+    )
+    if is_osv and split_views_enabled:
+        calib_l = calibration_runtime.get("front") or calibration_runtime.get("mono")
+        calib_r = calibration_runtime.get("rear") or calibration_runtime.get("mono")
+        try:
+            if calib_l is not None:
+                splitters["_L"] = Cross5FisheyeSplitter(calib_l, cfg=split_cfg)
+            if calib_r is not None:
+                splitters["_R"] = Cross5FisheyeSplitter(calib_r, cfg=split_cfg)
+        except Exception as e:
+            splitters = {}
+            logger.warning(f"cross5分割: 初期化に失敗したためスキップします: {e}")
+        if not splitters:
+            logger.warning("cross5分割: 利用可能なキャリブレーションがないためスキップします")
+    elif is_osv and not split_views_enabled:
+        logger.info("cross5分割出力: 無効")
 
     # キーフレーム出力
     logger.info("キーフレームを出力中...")
     fmt = config["output_image_format"]
     stereo_suffixes = ("_F", "_R") if is_front_rear else ("_L", "_R")
     stereo_images_root = output_dir / "images" if is_stereo_mode else output_dir
+    mask_histories = {stereo_suffixes[0]: deque(maxlen=max(2, int(config.get("dynamic_mask_motion_frames", 3)))),
+                      stereo_suffixes[1]: deque(maxlen=max(2, int(config.get("dynamic_mask_motion_frames", 3))))}
+    classes_for_detection = (
+        list(config.get("dynamic_mask_target_classes", ["人物", "人", "自転車", "バイク", "車両", "動物"]))
+        if bool(config.get("dynamic_mask_use_yolo_sam", True))
+        else []
+    )
+
+    def build_split_mask_path(split_image_path: Path) -> Path:
+        stem = f"{split_image_path.stem}{mask_suffix}" if mask_add_suffix else split_image_path.stem
+        if mask_output_format == "same":
+            ext = split_image_path.suffix
+        else:
+            ext = f".{mask_output_format.lstrip('.')}"
+        return masks_root / f"{stem}{ext}"
 
     for i, kf in enumerate(keyframes):
         # ステレオ判定
@@ -973,6 +1119,68 @@ def run_cli(args):
                 saved = save_frame_image(frame, filepath, fmt, config["output_jpeg_quality"])
                 if not saved:
                     logger.warning(f"保存失敗（フレーム {kf.frame_index}{suffix}）: {filepath}")
+                    continue
+
+                fisheye_binary_mask = None
+                if fisheye_mask_export_enabled and target_mask_generator is not None:
+                    try:
+                        history = mask_histories.setdefault(
+                            suffix, deque(maxlen=max(2, int(config.get("dynamic_mask_motion_frames", 3))))
+                        )
+                        history.append(frame.copy())
+                        fisheye_binary_mask = target_mask_generator.generate_mask(
+                            frame,
+                            classes_for_detection,
+                            motion_frames=list(history),
+                        ).astype(np.uint8)
+                        if bool(config.get("enable_fisheye_border_mask", True)):
+                            h_m, w_m = fisheye_binary_mask.shape[:2]
+                            valid_mask = np.zeros((h_m, w_m), dtype=np.uint8)
+                            radius = int(min(w_m, h_m) * 0.5 * float(np.clip(config.get("fisheye_mask_radius_ratio", 0.94), 0.0, 1.0)))
+                            cx = int(np.clip((w_m // 2) + int(config.get("fisheye_mask_center_offset_x", 0)), 0, max(w_m - 1, 0)))
+                            cy = int(np.clip((h_m // 2) + int(config.get("fisheye_mask_center_offset_y", 0)), 0, max(h_m - 1, 0)))
+                            if radius > 0:
+                                cv2.circle(valid_mask, (cx, cy), radius, 255, -1)
+                                fisheye_binary_mask = cv2.bitwise_and(fisheye_binary_mask, valid_mask)
+                        fisheye_mask_path = TargetMaskGenerator.build_mask_path(
+                            image_path=filepath,
+                            images_root=stereo_images_root,
+                            masks_root=masks_root,
+                            add_suffix=mask_add_suffix,
+                            suffix=mask_suffix,
+                            mask_ext=mask_output_format,
+                            flatten_stereo_lr=True,
+                        )
+                        fisheye_mask_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not write_image(fisheye_mask_path, fisheye_binary_mask):
+                            logger.warning(f"魚眼マスク保存失敗: {fisheye_mask_path}")
+                    except Exception as e:
+                        logger.warning(f"魚眼マスク生成失敗（フレーム {kf.frame_index}{suffix}）: {e}")
+                        fisheye_binary_mask = None
+
+                splitter = splitters.get(suffix) if is_osv else None
+                if splitter is not None:
+                    try:
+                        split_views = splitter.split_image_with_valid_mask(frame)
+                        projected_masks = splitter.project_mask(fisheye_binary_mask) if fisheye_binary_mask is not None else {}
+                        for view_name, (view_img, _valid_mask) in split_views.items():
+                            split_dir = stereo_images_root / f"{suffix.strip('_')}_{view_name}"
+                            split_dir.mkdir(parents=True, exist_ok=True)
+                            split_image_path = split_dir / f"keyframe_{kf.frame_index:06d}{suffix}_{view_name}.{fmt}"
+                            if not save_frame_image(view_img, split_image_path, fmt, config["output_jpeg_quality"]):
+                                logger.warning(f"分割画像保存失敗: {split_image_path}")
+                                continue
+                            if fisheye_binary_mask is None:
+                                continue
+                            split_mask = projected_masks.get(view_name)
+                            if split_mask is None:
+                                continue
+                            split_mask_path = build_split_mask_path(split_image_path)
+                            split_mask_path.parent.mkdir(parents=True, exist_ok=True)
+                            if not write_image(split_mask_path, split_mask):
+                                logger.warning(f"分割マスク保存失敗: {split_mask_path}")
+                    except Exception as e:
+                        logger.warning(f"cross5分割出力失敗（フレーム {kf.frame_index}{suffix}）: {e}")
                 continue  # ステレオの場合はここで次のフレームへ
 
             # マスク処理

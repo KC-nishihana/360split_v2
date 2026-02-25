@@ -7,8 +7,8 @@ KeyframeSelectorは KeyframeConfig を使用し、
 GUI/CLIではdict形式でオーバーライドできる。
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 import numpy as np
 
 
@@ -161,6 +161,8 @@ class KeyframeConfig:
     front_calib_xml: str = ""
     rear_calib_xml: str = ""
     calib_model: str = "auto"
+    motion_blur_method: str = "legacy"
+    enable_stage2_pipeline_parallel: bool = False
 
     def to_selector_dict(self) -> dict:
         """
@@ -253,6 +255,8 @@ class KeyframeConfig:
             'FRONT_CALIB_XML': self.front_calib_xml,
             'REAR_CALIB_XML': self.rear_calib_xml,
             'CALIB_MODEL': self.calib_model,
+            'MOTION_BLUR_METHOD': self.motion_blur_method,
+            'ENABLE_STAGE2_PIPELINE_PARALLEL': self.enable_stage2_pipeline_parallel,
         }
 
     @classmethod
@@ -269,160 +273,288 @@ class KeyframeConfig:
         --------
         KeyframeConfig
         """
+        normalized = normalize_config_dict(d or {})
         config = cls()
         # Weights
-        config.weights.alpha = d.get('weight_sharpness', config.weights.alpha)
-        config.weights.delta = d.get('weight_exposure', config.weights.delta)
-        config.weights.beta = d.get('weight_geometric', config.weights.beta)
-        config.weights.gamma = d.get('weight_content', config.weights.gamma)
+        config.weights.alpha = float(normalized.get('weight_sharpness', config.weights.alpha))
+        config.weights.delta = float(normalized.get('weight_exposure', config.weights.delta))
+        config.weights.beta = float(normalized.get('weight_geometric', config.weights.beta))
+        config.weights.gamma = float(normalized.get('weight_content', config.weights.gamma))
         # Selection
-        config.selection.ssim_change_threshold = d.get('ssim_threshold', config.selection.ssim_change_threshold)
-        config.sample_interval = int(max(1, d.get('sample_interval', config.sample_interval)))
-        config.stage1_batch_size = int(max(1, d.get('stage1_batch_size', config.stage1_batch_size)))
-        config.stage1_grab_threshold = int(max(1, d.get('stage1_grab_threshold', config.stage1_grab_threshold)))
-        config.stage1_eval_scale = float(np.clip(d.get('stage1_eval_scale', config.stage1_eval_scale), 0.1, 1.0))
-        config.selection.min_keyframe_interval = d.get('min_keyframe_interval', config.selection.min_keyframe_interval)
-        config.selection.max_keyframe_interval = d.get('max_keyframe_interval', config.selection.max_keyframe_interval)
-        config.selection.softmax_beta = d.get('softmax_beta', config.selection.softmax_beta)
-        config.selection.laplacian_threshold = d.get('laplacian_threshold', config.selection.laplacian_threshold)
-        config.selection.motion_blur_threshold = d.get('motion_blur_threshold', config.selection.motion_blur_threshold)
-        config.selection.exposure_threshold = d.get('exposure_threshold', config.selection.exposure_threshold)
-        config.selection.stationary_enable = d.get('stationary_enable', config.selection.stationary_enable)
-        config.selection.stationary_min_duration_sec = d.get(
+        config.selection.ssim_change_threshold = float(normalized.get('ssim_threshold', config.selection.ssim_change_threshold))
+        config.sample_interval = int(max(1, normalized.get('sample_interval', config.sample_interval)))
+        config.stage1_batch_size = int(max(1, normalized.get('stage1_batch_size', config.stage1_batch_size)))
+        config.stage1_grab_threshold = int(max(1, normalized.get('stage1_grab_threshold', config.stage1_grab_threshold)))
+        config.stage1_eval_scale = float(np.clip(normalized.get('stage1_eval_scale', config.stage1_eval_scale), 0.1, 1.0))
+        config.selection.min_keyframe_interval = int(normalized.get('min_keyframe_interval', config.selection.min_keyframe_interval))
+        config.selection.max_keyframe_interval = int(normalized.get('max_keyframe_interval', config.selection.max_keyframe_interval))
+        config.selection.softmax_beta = float(normalized.get('softmax_beta', config.selection.softmax_beta))
+        config.selection.laplacian_threshold = float(normalized.get('laplacian_threshold', config.selection.laplacian_threshold))
+        config.selection.motion_blur_threshold = float(normalized.get('motion_blur_threshold', config.selection.motion_blur_threshold))
+        config.selection.exposure_threshold = float(normalized.get('exposure_threshold', config.selection.exposure_threshold))
+        config.selection.stationary_enable = bool(normalized.get('stationary_enable', config.selection.stationary_enable))
+        config.selection.stationary_min_duration_sec = float(normalized.get(
             'stationary_min_duration_sec', config.selection.stationary_min_duration_sec
-        )
-        config.selection.stationary_use_quantile_threshold = d.get(
+        ))
+        config.selection.stationary_use_quantile_threshold = bool(normalized.get(
             'stationary_use_quantile_threshold', config.selection.stationary_use_quantile_threshold
-        )
-        config.selection.stationary_quantile = d.get(
+        ))
+        config.selection.stationary_quantile = float(normalized.get(
             'stationary_quantile', config.selection.stationary_quantile
-        )
-        config.selection.stationary_translation_threshold = d.get(
+        ))
+        config.selection.stationary_translation_threshold = normalized.get(
             'stationary_translation_threshold', config.selection.stationary_translation_threshold
         )
-        config.selection.stationary_rotation_threshold = d.get(
+        config.selection.stationary_rotation_threshold = normalized.get(
             'stationary_rotation_threshold', config.selection.stationary_rotation_threshold
         )
-        config.selection.stationary_flow_threshold = d.get(
+        config.selection.stationary_flow_threshold = normalized.get(
             'stationary_flow_threshold', config.selection.stationary_flow_threshold
         )
-        config.selection.stationary_min_match_count_for_vo = int(d.get(
+        config.selection.stationary_min_match_count_for_vo = int(normalized.get(
             'stationary_min_match_count_for_vo', config.selection.stationary_min_match_count_for_vo
         ))
-        config.selection.stationary_fallback_when_vo_unreliable = str(d.get(
+        config.selection.stationary_fallback_when_vo_unreliable = str(normalized.get(
             'stationary_fallback_when_vo_unreliable',
             config.selection.stationary_fallback_when_vo_unreliable,
         ))
-        config.selection.stationary_soft_penalty = bool(d.get(
+        config.selection.stationary_soft_penalty = bool(normalized.get(
             'stationary_soft_penalty', config.selection.stationary_soft_penalty
         ))
-        config.selection.stationary_penalty = float(d.get(
+        config.selection.stationary_penalty = float(normalized.get(
             'stationary_penalty', config.selection.stationary_penalty
         ))
-        config.selection.stationary_allow_boundary_frames = bool(d.get(
+        config.selection.stationary_allow_boundary_frames = bool(normalized.get(
             'stationary_allow_boundary_frames', config.selection.stationary_allow_boundary_frames
         ))
-        config.selection.stationary_boundary_grace_frames = int(d.get(
+        config.selection.stationary_boundary_grace_frames = int(normalized.get(
             'stationary_boundary_grace_frames', config.selection.stationary_boundary_grace_frames
         ))
-        config.selection.stationary_hysteresis_exit_scale = float(d.get(
+        config.selection.stationary_hysteresis_exit_scale = float(normalized.get(
             'stationary_hysteresis_exit_scale', config.selection.stationary_hysteresis_exit_scale
         ))
         # GRIC
-        config.gric.ransac_threshold = d.get('ransac_threshold', config.gric.ransac_threshold)
-        config.gric.lambda1 = d.get('gric_lambda1', config.gric.lambda1)
-        config.gric.lambda2 = d.get('gric_lambda2', config.gric.lambda2)
-        config.gric.sigma = d.get('gric_sigma', config.gric.sigma)
-        config.gric.degeneracy_threshold = d.get('gric_degeneracy_threshold', config.gric.degeneracy_threshold)
+        config.gric.ransac_threshold = float(normalized.get('ransac_threshold', config.gric.ransac_threshold))
+        config.gric.lambda1 = float(normalized.get('gric_lambda1', config.gric.lambda1))
+        config.gric.lambda2 = float(normalized.get('gric_lambda2', config.gric.lambda2))
+        config.gric.sigma = float(normalized.get('gric_sigma', config.gric.sigma))
+        config.gric.degeneracy_threshold = float(normalized.get('gric_degeneracy_threshold', config.gric.degeneracy_threshold))
         # 360
-        config.equirect360.enable_polar_mask = d.get('enable_polar_mask', config.equirect360.enable_polar_mask)
-        config.equirect360.mask_polar_ratio = d.get('mask_polar_ratio', config.equirect360.mask_polar_ratio)
-        config.equirect360.enable_fisheye_border_mask = d.get(
+        config.equirect360.enable_polar_mask = bool(normalized.get('enable_polar_mask', config.equirect360.enable_polar_mask))
+        config.equirect360.mask_polar_ratio = float(normalized.get('mask_polar_ratio', config.equirect360.mask_polar_ratio))
+        config.equirect360.enable_fisheye_border_mask = bool(normalized.get(
             'enable_fisheye_border_mask',
             config.equirect360.enable_fisheye_border_mask,
-        )
-        config.equirect360.fisheye_mask_radius_ratio = d.get(
+        ))
+        config.equirect360.fisheye_mask_radius_ratio = float(normalized.get(
             'fisheye_mask_radius_ratio',
             config.equirect360.fisheye_mask_radius_ratio,
-        )
-        config.equirect360.fisheye_mask_center_offset_x = int(d.get(
+        ))
+        config.equirect360.fisheye_mask_center_offset_x = int(normalized.get(
             'fisheye_mask_center_offset_x',
             config.equirect360.fisheye_mask_center_offset_x,
         ))
-        config.equirect360.fisheye_mask_center_offset_y = int(d.get(
+        config.equirect360.fisheye_mask_center_offset_y = int(normalized.get(
             'fisheye_mask_center_offset_y',
             config.equirect360.fisheye_mask_center_offset_y,
         ))
-        config.equirect360.enable_dynamic_mask_removal = d.get(
+        config.equirect360.enable_dynamic_mask_removal = bool(normalized.get(
             'enable_dynamic_mask_removal',
             config.equirect360.enable_dynamic_mask_removal,
-        )
-        config.equirect360.dynamic_mask_use_yolo_sam = d.get(
+        ))
+        config.equirect360.dynamic_mask_use_yolo_sam = bool(normalized.get(
             'dynamic_mask_use_yolo_sam',
             config.equirect360.dynamic_mask_use_yolo_sam,
-        )
-        config.equirect360.dynamic_mask_use_motion_diff = d.get(
+        ))
+        config.equirect360.dynamic_mask_use_motion_diff = bool(normalized.get(
             'dynamic_mask_use_motion_diff',
             config.equirect360.dynamic_mask_use_motion_diff,
-        )
-        config.equirect360.dynamic_mask_motion_frames = d.get(
+        ))
+        config.equirect360.dynamic_mask_motion_frames = int(normalized.get(
             'dynamic_mask_motion_frames',
             config.equirect360.dynamic_mask_motion_frames,
-        )
-        config.equirect360.dynamic_mask_motion_threshold = d.get(
+        ))
+        config.equirect360.dynamic_mask_motion_threshold = int(normalized.get(
             'dynamic_mask_motion_threshold',
             config.equirect360.dynamic_mask_motion_threshold,
-        )
-        config.equirect360.dynamic_mask_dilation_size = d.get(
+        ))
+        config.equirect360.dynamic_mask_dilation_size = int(normalized.get(
             'dynamic_mask_dilation_size',
             config.equirect360.dynamic_mask_dilation_size,
-        )
-        target_classes = d.get(
+        ))
+        target_classes = normalized.get(
             'dynamic_mask_target_classes',
-            d.get('target_classes', config.equirect360.dynamic_mask_target_classes),
+            normalized.get('target_classes', config.equirect360.dynamic_mask_target_classes),
         )
         if isinstance(target_classes, list):
             config.equirect360.dynamic_mask_target_classes = tuple(target_classes)
         elif isinstance(target_classes, tuple):
             config.equirect360.dynamic_mask_target_classes = target_classes
-        config.equirect360.dynamic_mask_inpaint_enabled = d.get(
+        config.equirect360.dynamic_mask_inpaint_enabled = bool(normalized.get(
             'dynamic_mask_inpaint_enabled',
             config.equirect360.dynamic_mask_inpaint_enabled,
-        )
-        config.equirect360.dynamic_mask_inpaint_module = d.get(
+        ))
+        config.equirect360.dynamic_mask_inpaint_module = normalized.get(
             'dynamic_mask_inpaint_module',
             config.equirect360.dynamic_mask_inpaint_module,
         )
-        config.equirect360.yolo_model_path = d.get('yolo_model_path', config.equirect360.yolo_model_path)
-        config.equirect360.sam_model_path = d.get('sam_model_path', config.equirect360.sam_model_path)
-        config.equirect360.confidence_threshold = d.get(
+        config.equirect360.yolo_model_path = str(normalized.get('yolo_model_path', config.equirect360.yolo_model_path))
+        config.equirect360.sam_model_path = str(normalized.get('sam_model_path', config.equirect360.sam_model_path))
+        config.equirect360.confidence_threshold = float(normalized.get(
             'confidence_threshold', config.equirect360.confidence_threshold
-        )
-        config.equirect360.detection_device = d.get('detection_device', config.equirect360.detection_device)
+        ))
+        config.equirect360.detection_device = str(normalized.get('detection_device', config.equirect360.detection_device))
         # Rerun
-        config.enable_rerun_logging = bool(d.get('enable_rerun_logging', config.enable_rerun_logging))
-        config.enable_stage0_scan = bool(d.get('enable_stage0_scan', config.enable_stage0_scan))
-        config.stage0_stride = int(d.get('stage0_stride', config.stage0_stride))
-        config.enable_stage3_refinement = bool(d.get('enable_stage3_refinement', config.enable_stage3_refinement))
-        config.stage3_weight_base = float(d.get('stage3_weight_base', config.stage3_weight_base))
-        config.stage3_weight_trajectory = float(d.get('stage3_weight_trajectory', config.stage3_weight_trajectory))
-        config.stage3_weight_stage0_risk = float(d.get('stage3_weight_stage0_risk', config.stage3_weight_stage0_risk))
-        config.vo_enabled = bool(d.get('vo_enabled', config.vo_enabled))
-        config.vo_center_roi_ratio = float(d.get('vo_center_roi_ratio', config.vo_center_roi_ratio))
-        config.vo_downscale_long_edge = int(d.get('vo_downscale_long_edge', config.vo_downscale_long_edge))
-        config.vo_max_features = int(d.get('vo_max_features', config.vo_max_features))
-        config.vo_t_sign = float(d.get('vo_t_sign', config.vo_t_sign))
-        config.vo_frame_subsample = int(max(1, d.get('vo_frame_subsample', config.vo_frame_subsample)))
-        config.vo_adaptive_roi_enable = bool(d.get('vo_adaptive_roi_enable', config.vo_adaptive_roi_enable))
-        config.vo_adaptive_roi_min = float(np.clip(d.get('vo_adaptive_roi_min', config.vo_adaptive_roi_min), 0.2, 1.0))
-        config.vo_adaptive_roi_max = float(np.clip(d.get('vo_adaptive_roi_max', config.vo_adaptive_roi_max), config.vo_adaptive_roi_min, 1.0))
-        config.vo_fast_fail_inlier_ratio = float(np.clip(d.get('vo_fast_fail_inlier_ratio', config.vo_fast_fail_inlier_ratio), 0.0, 1.0))
-        config.vo_step_proxy_clip_px = float(max(0.0, d.get('vo_step_proxy_clip_px', config.vo_step_proxy_clip_px)))
-        config.calib_xml = str(d.get('calib_xml', config.calib_xml) or "")
-        config.front_calib_xml = str(d.get('front_calib_xml', config.front_calib_xml) or "")
-        config.rear_calib_xml = str(d.get('rear_calib_xml', config.rear_calib_xml) or "")
-        config.calib_model = str(d.get('calib_model', config.calib_model) or "auto")
+        config.enable_rerun_logging = bool(normalized.get('enable_rerun_logging', config.enable_rerun_logging))
+        config.enable_stage0_scan = bool(normalized.get('enable_stage0_scan', config.enable_stage0_scan))
+        config.stage0_stride = int(max(1, normalized.get('stage0_stride', config.stage0_stride)))
+        config.enable_stage3_refinement = bool(normalized.get('enable_stage3_refinement', config.enable_stage3_refinement))
+        config.stage3_weight_base = float(normalized.get('stage3_weight_base', config.stage3_weight_base))
+        config.stage3_weight_trajectory = float(normalized.get('stage3_weight_trajectory', config.stage3_weight_trajectory))
+        config.stage3_weight_stage0_risk = float(normalized.get('stage3_weight_stage0_risk', config.stage3_weight_stage0_risk))
+        config.vo_enabled = bool(normalized.get('vo_enabled', config.vo_enabled))
+        config.vo_center_roi_ratio = float(np.clip(normalized.get('vo_center_roi_ratio', config.vo_center_roi_ratio), 0.2, 1.0))
+        config.vo_downscale_long_edge = int(max(256, normalized.get('vo_downscale_long_edge', config.vo_downscale_long_edge)))
+        config.vo_max_features = int(max(64, normalized.get('vo_max_features', config.vo_max_features)))
+        config.vo_t_sign = float(normalized.get('vo_t_sign', config.vo_t_sign))
+        config.vo_frame_subsample = int(max(1, normalized.get('vo_frame_subsample', config.vo_frame_subsample)))
+        config.vo_adaptive_roi_enable = bool(normalized.get('vo_adaptive_roi_enable', config.vo_adaptive_roi_enable))
+        config.vo_adaptive_roi_min = float(np.clip(normalized.get('vo_adaptive_roi_min', config.vo_adaptive_roi_min), 0.2, 1.0))
+        config.vo_adaptive_roi_max = float(np.clip(normalized.get('vo_adaptive_roi_max', config.vo_adaptive_roi_max), config.vo_adaptive_roi_min, 1.0))
+        config.vo_fast_fail_inlier_ratio = float(np.clip(normalized.get('vo_fast_fail_inlier_ratio', config.vo_fast_fail_inlier_ratio), 0.0, 1.0))
+        config.vo_step_proxy_clip_px = float(max(0.0, normalized.get('vo_step_proxy_clip_px', config.vo_step_proxy_clip_px)))
+        config.calib_xml = str(normalized.get('calib_xml', config.calib_xml) or "")
+        config.front_calib_xml = str(normalized.get('front_calib_xml', config.front_calib_xml) or "")
+        config.rear_calib_xml = str(normalized.get('rear_calib_xml', config.rear_calib_xml) or "")
+        config.calib_model = str(normalized.get('calib_model', config.calib_model) or "auto")
+        config.motion_blur_method = str(normalized.get("motion_blur_method", config.motion_blur_method) or "legacy").strip().lower()
+        if config.motion_blur_method not in {"legacy", "angle_hist", "fft_hybrid"}:
+            config.motion_blur_method = "legacy"
+        config.enable_stage2_pipeline_parallel = bool(
+            normalized.get("enable_stage2_pipeline_parallel", config.enable_stage2_pipeline_parallel)
+        )
+        config.validate()
         return config
+
+    def validate(self) -> None:
+        wsum = float(self.weights.alpha + self.weights.beta + self.weights.gamma + self.weights.delta)
+        if abs(wsum - 1.0) > 1e-6:
+            raise ValueError(f"weight sum must be 1.0, got {wsum:.6f}")
+
+
+SELECTOR_ALIAS_MAP: Dict[str, str] = {
+    'laplacian_threshold': 'LAPLACIAN_THRESHOLD',
+    'motion_blur_threshold': 'MOTION_BLUR_THRESHOLD',
+    'exposure_threshold': 'EXPOSURE_THRESHOLD',
+    'min_keyframe_interval': 'MIN_KEYFRAME_INTERVAL',
+    'max_keyframe_interval': 'MAX_KEYFRAME_INTERVAL',
+    'softmax_beta': 'SOFTMAX_BETA',
+    'ssim_change_threshold': 'SSIM_CHANGE_THRESHOLD',
+    'ssim_threshold': 'SSIM_CHANGE_THRESHOLD',
+    'weight_sharpness': 'WEIGHT_SHARPNESS',
+    'weight_exposure': 'WEIGHT_EXPOSURE',
+    'weight_geometric': 'WEIGHT_GEOMETRIC',
+    'weight_content': 'WEIGHT_CONTENT',
+    'pair_motion_aggregation': 'PAIR_MOTION_AGGREGATION',
+    'enable_rig_stitching': 'ENABLE_RIG_STITCHING',
+    'equirect_width': 'EQUIRECT_WIDTH',
+    'equirect_height': 'EQUIRECT_HEIGHT',
+    'rig_feature_method': 'RIG_FEATURE_METHOD',
+    'gric_ratio_threshold': 'GRIC_RATIO_THRESHOLD',
+    'gric_degeneracy_threshold': 'GRIC_DEGENERACY_THRESHOLD',
+    'min_feature_matches': 'MIN_FEATURE_MATCHES',
+    'enable_dynamic_mask_removal': 'ENABLE_DYNAMIC_MASK_REMOVAL',
+    'enable_fisheye_border_mask': 'ENABLE_FISHEYE_BORDER_MASK',
+    'fisheye_mask_radius_ratio': 'FISHEYE_MASK_RADIUS_RATIO',
+    'fisheye_mask_center_offset_x': 'FISHEYE_MASK_CENTER_OFFSET_X',
+    'fisheye_mask_center_offset_y': 'FISHEYE_MASK_CENTER_OFFSET_Y',
+    'dynamic_mask_use_yolo_sam': 'DYNAMIC_MASK_USE_YOLO_SAM',
+    'dynamic_mask_use_motion_diff': 'DYNAMIC_MASK_USE_MOTION_DIFF',
+    'dynamic_mask_motion_frames': 'DYNAMIC_MASK_MOTION_FRAMES',
+    'dynamic_mask_motion_threshold': 'DYNAMIC_MASK_MOTION_THRESHOLD',
+    'dynamic_mask_dilation_size': 'DYNAMIC_MASK_DILATION_SIZE',
+    'dynamic_mask_target_classes': 'DYNAMIC_MASK_TARGET_CLASSES',
+    'dynamic_mask_inpaint_enabled': 'DYNAMIC_MASK_INPAINT_ENABLED',
+    'dynamic_mask_inpaint_module': 'DYNAMIC_MASK_INPAINT_MODULE',
+    'yolo_model_path': 'YOLO_MODEL_PATH',
+    'sam_model_path': 'SAM_MODEL_PATH',
+    'confidence_threshold': 'CONFIDENCE_THRESHOLD',
+    'detection_device': 'DETECTION_DEVICE',
+    'stage1_grab_threshold': 'STAGE1_GRAB_THRESHOLD',
+    'stage1_eval_scale': 'STAGE1_EVAL_SCALE',
+    'enable_profile': 'ENABLE_PROFILE',
+    'stage2_perf_profile': 'STAGE2_PERF_PROFILE',
+    'stage2_mask_cache_ttl_frames': 'STAGE2_MASK_CACHE_TTL_FRAMES',
+    'enable_rescue_mode': 'ENABLE_RESCUE_MODE',
+    'rescue_feature_threshold': 'RESCUE_FEATURE_THRESHOLD',
+    'rescue_laplacian_factor': 'RESCUE_LAPLACIAN_FACTOR',
+    'force_keyframe_on_exposure_change': 'FORCE_KEYFRAME_ON_EXPOSURE_CHANGE',
+    'exposure_change_threshold': 'EXPOSURE_CHANGE_THRESHOLD',
+    'adaptive_thresholding': 'ADAPTIVE_THRESHOLDING',
+    'stationary_enable': 'STATIONARY_ENABLE',
+    'stationary_min_duration_sec': 'STATIONARY_MIN_DURATION_SEC',
+    'stationary_use_quantile_threshold': 'STATIONARY_USE_QUANTILE_THRESHOLD',
+    'stationary_quantile': 'STATIONARY_QUANTILE',
+    'stationary_translation_threshold': 'STATIONARY_TRANSLATION_THRESHOLD',
+    'stationary_rotation_threshold': 'STATIONARY_ROTATION_THRESHOLD',
+    'stationary_flow_threshold': 'STATIONARY_FLOW_THRESHOLD',
+    'stationary_min_match_count_for_vo': 'STATIONARY_MIN_MATCH_COUNT_FOR_VO',
+    'stationary_fallback_when_vo_unreliable': 'STATIONARY_FALLBACK_WHEN_VO_UNRELIABLE',
+    'stationary_soft_penalty': 'STATIONARY_SOFT_PENALTY',
+    'stationary_penalty': 'STATIONARY_PENALTY',
+    'stationary_allow_boundary_frames': 'STATIONARY_ALLOW_BOUNDARY_FRAMES',
+    'stationary_boundary_grace_frames': 'STATIONARY_BOUNDARY_GRACE_FRAMES',
+    'stationary_hysteresis_exit_scale': 'STATIONARY_HYSTERESIS_EXIT_SCALE',
+    'enable_stage0_scan': 'ENABLE_STAGE0_SCAN',
+    'stage0_stride': 'STAGE0_STRIDE',
+    'enable_stage3_refinement': 'ENABLE_STAGE3_REFINEMENT',
+    'stage3_weight_base': 'STAGE3_WEIGHT_BASE',
+    'stage3_weight_trajectory': 'STAGE3_WEIGHT_TRAJECTORY',
+    'stage3_weight_stage0_risk': 'STAGE3_WEIGHT_STAGE0_RISK',
+    'projection_mode': 'PROJECTION_MODE',
+    'vo_enabled': 'VO_ENABLED',
+    'vo_center_roi_ratio': 'VO_CENTER_ROI_RATIO',
+    'vo_max_features': 'VO_MAX_FEATURES',
+    'vo_quality_level': 'VO_QUALITY_LEVEL',
+    'vo_min_distance': 'VO_MIN_DISTANCE',
+    'vo_min_track_points': 'VO_MIN_TRACK_POINTS',
+    'vo_ransac_threshold': 'VO_RANSAC_THRESHOLD',
+    'vo_downscale_long_edge': 'VO_DOWNSCALE_LONG_EDGE',
+    'vo_match_norm_factor': 'VO_MATCH_NORM_FACTOR',
+    'vo_t_sign': 'VO_T_SIGN',
+    'vo_frame_subsample': 'VO_FRAME_SUBSAMPLE',
+    'vo_adaptive_roi_enable': 'VO_ADAPTIVE_ROI_ENABLE',
+    'vo_adaptive_roi_min': 'VO_ADAPTIVE_ROI_MIN',
+    'vo_adaptive_roi_max': 'VO_ADAPTIVE_ROI_MAX',
+    'vo_fast_fail_inlier_ratio': 'VO_FAST_FAIL_INLIER_RATIO',
+    'vo_step_proxy_clip_px': 'VO_STEP_PROXY_CLIP_PX',
+    'calib_xml': 'CALIB_XML',
+    'front_calib_xml': 'FRONT_CALIB_XML',
+    'rear_calib_xml': 'REAR_CALIB_XML',
+    'calib_model': 'CALIB_MODEL',
+    'analysis_mode': 'ANALYSIS_MODE',
+    'motion_blur_method': 'MOTION_BLUR_METHOD',
+    'enable_stage2_pipeline_parallel': 'ENABLE_STAGE2_PIPELINE_PARALLEL',
+    'sample_interval': 'SAMPLE_INTERVAL',
+    'stage1_batch_size': 'STAGE1_BATCH_SIZE',
+    'ransac_threshold': 'RANSAC_THRESHOLD',
+    'gric_lambda1': 'GRIC_LAMBDA1',
+    'gric_lambda2': 'GRIC_LAMBDA2',
+    'gric_sigma': 'GRIC_SIGMA',
+    'enable_polar_mask': 'ENABLE_POLAR_MASK',
+    'mask_polar_ratio': 'MASK_POLAR_RATIO',
+    'enable_rerun_logging': 'enable_rerun_logging',
+}
+
+_UPPER_TO_LOWER_MAP: Dict[str, str] = {v: k for k, v in SELECTOR_ALIAS_MAP.items()}
+
+
+def normalize_config_dict(d: dict) -> dict:
+    normalized = dict(d)
+    for upper_key, lower_key in _UPPER_TO_LOWER_MAP.items():
+        if upper_key in normalized and lower_key not in normalized:
+            normalized[lower_key] = normalized[upper_key]
+    return normalized
 
 
 # =============================================================================

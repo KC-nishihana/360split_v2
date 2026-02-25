@@ -21,18 +21,27 @@ from .accelerator import get_accelerator
 from processing.fisheye_rig import FisheyeRigProcessor
 from processing.mask_processor import MaskProcessor
 from .visual_odometry import KLTVisualOdometry, calibration_from_dict, integrate_relative_trajectory
+from .pipeline import run_stage1_filter, run_stage2_evaluator, run_stage3_refiner
 from .exceptions import (
     GeometricDegeneracyError,
     EstimationFailureError,
     InsufficientFeaturesError
 )
-from config import GRICConfig, Equirect360Config, NormalizationConfig
+from config import (
+    GRICConfig,
+    Equirect360Config,
+    NormalizationConfig,
+    KeyframeConfig,
+    SELECTOR_ALIAS_MAP,
+    normalize_config_dict,
+)
 
 from utils.logger import get_logger
 from utils.image_io import write_image
 logger = get_logger(__name__)
 
 DYNAMIC_MASK_DEFAULT_CLASSES = ["人物", "人", "自転車", "バイク", "車両", "動物"]
+_LEGACY_CONFIG_WARNING_EMITTED = False
 
 
 @dataclass
@@ -121,7 +130,7 @@ class KeyframeSelector:
     - Stage 2: 精密評価（候補フレームのみ）
     """
 
-    def __init__(self, config: Dict = None):
+    def __init__(self, config: Optional[Dict[str, Any] | KeyframeConfig] = None):
         """
         初期化
 
@@ -237,107 +246,31 @@ class KeyframeSelector:
             'FRONT_CALIB_XML': '',
             'REAR_CALIB_XML': '',
             'CALIB_MODEL': 'auto',
+            'MOTION_BLUR_METHOD': 'legacy',
+            'ENABLE_STAGE2_PIPELINE_PARALLEL': False,
         }
 
         # 外部設定でオーバーライド
         if config:
-            self.config.update(config)
-            # lower_snake_case 設定との互換
-            alias_map = {
-                'laplacian_threshold': 'LAPLACIAN_THRESHOLD',
-                'motion_blur_threshold': 'MOTION_BLUR_THRESHOLD',
-                'exposure_threshold': 'EXPOSURE_THRESHOLD',
-                'min_keyframe_interval': 'MIN_KEYFRAME_INTERVAL',
-                'max_keyframe_interval': 'MAX_KEYFRAME_INTERVAL',
-                'softmax_beta': 'SOFTMAX_BETA',
-                'ssim_change_threshold': 'SSIM_CHANGE_THRESHOLD',
-                'ssim_threshold': 'SSIM_CHANGE_THRESHOLD',
-                'weight_sharpness': 'WEIGHT_SHARPNESS',
-                'weight_exposure': 'WEIGHT_EXPOSURE',
-                'weight_geometric': 'WEIGHT_GEOMETRIC',
-                'weight_content': 'WEIGHT_CONTENT',
-                'pair_motion_aggregation': 'PAIR_MOTION_AGGREGATION',
-                'enable_rig_stitching': 'ENABLE_RIG_STITCHING',
-                'equirect_width': 'EQUIRECT_WIDTH',
-                'equirect_height': 'EQUIRECT_HEIGHT',
-                'rig_feature_method': 'RIG_FEATURE_METHOD',
-                'gric_ratio_threshold': 'GRIC_RATIO_THRESHOLD',
-                'gric_degeneracy_threshold': 'GRIC_DEGENERACY_THRESHOLD',
-                'min_feature_matches': 'MIN_FEATURE_MATCHES',
-                'enable_dynamic_mask_removal': 'ENABLE_DYNAMIC_MASK_REMOVAL',
-                'enable_fisheye_border_mask': 'ENABLE_FISHEYE_BORDER_MASK',
-                'fisheye_mask_radius_ratio': 'FISHEYE_MASK_RADIUS_RATIO',
-                'fisheye_mask_center_offset_x': 'FISHEYE_MASK_CENTER_OFFSET_X',
-                'fisheye_mask_center_offset_y': 'FISHEYE_MASK_CENTER_OFFSET_Y',
-                'dynamic_mask_use_yolo_sam': 'DYNAMIC_MASK_USE_YOLO_SAM',
-                'dynamic_mask_use_motion_diff': 'DYNAMIC_MASK_USE_MOTION_DIFF',
-                'dynamic_mask_motion_frames': 'DYNAMIC_MASK_MOTION_FRAMES',
-                'dynamic_mask_motion_threshold': 'DYNAMIC_MASK_MOTION_THRESHOLD',
-                'dynamic_mask_dilation_size': 'DYNAMIC_MASK_DILATION_SIZE',
-                'dynamic_mask_target_classes': 'DYNAMIC_MASK_TARGET_CLASSES',
-                'dynamic_mask_inpaint_enabled': 'DYNAMIC_MASK_INPAINT_ENABLED',
-                'dynamic_mask_inpaint_module': 'DYNAMIC_MASK_INPAINT_MODULE',
-                'yolo_model_path': 'YOLO_MODEL_PATH',
-                'sam_model_path': 'SAM_MODEL_PATH',
-                'confidence_threshold': 'CONFIDENCE_THRESHOLD',
-                'detection_device': 'DETECTION_DEVICE',
-                'stage1_grab_threshold': 'STAGE1_GRAB_THRESHOLD',
-                'stage1_eval_scale': 'STAGE1_EVAL_SCALE',
-                'enable_profile': 'ENABLE_PROFILE',
-                'stage2_perf_profile': 'STAGE2_PERF_PROFILE',
-                'stage2_mask_cache_ttl_frames': 'STAGE2_MASK_CACHE_TTL_FRAMES',
-                'enable_rescue_mode': 'ENABLE_RESCUE_MODE',
-                'rescue_feature_threshold': 'RESCUE_FEATURE_THRESHOLD',
-                'rescue_laplacian_factor': 'RESCUE_LAPLACIAN_FACTOR',
-                'force_keyframe_on_exposure_change': 'FORCE_KEYFRAME_ON_EXPOSURE_CHANGE',
-                'exposure_change_threshold': 'EXPOSURE_CHANGE_THRESHOLD',
-                'adaptive_thresholding': 'ADAPTIVE_THRESHOLDING',
-                'stationary_enable': 'STATIONARY_ENABLE',
-                'stationary_min_duration_sec': 'STATIONARY_MIN_DURATION_SEC',
-                'stationary_use_quantile_threshold': 'STATIONARY_USE_QUANTILE_THRESHOLD',
-                'stationary_quantile': 'STATIONARY_QUANTILE',
-                'stationary_translation_threshold': 'STATIONARY_TRANSLATION_THRESHOLD',
-                'stationary_rotation_threshold': 'STATIONARY_ROTATION_THRESHOLD',
-                'stationary_flow_threshold': 'STATIONARY_FLOW_THRESHOLD',
-                'stationary_min_match_count_for_vo': 'STATIONARY_MIN_MATCH_COUNT_FOR_VO',
-                'stationary_fallback_when_vo_unreliable': 'STATIONARY_FALLBACK_WHEN_VO_UNRELIABLE',
-                'stationary_soft_penalty': 'STATIONARY_SOFT_PENALTY',
-                'stationary_penalty': 'STATIONARY_PENALTY',
-                'stationary_allow_boundary_frames': 'STATIONARY_ALLOW_BOUNDARY_FRAMES',
-                'stationary_boundary_grace_frames': 'STATIONARY_BOUNDARY_GRACE_FRAMES',
-                'stationary_hysteresis_exit_scale': 'STATIONARY_HYSTERESIS_EXIT_SCALE',
-                'enable_stage0_scan': 'ENABLE_STAGE0_SCAN',
-                'stage0_stride': 'STAGE0_STRIDE',
-                'enable_stage3_refinement': 'ENABLE_STAGE3_REFINEMENT',
-                'stage3_weight_base': 'STAGE3_WEIGHT_BASE',
-                'stage3_weight_trajectory': 'STAGE3_WEIGHT_TRAJECTORY',
-                'stage3_weight_stage0_risk': 'STAGE3_WEIGHT_STAGE0_RISK',
-                'projection_mode': 'PROJECTION_MODE',
-                'vo_enabled': 'VO_ENABLED',
-                'vo_center_roi_ratio': 'VO_CENTER_ROI_RATIO',
-                'vo_max_features': 'VO_MAX_FEATURES',
-                'vo_quality_level': 'VO_QUALITY_LEVEL',
-                'vo_min_distance': 'VO_MIN_DISTANCE',
-                'vo_min_track_points': 'VO_MIN_TRACK_POINTS',
-                'vo_ransac_threshold': 'VO_RANSAC_THRESHOLD',
-                'vo_downscale_long_edge': 'VO_DOWNSCALE_LONG_EDGE',
-                'vo_match_norm_factor': 'VO_MATCH_NORM_FACTOR',
-                'vo_t_sign': 'VO_T_SIGN',
-                'vo_frame_subsample': 'VO_FRAME_SUBSAMPLE',
-                'vo_adaptive_roi_enable': 'VO_ADAPTIVE_ROI_ENABLE',
-                'vo_adaptive_roi_min': 'VO_ADAPTIVE_ROI_MIN',
-                'vo_adaptive_roi_max': 'VO_ADAPTIVE_ROI_MAX',
-                'vo_fast_fail_inlier_ratio': 'VO_FAST_FAIL_INLIER_RATIO',
-                'vo_step_proxy_clip_px': 'VO_STEP_PROXY_CLIP_PX',
-                'calib_xml': 'CALIB_XML',
-                'front_calib_xml': 'FRONT_CALIB_XML',
-                'rear_calib_xml': 'REAR_CALIB_XML',
-                'calib_model': 'CALIB_MODEL',
-                'analysis_mode': 'ANALYSIS_MODE',
-            }
-            for src, dst in alias_map.items():
-                if src in config:
-                    self.config[dst] = config[src]
+            normalized_from_dataclass: Dict[str, Any]
+            incoming: Dict[str, Any]
+            if isinstance(config, KeyframeConfig):
+                normalized_from_dataclass = config.to_selector_dict()
+                incoming = {}
+            else:
+                incoming = dict(config)
+                normalized_from_dataclass = KeyframeConfig.from_dict(incoming).to_selector_dict()
+                global _LEGACY_CONFIG_WARNING_EMITTED
+                if not _LEGACY_CONFIG_WARNING_EMITTED:
+                    lowered = normalize_config_dict(incoming)
+                    used_legacy = [k for k in SELECTOR_ALIAS_MAP if k in lowered and k not in incoming and SELECTOR_ALIAS_MAP[k] in incoming]
+                    if any(k in incoming for k in SELECTOR_ALIAS_MAP) or used_legacy:
+                        logger.warning("Legacy lower_snake_case config keys are accepted for now; migrate to KeyframeConfig/upper keys.")
+                        _LEGACY_CONFIG_WARNING_EMITTED = True
+            # Preserve unknown keys while overriding canonical keys from KeyframeConfig.
+            if incoming:
+                self.config.update(incoming)
+            self.config.update(normalized_from_dataclass)
 
         # 正規化設定
         self.normalization = NormalizationConfig(
@@ -368,7 +301,10 @@ class KeyframeSelector:
 
         # 評価器を初期化
         stage1_eval_scale = float(np.clip(self.config.get('STAGE1_EVAL_SCALE', 0.5), 0.1, 1.0))
-        self.quality_evaluator = QualityEvaluator(eval_scale=stage1_eval_scale)
+        self.quality_evaluator = QualityEvaluator(
+            eval_scale=stage1_eval_scale,
+            motion_blur_method=str(self.config.get("MOTION_BLUR_METHOD", "legacy")),
+        )
         self.geometric_evaluator = GeometricEvaluator(
             gric_config=gric_config,
             equirect_config=equirect_config
@@ -412,7 +348,7 @@ class KeyframeSelector:
             if callable(hook):
                 return hook
             logger.warning(f"インペイントモジュールに inpaint_frame がありません: {module_name}")
-        except Exception as e:
+        except (ImportError, AttributeError, TypeError, ValueError) as e:
             logger.warning(f"インペイントモジュール読み込み失敗: {module_name}, err={e}")
         return None
 
@@ -442,7 +378,7 @@ class KeyframeSelector:
                 enable_mask_inpaint=bool(self.config.get('DYNAMIC_MASK_INPAINT_ENABLED', False)),
                 inpaint_hook=inpaint_hook,
             )
-        except Exception as e:
+        except (ImportError, RuntimeError, OSError, ValueError, TypeError, AttributeError) as e:
             logger.warning(f"動体マスク生成器の初期化に失敗したため無効化: {e}")
             return None
 
@@ -505,7 +441,7 @@ class KeyframeSelector:
             mask_prev = _generate_mask(frame_prev, frame_prev_idx)
             mask_cur = _generate_mask(frame_cur, frame_cur_idx)
             return mask_prev, mask_cur
-        except Exception as e:
+        except (cv2.error, RuntimeError, ValueError, TypeError) as e:
             logger.debug(f"動体マスク生成失敗（無効化して継続）: {e}")
             return None, None
 
@@ -525,7 +461,7 @@ class KeyframeSelector:
                 classes_for_detection,
                 motion_frames=[frame],
             )
-        except Exception:
+        except (cv2.error, RuntimeError, ValueError, TypeError):
             return None
 
     @staticmethod
@@ -539,7 +475,7 @@ class KeyframeSelector:
         started = perf_counter() if perf_stats is not None and perf_stats.enabled else 0.0
         try:
             frame_log_callback(payload)
-        except Exception as e:
+        except (RuntimeError, ValueError, TypeError) as e:
             frame_idx = payload.get("frame_index", -1)
             logger.debug(f"frame_log_callback失敗: frame={frame_idx}, err={e}")
         finally:
@@ -1611,9 +1547,7 @@ class KeyframeSelector:
         t_stage1 = perf_counter() if profile_enabled else 0.0
         _stage_start("1", total_frames=total_frames)
         logger.info("Stage 1: 高速品質フィルタリング開始")
-        stage1_candidates = self._stage1_fast_filter(
-            video_loader, metadata, progress_callback
-        )
+        stage1_candidates = run_stage1_filter(self, video_loader, metadata, progress_callback)
         logger.info(
             f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
             f"({100*len(stage1_candidates)/max(total_frames, 1):.1f}%)"
@@ -1640,9 +1574,19 @@ class KeyframeSelector:
         # ===== Stage 2: 精密評価 =====
         t_stage2 = perf_counter() if profile_enabled else 0.0
         _stage_start("2", candidates=len(stage1_candidates))
-        logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
-        stage2_candidates, stage2_records = self._stage2_precise_evaluation(
-            video_loader, metadata, stage1_candidates, progress_callback, frame_log_callback, stage0_metrics
+        stage2_parallel = bool(self.config.get("ENABLE_STAGE2_PIPELINE_PARALLEL", False))
+        logger.info(
+            f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム, "
+            f"parallel={'on' if stage2_parallel else 'off'}）"
+        )
+        stage2_candidates, stage2_records = run_stage2_evaluator(
+            self,
+            video_loader,
+            metadata,
+            stage1_candidates,
+            progress_callback,
+            frame_log_callback,
+            stage0_metrics,
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
         _stage_summary("2", candidates=len(stage2_candidates), records=len(stage2_records))
@@ -1667,7 +1611,8 @@ class KeyframeSelector:
             t_stage3 = perf_counter() if profile_enabled else 0.0
             _stage_start("3", input_candidates=len(stage2_candidates))
             logger.info("Stage 3: 軌跡再評価開始")
-            stage2_candidates = self._stage3_refine_with_trajectory(
+            stage2_candidates = run_stage3_refiner(
+                self,
                 metadata=metadata,
                 stage2_candidates=stage2_candidates,
                 stage2_final=stage2_keyframes_pre_stage3,

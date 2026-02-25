@@ -29,7 +29,7 @@ class QualityEvaluator:
     - Log-sum-exp トリックによる数値安定性
     """
 
-    def __init__(self, eval_scale: float = 0.5):
+    def __init__(self, eval_scale: float = 0.5, motion_blur_method: str = "legacy"):
         """
         初期化
 
@@ -41,6 +41,9 @@ class QualityEvaluator:
         """
         self._eval_scale = np.clip(eval_scale, 0.1, 1.0)
         self._accel = get_accelerator()
+        self._motion_blur_method = str(motion_blur_method or "legacy").strip().lower()
+        if self._motion_blur_method not in {"legacy", "angle_hist", "fft_hybrid"}:
+            self._motion_blur_method = "legacy"
 
     def evaluate(self, frame: np.ndarray, beta: float = 5.0) -> Dict[str, float]:
         """
@@ -93,7 +96,7 @@ class QualityEvaluator:
 
         # 各品質指標を計算
         sharpness = self._compute_sharpness(gray)
-        motion_blur = self._compute_motion_blur(sobel_x, sobel_y)
+        motion_blur = self._compute_motion_blur(sobel_x, sobel_y, gray=gray, method=self._motion_blur_method)
         exposure = self._compute_exposure_score(gray)
         softmax_depth = self._compute_softmax_depth_score(sobel_x, sobel_y, beta)
 
@@ -139,7 +142,7 @@ class QualityEvaluator:
 
         return {
             'sharpness': self._compute_sharpness(gray),
-            'motion_blur': self._compute_motion_blur(sobel_x, sobel_y),
+            'motion_blur': self._compute_motion_blur(sobel_x, sobel_y, gray=gray, method=self._motion_blur_method),
             'exposure': self._compute_exposure_score(gray),
             'softmax_depth': 0.0,
         }
@@ -196,8 +199,13 @@ class QualityEvaluator:
 
         return float(sharpness)
 
-    def _compute_motion_blur(self, sobel_x: np.ndarray,
-                            sobel_y: np.ndarray) -> float:
+    def _compute_motion_blur(
+        self,
+        sobel_x: np.ndarray,
+        sobel_y: np.ndarray,
+        gray: Optional[np.ndarray] = None,
+        method: str = "legacy",
+    ) -> float:
         """
         モーションブラー検出スコア（共有Sobel版）
 
@@ -221,6 +229,10 @@ class QualityEvaluator:
         if sobel_x is None or sobel_y is None:
             return 0.0
 
+        method = str(method or "legacy").strip().lower()
+        if method not in {"legacy", "angle_hist", "fft_hybrid"}:
+            method = "legacy"
+
         # 勾配エネルギーを計算
         energy_x = np.sum(np.abs(sobel_x))
         energy_y = np.sum(np.abs(sobel_y))
@@ -235,9 +247,66 @@ class QualityEvaluator:
 
         # 偏った方向性があるほどモーションブラースコアが高い
         # 最も偏った場合（0 or 1）で1.0、バランスしている場合は0に近い
-        motion_blur_score = abs(direction_ratio - 0.5) * 2.0
+        legacy_score = float(np.clip(abs(direction_ratio - 0.5) * 2.0, 0.0, 1.0))
+        if method == "legacy":
+            return legacy_score
 
-        return float(np.clip(motion_blur_score, 0.0, 1.0))
+        angle_score = self._compute_motion_blur_angle_hist(sobel_x, sobel_y)
+        if method == "angle_hist":
+            return angle_score
+
+        if gray is None or gray.size == 0:
+            return float(np.clip(0.5 * legacy_score + 0.5 * angle_score, 0.0, 1.0))
+        fft_score = self._compute_motion_blur_fft(gray)
+        # legacy互換を維持しつつ、方向性/高周波劣化を加味
+        return float(np.clip(0.25 * legacy_score + 0.35 * angle_score + 0.40 * fft_score, 0.0, 1.0))
+
+    def _compute_motion_blur_angle_hist(self, sobel_x: np.ndarray, sobel_y: np.ndarray) -> float:
+        mag = np.sqrt(sobel_x ** 2 + sobel_y ** 2)
+        if mag.size == 0:
+            return 0.0
+        angle = (np.arctan2(sobel_y, sobel_x) + np.pi) % np.pi
+        bins = 18
+        hist, _ = np.histogram(angle, bins=bins, range=(0.0, np.pi), weights=mag)
+        total = float(np.sum(hist))
+        if total <= 1e-6:
+            return 0.0
+        p = hist / total
+        entropy = -np.sum(p[p > 0.0] * np.log2(p[p > 0.0]))
+        max_entropy = np.log2(bins)
+        concentration = 1.0 - float(entropy / max(max_entropy, 1e-6))
+        return float(np.clip(concentration, 0.0, 1.0))
+
+    def _compute_motion_blur_fft(self, gray: np.ndarray) -> float:
+        h, w = gray.shape[:2]
+        if h < 8 or w < 8:
+            return 0.0
+        # 360動画で向き依存を抑えるため4象限で集計
+        hs = [0, h // 2, h]
+        ws = [0, w // 2, w]
+        scores = []
+        for y0, y1 in ((hs[0], hs[1]), (hs[1], hs[2])):
+            for x0, x1 in ((ws[0], ws[1]), (ws[1], ws[2])):
+                if y1 - y0 < 8 or x1 - x0 < 8:
+                    continue
+                patch = gray[y0:y1, x0:x1].astype(np.float32)
+                f = np.fft.fftshift(np.fft.fft2(patch))
+                power = np.log1p(np.abs(f))
+                ph, pw = power.shape
+                cy, cx = ph // 2, pw // 2
+                yy, xx = np.ogrid[:ph, :pw]
+                rr = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+                r0 = 0.15 * min(ph, pw)
+                r1 = 0.40 * min(ph, pw)
+                high = power[rr >= r1]
+                mid = power[(rr >= r0) & (rr < r1)]
+                if high.size == 0 or mid.size == 0:
+                    continue
+                ratio = float(np.mean(high) / max(np.mean(mid), 1e-6))
+                scores.append(float(np.clip(1.0 - ratio, 0.0, 1.0)))
+        if not scores:
+            return 0.0
+        return float(np.clip(np.mean(scores), 0.0, 1.0))
 
     def _compute_exposure_score(self, gray: np.ndarray) -> float:
         """

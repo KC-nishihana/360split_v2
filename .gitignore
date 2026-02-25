@@ -20,6 +20,8 @@ test/*.png
 test/left_images/
 test/backup/
 test*
+!tests/
+!tests/*.py
 
 # 仮想環境
 venv/

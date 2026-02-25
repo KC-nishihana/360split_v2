@@ -67,6 +67,93 @@ class FrameScoreData:
     vo_valid: bool = False
 
 
+def _run_stage1_scan(
+    video_path: str,
+    config: dict,
+    sample_interval: int,
+    is_running_cb,
+    on_batch_cb=None,
+    on_progress_cb=None,
+) -> List[FrameScoreData]:
+    from core.quality_evaluator import QualityEvaluator
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"ビデオを開けません: {video_path}")
+
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        stage1_eval_scale = float(config.get('stage1_eval_scale', config.get('STAGE1_EVAL_SCALE', 0.5)))
+        stage1_eval_scale = max(0.1, min(1.0, stage1_eval_scale))
+        evaluator = QualityEvaluator(
+            eval_scale=stage1_eval_scale,
+            motion_blur_method=str(config.get("MOTION_BLUR_METHOD", config.get("motion_blur_method", "legacy"))),
+        )
+
+        all_scores: List[FrameScoreData] = []
+        batch: List[FrameScoreData] = []
+        batch_size = int(config.get('STAGE1_BATCH_SIZE', 32))
+        frame_indices = list(range(0, total_frames, sample_interval))
+        grab_threshold = int(config.get('stage1_grab_threshold', config.get('STAGE1_GRAB_THRESHOLD', 30)))
+        use_grab = (sample_interval > 1 and sample_interval <= grab_threshold)
+        last_read = -1
+        current_pos = -1
+
+        if use_grab and frame_indices:
+            first_idx = frame_indices[0]
+            cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+            current_pos = first_idx
+
+        for count, frame_idx in enumerate(frame_indices):
+            if not is_running_cb():
+                break
+
+            if use_grab:
+                while current_pos < frame_idx:
+                    ok = cap.grab()
+                    if not ok:
+                        break
+                    current_pos += 1
+                if current_pos != frame_idx:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    current_pos = frame_idx
+            else:
+                if frame_idx != last_read + 1:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if use_grab:
+                current_pos += 1
+            last_read = frame_idx
+
+            if not ret or frame is None:
+                continue
+
+            scores = evaluator.evaluate_stage1_fast(frame)
+            fsd = FrameScoreData(
+                frame_index=frame_idx,
+                timestamp=frame_idx / fps,
+                sharpness=scores.get('sharpness', 0.0),
+                exposure=scores.get('exposure', 0.0),
+                motion_blur=scores.get('motion_blur', 0.0),
+            )
+            all_scores.append(fsd)
+            batch.append(fsd)
+
+            if len(batch) >= batch_size:
+                if on_batch_cb is not None:
+                    on_batch_cb(list(batch))
+                batch.clear()
+            if on_progress_cb is not None:
+                on_progress_cb(count + 1, len(frame_indices))
+
+        if batch and on_batch_cb is not None:
+            on_batch_cb(list(batch))
+        return all_scores
+    finally:
+        cap.release()
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: 簡易解析ワーカー
 # ---------------------------------------------------------------------------
@@ -106,104 +193,34 @@ class Stage1Worker(QThread):
         self._is_running = False
 
     def run(self):
-        cap = None
         try:
-            from core.quality_evaluator import QualityEvaluator
             logger.info(
                 "worker_start, worker=Stage1Worker,"
                 f" video_path={self.video_path},"
                 f" sample_interval={int(self.sample_interval)},"
                 f" batch_size={int(self.config.get('STAGE1_BATCH_SIZE', 32))}"
             )
+            def _on_progress(current: int, total: int) -> None:
+                self.progress.emit(current, total, f"Stage 1: {current}/{max(total, 1)}")
 
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                self.error.emit(f"ビデオを開けません: {self.video_path}")
-                return
-
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            stage1_eval_scale = float(self.config.get('stage1_eval_scale', self.config.get('STAGE1_EVAL_SCALE', 0.5)))
-            stage1_eval_scale = max(0.1, min(1.0, stage1_eval_scale))
-            evaluator = QualityEvaluator(eval_scale=stage1_eval_scale)
-
-            all_scores: List[FrameScoreData] = []
-            batch: List[FrameScoreData] = []
-            batch_size = int(self.config.get('STAGE1_BATCH_SIZE', 32))
-            frame_indices = list(range(0, total_frames, self.sample_interval))
-            grab_threshold = int(self.config.get('stage1_grab_threshold', self.config.get('STAGE1_GRAB_THRESHOLD', 30)))
-            use_grab = (self.sample_interval > 1 and self.sample_interval <= grab_threshold)
-            last_read = -1
-            current_pos = -1
-
-            if use_grab and frame_indices:
-                first_idx = frame_indices[0]
-                cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
-                current_pos = first_idx
-
-            for count, frame_idx in enumerate(frame_indices):
-                if not self._is_running:
-                    break
-
-                # シーク最適化
-                if use_grab:
-                    while current_pos < frame_idx:
-                        ok = cap.grab()
-                        if not ok:
-                            break
-                        current_pos += 1
-                    if current_pos != frame_idx:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        current_pos = frame_idx
-                else:
-                    if frame_idx != last_read + 1:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if use_grab:
-                    current_pos += 1
-                last_read = frame_idx
-
-                if not ret or frame is None:
-                    continue
-
-                scores = evaluator.evaluate_stage1_fast(frame)
-
-                fsd = FrameScoreData(
-                    frame_index=frame_idx,
-                    timestamp=frame_idx / fps,
-                    sharpness=scores.get('sharpness', 0.0),
-                    exposure=scores.get('exposure', 0.0),
-                    motion_blur=scores.get('motion_blur', 0.0),
-                )
-                all_scores.append(fsd)
-                batch.append(fsd)
-
-                # バッチ送出
-                if len(batch) >= batch_size:
-                    self.frame_scores.emit(list(batch))
-                    batch.clear()
-                    self.progress.emit(count + 1, len(frame_indices),
-                                       f"Stage 1: {count+1}/{len(frame_indices)}")
-
-            # 残りバッチ
-            if batch:
-                self.frame_scores.emit(list(batch))
-
+            all_scores = _run_stage1_scan(
+                video_path=self.video_path,
+                config=self.config,
+                sample_interval=int(self.sample_interval),
+                is_running_cb=lambda: self._is_running,
+                on_batch_cb=lambda items: self.frame_scores.emit(items),
+                on_progress_cb=_on_progress,
+            )
             if self._is_running:
-                self.progress.emit(len(frame_indices), len(frame_indices),
-                                   "Stage 1 完了")
+                self.progress.emit(len(all_scores), max(len(all_scores), 1), "Stage 1 完了")
                 self.finished_scores.emit(all_scores)
                 logger.info(
                     "worker_finished, worker=Stage1Worker,"
                     f" scanned_frames={len(all_scores)}"
                 )
-
-        except Exception as e:
+        except (RuntimeError, cv2.error, ValueError, TypeError, OSError) as e:
             logger.exception("Stage 1 ワーカーエラー")
             self.error.emit(f"Stage 1 エラー: {e}")
-        finally:
-            if cap is not None:
-                cap.release()
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +453,6 @@ class UnifiedAnalysisWorker(QThread):
         try:
             from core.video_loader import VideoLoader, DualVideoLoader
             from core.keyframe_selector import KeyframeSelector
-            from core.quality_evaluator import QualityEvaluator
             run_id = str(self.config.get("analysis_run_id", "n/a"))
             logger.info(
                 "worker_start, worker=UnifiedAnalysisWorker,"
@@ -449,81 +465,24 @@ class UnifiedAnalysisWorker(QThread):
             # ----- Stage 1: 高速品質スキャン -----
             self.progress.emit(0, 100, "Stage 1: 品質スキャン開始...")
 
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                self.error.emit(f"ビデオを開けません: {self.video_path}")
-                return
-
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            stage1_eval_scale = float(self.config.get('stage1_eval_scale', self.config.get('STAGE1_EVAL_SCALE', 0.5)))
-            stage1_eval_scale = max(0.1, min(1.0, stage1_eval_scale))
-            evaluator = QualityEvaluator(eval_scale=stage1_eval_scale)
-
             sample_interval = int(self.config.get('SAMPLE_INTERVAL', 1))
-            batch_size = int(self.config.get('STAGE1_BATCH_SIZE', 32))
-            frame_indices = list(range(0, total_frames, sample_interval))
-            grab_threshold = int(self.config.get('stage1_grab_threshold', self.config.get('STAGE1_GRAB_THRESHOLD', 30)))
-            use_grab = (sample_interval > 1 and sample_interval <= grab_threshold)
             stage1_weight_pct = int(self.config.get('UNIFIED_STAGE1_PROGRESS_WEIGHT', 35))
             stage1_weight_pct = max(10, min(70, stage1_weight_pct))
+            progress_state = {"last_total": 1}
 
-            all_scores: List[FrameScoreData] = []
-            batch: List[FrameScoreData] = []
-            last_read = -1
-            current_pos = -1
+            def _on_progress(current: int, total: int) -> None:
+                progress_state["last_total"] = max(total, 1)
+                pct = int(current / max(total, 1) * stage1_weight_pct)
+                self.progress.emit(pct, 100, f"Stage 1: {current}/{max(total, 1)}")
 
-            if use_grab and frame_indices:
-                first_idx = frame_indices[0]
-                cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
-                current_pos = first_idx
-
-            for count, frame_idx in enumerate(frame_indices):
-                if not self._is_running:
-                    cap.release()
-                    return
-
-                if use_grab:
-                    while current_pos < frame_idx:
-                        ok = cap.grab()
-                        if not ok:
-                            break
-                        current_pos += 1
-                    if current_pos != frame_idx:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        current_pos = frame_idx
-                else:
-                    if frame_idx != last_read + 1:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if use_grab:
-                    current_pos += 1
-                last_read = frame_idx
-
-                if not ret or frame is None:
-                    continue
-
-                scores = evaluator.evaluate_stage1_fast(frame)
-                fsd = FrameScoreData(
-                    frame_index=frame_idx,
-                    timestamp=frame_idx / fps,
-                    sharpness=scores.get('sharpness', 0.0),
-                    exposure=scores.get('exposure', 0.0),
-                    motion_blur=scores.get('motion_blur', 0.0),
-                )
-                all_scores.append(fsd)
-                batch.append(fsd)
-
-                if len(batch) >= batch_size:
-                    self.stage1_batch.emit(list(batch))
-                    batch.clear()
-                    pct = int((count + 1) / max(len(frame_indices), 1) * stage1_weight_pct)
-                    self.progress.emit(pct, 100,
-                                       f"Stage 1: {count+1}/{len(frame_indices)}")
-
-            if batch:
-                self.stage1_batch.emit(list(batch))
-            cap.release()
+            all_scores = _run_stage1_scan(
+                video_path=self.video_path,
+                config=self.config,
+                sample_interval=sample_interval,
+                is_running_cb=lambda: self._is_running,
+                on_batch_cb=lambda items: self.stage1_batch.emit(items),
+                on_progress_cb=_on_progress,
+            )
 
             if not self._is_running:
                 return

@@ -212,7 +212,8 @@ class KLTVisualOdometry:
             )
         except Exception:
             e, mask_e = None, None
-        if e is None or mask_e is None:
+        # mask_e が None またはインライア数が不足する場合は無効扱い
+        if e is None or mask_e is None or int(mask_e.sum()) < self.min_track_points:
             return _invalid_metrics()
 
         try:

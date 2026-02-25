@@ -160,6 +160,8 @@ class KeyframeSelector:
             'THUMBNAIL_SIZE': (192, 108),
             'SAMPLE_INTERVAL': 1,
             'STAGE1_BATCH_SIZE': 32,
+            'STAGE1_GRAB_THRESHOLD': 30,
+            'STAGE1_EVAL_SCALE': 0.5,
             'ENABLE_RIG_STITCHING': True,
             'EQUIRECT_WIDTH': 4096,
             'EQUIRECT_HEIGHT': 2048,
@@ -181,6 +183,7 @@ class KeyframeSelector:
             'SAM_MODEL_PATH': 'sam3_t.pt',
             'CONFIDENCE_THRESHOLD': 0.25,
             'DETECTION_DEVICE': 'auto',
+            'ENABLE_PROFILE': False,
             'STAGE2_PERF_PROFILE': True,
             'STAGE2_MASK_CACHE_TTL_FRAMES': 0,
             # レスキューモード設定
@@ -278,6 +281,9 @@ class KeyframeSelector:
                 'sam_model_path': 'SAM_MODEL_PATH',
                 'confidence_threshold': 'CONFIDENCE_THRESHOLD',
                 'detection_device': 'DETECTION_DEVICE',
+                'stage1_grab_threshold': 'STAGE1_GRAB_THRESHOLD',
+                'stage1_eval_scale': 'STAGE1_EVAL_SCALE',
+                'enable_profile': 'ENABLE_PROFILE',
                 'stage2_perf_profile': 'STAGE2_PERF_PROFILE',
                 'stage2_mask_cache_ttl_frames': 'STAGE2_MASK_CACHE_TTL_FRAMES',
                 'enable_rescue_mode': 'ENABLE_RESCUE_MODE',
@@ -361,7 +367,8 @@ class KeyframeSelector:
         )
 
         # 評価器を初期化
-        self.quality_evaluator = QualityEvaluator()
+        stage1_eval_scale = float(np.clip(self.config.get('STAGE1_EVAL_SCALE', 0.5), 0.1, 1.0))
+        self.quality_evaluator = QualityEvaluator(eval_scale=stage1_eval_scale)
         self.geometric_evaluator = GeometricEvaluator(
             gric_config=gric_config,
             equirect_config=equirect_config
@@ -1553,6 +1560,23 @@ class KeyframeSelector:
 
         mode_enable_stage0 = bool(self.config.get('ENABLE_STAGE0_SCAN', True))
         mode_enable_stage3 = bool(self.config.get('ENABLE_STAGE3_REFINEMENT', True))
+        profile_enabled = bool(self.config.get('ENABLE_PROFILE', False))
+
+        def _profile_log(stage: str, elapsed_s: float, frames: int) -> None:
+            if not profile_enabled:
+                return
+            total_ms = max(0.0, elapsed_s) * 1000.0
+            if frames > 0 and elapsed_s > 0.0:
+                ms_per_frame = total_ms / float(frames)
+                fps = float(frames) / float(elapsed_s)
+            else:
+                ms_per_frame = 0.0
+                fps = 0.0
+            logger.info(
+                f"[PROFILE] Stage{stage}: {total_ms:.0f}ms total, "
+                f"{ms_per_frame:.1f}ms/frame, {fps:.1f}frames/s"
+            )
+
         if analysis_mode == "stage0":
             mode_enable_stage0 = True
             mode_enable_stage3 = False
@@ -1565,6 +1589,7 @@ class KeyframeSelector:
         # ===== Stage 0: 軽量走査 =====
         stage0_metrics: Dict[int, Dict[str, Any]] = {}
         if mode_enable_stage0:
+            t_stage0 = perf_counter() if profile_enabled else 0.0
             _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
             logger.info("Stage 0: 軽量運動量走査開始")
             stage0_metrics = self._stage0_lightweight_motion_scan(
@@ -1572,6 +1597,8 @@ class KeyframeSelector:
             )
             logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
             _stage_summary("0", samples=len(stage0_metrics))
+            if profile_enabled:
+                _profile_log("0", perf_counter() - t_stage0, len(stage0_metrics))
         if analysis_mode == "stage0":
             logger.info("Stage 0モードのため Stage1/2/3 をスキップ")
             logger.info(
@@ -1581,6 +1608,7 @@ class KeyframeSelector:
             return []
 
         # ===== Stage 1: 高速フィルタリング =====
+        t_stage1 = perf_counter() if profile_enabled else 0.0
         _stage_start("1", total_frames=total_frames)
         logger.info("Stage 1: 高速品質フィルタリング開始")
         stage1_candidates = self._stage1_fast_filter(
@@ -1596,6 +1624,10 @@ class KeyframeSelector:
             total=total_frames,
             pass_ratio=f"{100*len(stage1_candidates)/max(total_frames, 1):.2f}",
         )
+        if profile_enabled:
+            sample_interval = max(1, int(self.config.get('SAMPLE_INTERVAL', 1)))
+            stage1_samples = len(range(0, total_frames, sample_interval))
+            _profile_log("1", perf_counter() - t_stage1, stage1_samples)
 
         if not stage1_candidates:
             logger.warning("Stage 1でフレームが残りませんでした")
@@ -1606,6 +1638,7 @@ class KeyframeSelector:
             return []
 
         # ===== Stage 2: 精密評価 =====
+        t_stage2 = perf_counter() if profile_enabled else 0.0
         _stage_start("2", candidates=len(stage1_candidates))
         logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
         stage2_candidates, stage2_records = self._stage2_precise_evaluation(
@@ -1613,6 +1646,8 @@ class KeyframeSelector:
         )
         logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
         _stage_summary("2", candidates=len(stage2_candidates), records=len(stage2_records))
+        if profile_enabled:
+            _profile_log("2", perf_counter() - t_stage2, len(stage1_candidates))
 
         self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
 
@@ -1629,6 +1664,7 @@ class KeyframeSelector:
         # ===== Stage 3: 軌跡再評価 =====
         keyframes = stage2_keyframes_pre_stage3
         if mode_enable_stage3:
+            t_stage3 = perf_counter() if profile_enabled else 0.0
             _stage_start("3", input_candidates=len(stage2_candidates))
             logger.info("Stage 3: 軌跡再評価開始")
             stage2_candidates = self._stage3_refine_with_trajectory(
@@ -1646,6 +1682,8 @@ class KeyframeSelector:
             )
             logger.info(f"Stage 3完了: {len(keyframes)}個")
             _stage_summary("3", keyframes=len(keyframes))
+            if profile_enabled:
+                _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
 
         if frame_log_callback:
             selected_idx = {kf.frame_index for kf in keyframes}
@@ -1707,6 +1745,8 @@ class KeyframeSelector:
         total_frames = metadata.frame_count
         sample_interval = self.config['SAMPLE_INTERVAL']
         batch_size = self.config['STAGE1_BATCH_SIZE']
+        grab_threshold = int(self.config.get('STAGE1_GRAB_THRESHOLD', 30))
+        use_grab = (sample_interval > 1 and sample_interval <= grab_threshold)
 
         # フレームインデックスを収集
         frame_indices = list(range(0, total_frames, sample_interval))
@@ -1720,12 +1760,42 @@ class KeyframeSelector:
         if is_paired:
             cap_a, cap_b = self._open_independent_pair_captures(video_loader)
             try:
+                last_read_idx = -1
+                current_pos = -1
+                if use_grab and frame_indices and cap_a is not None and cap_b is not None:
+                    first_idx = frame_indices[0]
+                    cap_a.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+                    cap_b.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+                    current_pos = first_idx
+
+                cached_mask_a = None
+                cached_mask_b = None
+                cached_shape_a = None
+                cached_shape_b = None
+
                 for idx, frame_idx in enumerate(frame_indices):
                     if cap_a is not None and cap_b is not None:
-                        cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        if use_grab:
+                            while current_pos < frame_idx:
+                                ok_a = cap_a.grab()
+                                ok_b = cap_b.grab()
+                                if not ok_a or not ok_b:
+                                    break
+                                current_pos += 1
+                            if current_pos != frame_idx:
+                                cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                                cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                                current_pos = frame_idx
+                        else:
+                            if frame_idx != last_read_idx + 1:
+                                cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                                cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
                         ret_a, frame_a = cap_a.read()
                         ret_b, frame_b = cap_b.read()
+                        if use_grab:
+                            current_pos += 1
+                        last_read_idx = frame_idx
                         if not ret_a or not ret_b or frame_a is None or frame_b is None:
                             continue
                     else:
@@ -1735,8 +1805,16 @@ class KeyframeSelector:
                             continue
 
                     if use_fisheye_border_mask:
-                        valid_mask_a = self._create_fisheye_valid_mask(frame_a)
-                        valid_mask_b = self._create_fisheye_valid_mask(frame_b)
+                        shape_a = frame_a.shape[:2]
+                        shape_b = frame_b.shape[:2]
+                        if cached_mask_a is None or cached_shape_a != shape_a:
+                            cached_mask_a = self._create_fisheye_valid_mask(frame_a)
+                            cached_shape_a = shape_a
+                        if cached_mask_b is None or cached_shape_b != shape_b:
+                            cached_mask_b = self._create_fisheye_valid_mask(frame_b)
+                            cached_shape_b = shape_b
+                        valid_mask_a = cached_mask_a
+                        valid_mask_b = cached_mask_b
                         frame_a = self.mask_processor.apply_valid_region_mask(frame_a, valid_mask_a, fill_value=0)
                         frame_b = self.mask_processor.apply_valid_region_mask(frame_b, valid_mask_b, fill_value=0)
 
@@ -1766,6 +1844,12 @@ class KeyframeSelector:
         try:
             num_batches = (len(frame_indices) + batch_size - 1) // batch_size
             last_read_idx = -1
+            current_pos = -1
+
+            if use_grab and frame_indices:
+                first_idx = frame_indices[0]
+                cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+                current_pos = first_idx
 
             for batch_idx in range(num_batches):
                 start_idx = batch_idx * batch_size
@@ -1775,10 +1859,23 @@ class KeyframeSelector:
                 frames = []
                 valid_indices = []
                 for frame_idx in batch_indices:
-                    if frame_idx != last_read_idx + 1:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    if use_grab:
+                        while current_pos < frame_idx:
+                            ok = cap.grab()
+                            if not ok:
+                                break
+                            current_pos += 1
+
+                        if current_pos != frame_idx:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            current_pos = frame_idx
+                    else:
+                        if frame_idx != last_read_idx + 1:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
 
                     ret, frame = cap.read()
+                    if use_grab:
+                        current_pos += 1
                     last_read_idx = frame_idx
                     if ret and frame is not None:
                         frames.append(frame)
@@ -2232,10 +2329,7 @@ class KeyframeSelector:
         dict
             品質スコア
         """
-        return self.quality_evaluator.evaluate(
-            frame,
-            beta=self.config['SOFTMAX_BETA']
-        )
+        return self.quality_evaluator.evaluate_stage1_fast(frame)
 
     def _compute_quality_score_pair(self, frame_a: np.ndarray,
                                     frame_b: np.ndarray) -> Dict[str, float]:
@@ -2244,8 +2338,8 @@ class KeyframeSelector:
 
         どちらか片方でも閾値未達なら除外する。
         """
-        score_a = self.quality_evaluator.evaluate(frame_a, beta=self.config['SOFTMAX_BETA'])
-        score_b = self.quality_evaluator.evaluate(frame_b, beta=self.config['SOFTMAX_BETA'])
+        score_a = self.quality_evaluator.evaluate_stage1_fast(frame_a)
+        score_b = self.quality_evaluator.evaluate_stage1_fast(frame_b)
 
         sharpness_ok = (
             score_a.get('sharpness', 0.0) >= self.config['LAPLACIAN_THRESHOLD'] and

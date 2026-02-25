@@ -136,6 +136,8 @@ class KeyframeConfig:
     # パイプライン設定
     sample_interval: int = 1           # フレームサンプリング間隔
     stage1_batch_size: int = 32        # Stage 1 バッチサイズ
+    stage1_grab_threshold: int = 30    # Stage1でgrab方式を使う最大サンプル間隔
+    stage1_eval_scale: float = 0.5     # Stage1品質評価の縮小スケール
     thumbnail_size: Tuple[int, int] = (192, 108)
     enable_rerun_logging: bool = False  # GUI実行時のRerunログ有効化
     enable_stage0_scan: bool = True
@@ -227,6 +229,8 @@ class KeyframeConfig:
             'THUMBNAIL_SIZE': self.thumbnail_size,
             'SAMPLE_INTERVAL': self.sample_interval,
             'STAGE1_BATCH_SIZE': self.stage1_batch_size,
+            'STAGE1_GRAB_THRESHOLD': self.stage1_grab_threshold,
+            'STAGE1_EVAL_SCALE': self.stage1_eval_scale,
             'enable_rerun_logging': self.enable_rerun_logging,
             'ENABLE_STAGE0_SCAN': self.enable_stage0_scan,
             'STAGE0_STRIDE': self.stage0_stride,
@@ -273,6 +277,10 @@ class KeyframeConfig:
         config.weights.gamma = d.get('weight_content', config.weights.gamma)
         # Selection
         config.selection.ssim_change_threshold = d.get('ssim_threshold', config.selection.ssim_change_threshold)
+        config.sample_interval = int(max(1, d.get('sample_interval', config.sample_interval)))
+        config.stage1_batch_size = int(max(1, d.get('stage1_batch_size', config.stage1_batch_size)))
+        config.stage1_grab_threshold = int(max(1, d.get('stage1_grab_threshold', config.stage1_grab_threshold)))
+        config.stage1_eval_scale = float(np.clip(d.get('stage1_eval_scale', config.stage1_eval_scale), 0.1, 1.0))
         config.selection.min_keyframe_interval = d.get('min_keyframe_interval', config.selection.min_keyframe_interval)
         config.selection.max_keyframe_interval = d.get('max_keyframe_interval', config.selection.max_keyframe_interval)
         config.selection.softmax_beta = d.get('softmax_beta', config.selection.softmax_beta)

@@ -104,6 +104,46 @@ class QualityEvaluator:
             'softmax_depth': softmax_depth
         }
 
+    def evaluate_stage1_fast(self, frame: np.ndarray) -> Dict[str, float]:
+        """
+        Stage1用の軽量品質評価（softmax_depth計算を省略）
+
+        Parameters:
+        -----------
+        frame : np.ndarray
+            入力フレーム（BGR形式）
+
+        Returns:
+        --------
+        dict
+            Stage1判定に必要な品質スコア辞書
+        """
+        if frame is None or frame.size == 0:
+            return {
+                'sharpness': 0.0,
+                'motion_blur': 0.0,
+                'exposure': 0.0,
+                'softmax_depth': 0.0,
+            }
+
+        if self._eval_scale < 1.0:
+            h, w = frame.shape[:2]
+            new_h, new_w = int(h * self._eval_scale), int(w * self._eval_scale)
+            frame_work = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            frame_work = frame
+
+        gray = cv2.cvtColor(frame_work, cv2.COLOR_BGR2GRAY) if len(frame_work.shape) == 3 else frame_work
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+
+        return {
+            'sharpness': self._compute_sharpness(gray),
+            'motion_blur': self._compute_motion_blur(sobel_x, sobel_y),
+            'exposure': self._compute_exposure_score(gray),
+            'softmax_depth': 0.0,
+        }
+
     @staticmethod
     def evaluate_frame(frame: np.ndarray, beta: float = 5.0,
                       eval_scale: float = 0.5) -> Dict[str, float]:

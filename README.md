@@ -77,10 +77,13 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
 **CUDA対応OpenCV（さらに高速化、オプション）:**
-```bash
-pip uninstall opencv-python
-pip install opencv-contrib-python
-```
+
+`pip install opencv-contrib-python` の公式ホイールは通常 CUDA 無効です。CUDA ORB などを使うには次のいずれかが必要です。
+
+- OpenCV を `WITH_CUDA=ON` でソースビルドする
+- CUDA 対応 OpenCV が同梱された環境（例: Jetson）を使う
+
+手軽なGPU高速化は PyTorch 側（`core/accelerator.py`）を推奨します。
 
 ### 5. 対象マスク生成（オプション）
 
@@ -125,6 +128,9 @@ python main.py --cli input.mp4 --remove-dynamic-objects
 
 # Stage0軽量走査を無効化し、Stage3重みを調整
 python main.py --cli input.mp4 --disable-stage0-scan --stage3-weight-trajectory 0.35
+
+# Stage1高速化パラメータを調整（grab閾値・評価スケール）
+python main.py --cli input.mp4 --stage1-grab-threshold 45 --stage1-eval-scale 0.33
 
 # Stage3軌跡再評価を無効化（Stage2まで）
 python main.py --cli input.mp4 --disable-stage3-refinement
@@ -177,6 +183,8 @@ python main.py --cli input.mp4 -v
 | `--dynamic-mask-inpaint-module MOD` | インペイント処理モジュール名 | `""` |
 | `--disable-stage0-scan` | Stage0軽量走査を無効化 | `false` |
 | `--stage0-stride N` | Stage0固定サンプリング間隔（フレーム数） | `5` |
+| `--stage1-grab-threshold N` | Stage1でgrab方式を使う最大サンプリング間隔 | `30` |
+| `--stage1-eval-scale F` | Stage1品質評価の縮小スケール（0.1-1.0） | `0.5` |
 | `--disable-stage3-refinement` | Stage3軌跡再評価を無効化 | `false` |
 | `--stage3-weight-base F` | Stage3再スコア式のbase重み | `0.70` |
 | `--stage3-weight-trajectory F` | Stage3再スコア式のtrajectory重み | `0.25` |

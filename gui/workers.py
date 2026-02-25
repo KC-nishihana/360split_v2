@@ -14,6 +14,7 @@ ExportWorker:
 import cv2
 import numpy as np
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -122,30 +123,50 @@ class Stage1Worker(QThread):
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            evaluator = QualityEvaluator(eval_scale=0.5)
+            stage1_eval_scale = float(self.config.get('stage1_eval_scale', self.config.get('STAGE1_EVAL_SCALE', 0.5)))
+            stage1_eval_scale = max(0.1, min(1.0, stage1_eval_scale))
+            evaluator = QualityEvaluator(eval_scale=stage1_eval_scale)
 
             all_scores: List[FrameScoreData] = []
             batch: List[FrameScoreData] = []
             batch_size = int(self.config.get('STAGE1_BATCH_SIZE', 32))
-            beta = float(self.config.get('SOFTMAX_BETA', 5.0))
-
             frame_indices = list(range(0, total_frames, self.sample_interval))
+            grab_threshold = int(self.config.get('stage1_grab_threshold', self.config.get('STAGE1_GRAB_THRESHOLD', 30)))
+            use_grab = (self.sample_interval > 1 and self.sample_interval <= grab_threshold)
             last_read = -1
+            current_pos = -1
+
+            if use_grab and frame_indices:
+                first_idx = frame_indices[0]
+                cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+                current_pos = first_idx
 
             for count, frame_idx in enumerate(frame_indices):
                 if not self._is_running:
                     break
 
                 # シーク最適化
-                if frame_idx != last_read + 1:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                if use_grab:
+                    while current_pos < frame_idx:
+                        ok = cap.grab()
+                        if not ok:
+                            break
+                        current_pos += 1
+                    if current_pos != frame_idx:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        current_pos = frame_idx
+                else:
+                    if frame_idx != last_read + 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
+                if use_grab:
+                    current_pos += 1
                 last_read = frame_idx
 
                 if not ret or frame is None:
                     continue
 
-                scores = evaluator.evaluate(frame, beta=beta)
+                scores = evaluator.evaluate_stage1_fast(frame)
 
                 fsd = FrameScoreData(
                     frame_index=frame_idx,
@@ -435,31 +456,54 @@ class UnifiedAnalysisWorker(QThread):
 
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            evaluator = QualityEvaluator(eval_scale=0.5)
-            beta = float(self.config.get('SOFTMAX_BETA', 5.0))
+            stage1_eval_scale = float(self.config.get('stage1_eval_scale', self.config.get('STAGE1_EVAL_SCALE', 0.5)))
+            stage1_eval_scale = max(0.1, min(1.0, stage1_eval_scale))
+            evaluator = QualityEvaluator(eval_scale=stage1_eval_scale)
 
             sample_interval = int(self.config.get('SAMPLE_INTERVAL', 1))
             batch_size = int(self.config.get('STAGE1_BATCH_SIZE', 32))
             frame_indices = list(range(0, total_frames, sample_interval))
+            grab_threshold = int(self.config.get('stage1_grab_threshold', self.config.get('STAGE1_GRAB_THRESHOLD', 30)))
+            use_grab = (sample_interval > 1 and sample_interval <= grab_threshold)
+            stage1_weight_pct = int(self.config.get('UNIFIED_STAGE1_PROGRESS_WEIGHT', 35))
+            stage1_weight_pct = max(10, min(70, stage1_weight_pct))
 
             all_scores: List[FrameScoreData] = []
             batch: List[FrameScoreData] = []
             last_read = -1
+            current_pos = -1
+
+            if use_grab and frame_indices:
+                first_idx = frame_indices[0]
+                cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
+                current_pos = first_idx
 
             for count, frame_idx in enumerate(frame_indices):
                 if not self._is_running:
                     cap.release()
                     return
 
-                if frame_idx != last_read + 1:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                if use_grab:
+                    while current_pos < frame_idx:
+                        ok = cap.grab()
+                        if not ok:
+                            break
+                        current_pos += 1
+                    if current_pos != frame_idx:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        current_pos = frame_idx
+                else:
+                    if frame_idx != last_read + 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
+                if use_grab:
+                    current_pos += 1
                 last_read = frame_idx
 
                 if not ret or frame is None:
                     continue
 
-                scores = evaluator.evaluate(frame, beta=beta)
+                scores = evaluator.evaluate_stage1_fast(frame)
                 fsd = FrameScoreData(
                     frame_index=frame_idx,
                     timestamp=frame_idx / fps,
@@ -473,7 +517,7 @@ class UnifiedAnalysisWorker(QThread):
                 if len(batch) >= batch_size:
                     self.stage1_batch.emit(list(batch))
                     batch.clear()
-                    pct = int((count + 1) / len(frame_indices) * 50)  # 0-50%
+                    pct = int((count + 1) / max(len(frame_indices), 1) * stage1_weight_pct)
                     self.progress.emit(pct, 100,
                                        f"Stage 1: {count+1}/{len(frame_indices)}")
 
@@ -485,7 +529,7 @@ class UnifiedAnalysisWorker(QThread):
                 return
 
             self.stage1_finished.emit(all_scores)
-            self.progress.emit(50, 100, "Stage 1 完了。Stage 2/3 開始...")
+            self.progress.emit(stage1_weight_pct, 100, "Stage 1 完了。Stage 2/3 開始...")
 
             # ----- Stage 2: 精密評価 -----
             if str(self.video_path).lower().endswith(".osv"):
@@ -512,7 +556,8 @@ class UnifiedAnalysisWorker(QThread):
             def progress_cb(current, total, message=""):
                 if not self._is_running:
                     return
-                pct = 50 + int(current / max(total, 1) * 50)  # 50-100%
+                pct = stage1_weight_pct + int(current / max(total, 1) * (100 - stage1_weight_pct))
+                pct = max(stage1_weight_pct, min(100, pct))
                 self.progress.emit(pct, 100,
                                    f"解析: {current}/{total} {message}")
 
@@ -1040,11 +1085,16 @@ class ExportWorker(QThread):
         return masks_root / f"{stem}{ext}"
 
     def run(self):
+        write_executor = None
         try:
             output_path = Path(self.output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             stereo_images_root = output_path / "images"
             masks_root = output_path / self.mask_output_dirname
+            max_write_workers = int(self.export_runtime_config.get("export_write_workers", min(4, os.cpu_count() or 2)))
+            max_write_workers = max(1, min(8, max_write_workers))
+            if max_write_workers > 1:
+                write_executor = ThreadPoolExecutor(max_workers=max_write_workers)
 
             # ステレオ判定
             if self.is_stereo and self.stereo_left_path and self.stereo_right_path:
@@ -1303,11 +1353,30 @@ class ExportWorker(QThread):
                                     fisheye_mask_img = cv2.imread(str(fisheye_mask_path), cv2.IMREAD_GRAYSCALE)
                                     if fisheye_mask_img is not None:
                                         projected_masks = splitter.project_mask(fisheye_mask_img)
+                                split_write_futures = []
                                 for view_name, (view_img, _valid) in split_views.items():
                                     split_dir = stereo_images_root / f"{suffix.strip('_')}_{view_name}"
                                     split_dir.mkdir(parents=True, exist_ok=True)
                                     split_path = split_dir / f"{self.prefix}_{frame_idx:06d}{suffix}_{view_name}.{ext}"
-                                    if ext == 'jpg':
+                                    if write_executor is not None:
+                                        if ext == 'jpg':
+                                            split_write_futures.append((
+                                                write_executor.submit(
+                                                write_image,
+                                                split_path,
+                                                view_img,
+                                                [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality],
+                                                ),
+                                                split_path,
+                                                "分割画像",
+                                            ))
+                                        else:
+                                            split_write_futures.append((
+                                                write_executor.submit(write_image, split_path, view_img),
+                                                split_path,
+                                                "分割画像",
+                                            ))
+                                    elif ext == 'jpg':
                                         saved_split = write_image(
                                             split_path,
                                             view_img,
@@ -1325,8 +1394,20 @@ class ExportWorker(QThread):
                                         continue
                                     split_mask_path = self._build_flat_split_mask_path(masks_root, split_path)
                                     split_mask_path.parent.mkdir(parents=True, exist_ok=True)
-                                    if not write_image(split_mask_path, split_mask):
-                                        logger.warning(f"分割マスク保存失敗: {split_mask_path}")
+                                    if write_executor is not None:
+                                        split_write_futures.append((
+                                            write_executor.submit(write_image, split_mask_path, split_mask),
+                                            split_mask_path,
+                                            "分割マスク",
+                                        ))
+                                    else:
+                                        saved_mask = write_image(split_mask_path, split_mask)
+                                        if not saved_mask:
+                                            logger.warning(f"分割マスク保存失敗: {split_mask_path}")
+                                if write_executor is not None:
+                                    for fut, out_path, kind in split_write_futures:
+                                        if not bool(fut.result()):
+                                            logger.warning(f"{kind}保存失敗: {out_path}")
                             except Exception as e:
                                 logger.warning(f"cross5分割出力エラー（フレーム {frame_idx}{suffix}）: {e}")
 
@@ -1445,6 +1526,7 @@ class ExportWorker(QThread):
                             faces = equirect_processor.to_cubemap(
                                 processed_frame, self.cubemap_face_size
                             )
+                            cubemap_futures = []
                             for face_name, face_img in faces.items():
                                 # 方向ごとのフォルダ: cubemap/front/, cubemap/back/ など
                                 face_dir = output_path / "cubemap" / face_name
@@ -1452,7 +1534,18 @@ class ExportWorker(QThread):
 
                                 # ファイル名: keyframe_NNNNNN_front.jpg（サフィックスあり）
                                 face_path = face_dir / f"keyframe_{frame_idx:06d}_{face_name}.{ext}"
-                                if ext == 'jpg':
+                                if write_executor is not None:
+                                    if ext == 'jpg':
+                                        fut = write_executor.submit(
+                                            write_image,
+                                            face_path,
+                                            face_img,
+                                            [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality],
+                                        )
+                                    else:
+                                        fut = write_executor.submit(write_image, face_path, face_img)
+                                    cubemap_futures.append((fut, face_path))
+                                elif ext == 'jpg':
                                     if not write_image(
                                         face_path,
                                         face_img,
@@ -1462,6 +1555,9 @@ class ExportWorker(QThread):
                                 else:
                                     if not write_image(face_path, face_img):
                                         logger.warning(f"Cubemap保存失敗: {face_path}")
+                            for fut, face_path in cubemap_futures:
+                                if not bool(fut.result()):
+                                    logger.warning(f"Cubemap保存失敗: {face_path}")
                             logger.debug(f"Cubemap 出力完了（フレーム {frame_idx}）")
                         except Exception as e:
                             logger.warning(f"Cubemap 出力エラー（フレーム {frame_idx}）: {e}")
@@ -1469,6 +1565,7 @@ class ExportWorker(QThread):
                     # --- Perspective 出力 ---
                     if self.enable_perspective and equirect_processor:
                         try:
+                            perspective_futures = []
                             for yaw in self.perspective_yaw_list:
                                 for pitch in self.perspective_pitch_list:
                                     persp_img = equirect_processor.to_perspective(
@@ -1484,7 +1581,18 @@ class ExportWorker(QThread):
 
                                     # ファイル名: keyframe_NNNNNN_y+0_p+0.jpg（サフィックスあり）
                                     persp_path = angle_dir / f"keyframe_{frame_idx:06d}_{angle_name}.{ext}"
-                                    if ext == 'jpg':
+                                    if write_executor is not None:
+                                        if ext == 'jpg':
+                                            fut = write_executor.submit(
+                                                write_image,
+                                                persp_path,
+                                                persp_img,
+                                                [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality],
+                                            )
+                                        else:
+                                            fut = write_executor.submit(write_image, persp_path, persp_img)
+                                        perspective_futures.append((fut, persp_path))
+                                    elif ext == 'jpg':
                                         if not write_image(
                                             persp_path,
                                             persp_img,
@@ -1494,6 +1602,9 @@ class ExportWorker(QThread):
                                     else:
                                         if not write_image(persp_path, persp_img):
                                             logger.warning(f"Perspective保存失敗: {persp_path}")
+                            for fut, persp_path in perspective_futures:
+                                if not bool(fut.result()):
+                                    logger.warning(f"Perspective保存失敗: {persp_path}")
                             logger.debug(f"Perspective 出力完了（フレーム {frame_idx}）")
                         except Exception as e:
                             logger.warning(f"Perspective 出力エラー（フレーム {frame_idx}）: {e}")
@@ -1510,12 +1621,17 @@ class ExportWorker(QThread):
             else:
                 if cap is not None:
                     cap.release()
+            if write_executor is not None:
+                write_executor.shutdown(wait=True)
 
             self.finished.emit(exported)
 
         except Exception as e:
             logger.exception("エクスポートワーカーエラー")
             self.error.emit(f"エクスポートエラー: {e}")
+        finally:
+            if write_executor is not None:
+                write_executor.shutdown(wait=False)
 
 
 class GenerateMasksWorker(QThread):

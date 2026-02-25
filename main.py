@@ -206,6 +206,18 @@ def parse_arguments():
         help="Stage0固定サンプリング間隔（フレーム数）"
     )
     parser.add_argument(
+        "--stage1-grab-threshold",
+        type=int,
+        default=None,
+        help="Stage1でgrab方式を使う最大サンプリング間隔（1以上）"
+    )
+    parser.add_argument(
+        "--stage1-eval-scale",
+        type=float,
+        default=None,
+        help="Stage1品質評価の縮小スケール（0.1-1.0）"
+    )
+    parser.add_argument(
         "--disable-stage3-refinement",
         action="store_true",
         default=False,
@@ -367,6 +379,12 @@ def parse_arguments():
         default=False,
         help="詳細ログ出力"
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="各ステージ処理時間と ms/frame をログ出力する（性能計測）"
+    )
 
     parser.add_argument(
         "--rerun-stream",
@@ -481,6 +499,10 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["enable_stage0_scan"] = False
     if args.stage0_stride is not None:
         config["stage0_stride"] = max(1, int(args.stage0_stride))
+    if args.stage1_grab_threshold is not None:
+        config["stage1_grab_threshold"] = max(1, int(args.stage1_grab_threshold))
+    if args.stage1_eval_scale is not None:
+        config["stage1_eval_scale"] = float(max(0.1, min(1.0, args.stage1_eval_scale)))
     if args.disable_stage3_refinement:
         config["enable_stage3_refinement"] = False
     if args.stage3_weight_base is not None:
@@ -543,6 +565,9 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["vo_fast_fail_inlier_ratio"] = float(max(0.0, min(1.0, args.vo_fast_fail_inlier_ratio)))
     if args.vo_step_proxy_clip_px is not None:
         config["vo_step_proxy_clip_px"] = float(max(0.0, args.vo_step_proxy_clip_px))
+    if args.profile:
+        config["enable_profile"] = True
+        config["stage2_perf_profile"] = True
     if args.equirectangular:
         config["projection_mode"] = "Equirectangular"
     if args.cubemap:

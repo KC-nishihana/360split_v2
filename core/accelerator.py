@@ -502,7 +502,6 @@ class Accelerator:
         # 基準フレームをテンソル化
         ref_t = torch.from_numpy(reference.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
 
-        results = []
         # バッチ処理
         batch = torch.stack([
             torch.from_numpy(f.astype(np.float32)) for f in frames
@@ -522,11 +521,9 @@ class Accelerator:
         ssim_map = ((2 * mu_cross + C1) * (2 * sigma_cross + C2)) / \
                    ((mu_ref_sq + mu_batch_sq + C1) * (sigma_ref_sq + sigma_batch_sq + C2))
 
-        # 各フレームの平均SSIMを計算
-        for i in range(len(frames)):
-            results.append(float(ssim_map[i].mean().cpu().item()))
-
-        return results
+        # 各フレームの平均SSIM を一括計算
+        # ssim_map shape: (N, 1, H, W) → mean(dim=[1,2,3]) → (N,)
+        return ssim_map.mean(dim=[1, 2, 3]).cpu().tolist()
 
 
 # === モジュールレベルのアクセサ ===

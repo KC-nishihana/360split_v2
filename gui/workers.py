@@ -1376,15 +1376,16 @@ class ExportWorker(QThread):
                                                 split_path,
                                                 "分割画像",
                                             ))
+                                        split_saved = True
                                     elif ext == 'jpg':
-                                        saved_split = write_image(
+                                        split_saved = write_image(
                                             split_path,
                                             view_img,
                                             [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
                                         )
                                     else:
-                                        saved_split = write_image(split_path, view_img)
-                                    if not saved_split:
+                                        split_saved = write_image(split_path, view_img)
+                                    if not split_saved:
                                         logger.warning(f"分割画像保存失敗: {split_path}")
                                         continue
                                     if not projected_masks or target_mask_cls is None:

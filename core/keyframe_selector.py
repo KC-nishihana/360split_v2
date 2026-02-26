@@ -9,12 +9,18 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable, Tuple
-from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from time import perf_counter
 
 from .video_loader import VideoLoader, VideoMetadata
 from .quality_evaluator import QualityEvaluator
+from .quality_score import (
+    apply_abs_guard,
+    compose_quality,
+    compute_raw_metrics,
+    normalize_batch_p10_p90,
+    parse_roi_spec,
+)
 from .geometric_evaluator import GeometricEvaluator
 from .adaptive_selector import AdaptiveSelector
 from .accelerator import get_accelerator
@@ -164,6 +170,19 @@ class KeyframeSelector:
             'SSIM_CHANGE_THRESHOLD': 0.85,
             'MOTION_BLUR_THRESHOLD': 0.3,
             'EXPOSURE_THRESHOLD': 0.35,
+            'QUALITY_FILTER_ENABLED': True,
+            'QUALITY_THRESHOLD': 0.50,
+            'QUALITY_ROI_MODE': 'circle',
+            'QUALITY_ROI_RATIO': 0.40,
+            'QUALITY_ABS_LAPLACIAN_MIN': 35.0,
+            'QUALITY_USE_ORB': True,
+            'QUALITY_WEIGHT_SHARPNESS': 0.40,
+            'QUALITY_WEIGHT_TENENGRAD': 0.30,
+            'QUALITY_WEIGHT_EXPOSURE': 0.15,
+            'QUALITY_WEIGHT_KEYPOINTS': 0.15,
+            'QUALITY_NORM_P_LOW': 10.0,
+            'QUALITY_NORM_P_HIGH': 90.0,
+            'QUALITY_DEBUG': False,
             'PAIR_MOTION_AGGREGATION': 'max',
             'MIN_FEATURE_MATCHES': 30,
             'THUMBNAIL_SIZE': (192, 108),
@@ -337,6 +356,7 @@ class KeyframeSelector:
             fast_fail_inlier_ratio=float(self.config.get('VO_FAST_FAIL_INLIER_RATIO', 0.12)),
             step_proxy_clip_px=float(self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)),
         )
+        self.stage1_quality_records: List[Dict[str, Any]] = []
 
     def _load_inpaint_hook(self):
         module_name = str(self.config.get('DYNAMIC_MASK_INPAINT_MODULE', '') or '').strip()
@@ -1689,20 +1709,39 @@ class KeyframeSelector:
         """
         total_frames = metadata.frame_count
         sample_interval = self.config['SAMPLE_INTERVAL']
-        batch_size = self.config['STAGE1_BATCH_SIZE']
         grab_threshold = int(self.config.get('STAGE1_GRAB_THRESHOLD', 30))
         use_grab = (sample_interval > 1 and sample_interval <= grab_threshold)
-
-        # フレームインデックスを収集
         frame_indices = list(range(0, total_frames, sample_interval))
+        fps = float(getattr(metadata, "fps", 0.0) or 30.0)
 
-        candidates = []
+        candidates: List[Dict[str, Any]] = []
+        self.stage1_quality_records = []
+
+        quality_filter_enabled = bool(self.config.get('QUALITY_FILTER_ENABLED', True))
+        quality_threshold = float(np.clip(self.config.get('QUALITY_THRESHOLD', 0.50), 0.0, 1.0))
+        quality_abs_laplacian_min = float(max(0.0, self.config.get('QUALITY_ABS_LAPLACIAN_MIN', 35.0)))
+        quality_use_orb = bool(self.config.get('QUALITY_USE_ORB', True))
+        quality_norm_p_low = float(np.clip(self.config.get('QUALITY_NORM_P_LOW', 10.0), 0.0, 100.0))
+        quality_norm_p_high = float(
+            np.clip(self.config.get('QUALITY_NORM_P_HIGH', 90.0), quality_norm_p_low, 100.0)
+        )
+        quality_debug = bool(self.config.get('QUALITY_DEBUG', False))
+        roi_mode = str(self.config.get('QUALITY_ROI_MODE', 'circle')).strip().lower()
+        roi_ratio = float(np.clip(self.config.get('QUALITY_ROI_RATIO', 0.40), 0.05, 1.0))
+        roi_spec = parse_roi_spec(f"{roi_mode}:{roi_ratio}")
+        quality_weights = {
+            "quality_weight_sharpness": float(max(0.0, self.config.get('QUALITY_WEIGHT_SHARPNESS', 0.40))),
+            "quality_weight_tenengrad": float(max(0.0, self.config.get('QUALITY_WEIGHT_TENENGRAD', 0.30))),
+            "quality_weight_exposure": float(max(0.0, self.config.get('QUALITY_WEIGHT_EXPOSURE', 0.15))),
+            "quality_weight_keypoints": float(max(0.0, self.config.get('QUALITY_WEIGHT_KEYPOINTS', 0.15))),
+        }
+        quality_fields = ("laplacian_var", "tenengrad", "exposure", "orb_keypoints")
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
         use_fisheye_border_mask = self._is_fisheye_border_mask_enabled(is_paired)
 
-        # ペアレンズ: レンズ毎品質評価 + AND条件
         if is_paired:
+            pair_entries: List[Dict[str, Any]] = []
             cap_a, cap_b = self._open_independent_pair_captures(video_loader)
             try:
                 last_read_idx = -1
@@ -1744,7 +1783,6 @@ class KeyframeSelector:
                         if not ret_a or not ret_b or frame_a is None or frame_b is None:
                             continue
                     else:
-                        # テストダミーローダー等のフォールバック
                         frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
                         if frame_a is None or frame_b is None:
                             continue
@@ -1758,18 +1796,35 @@ class KeyframeSelector:
                         if cached_mask_b is None or cached_shape_b != shape_b:
                             cached_mask_b = self._create_fisheye_valid_mask(frame_b)
                             cached_shape_b = shape_b
-                        valid_mask_a = cached_mask_a
-                        valid_mask_b = cached_mask_b
-                        frame_a = self.mask_processor.apply_valid_region_mask(frame_a, valid_mask_a, fill_value=0)
-                        frame_b = self.mask_processor.apply_valid_region_mask(frame_b, valid_mask_b, fill_value=0)
+                        frame_a = self.mask_processor.apply_valid_region_mask(frame_a, cached_mask_a, fill_value=0)
+                        frame_b = self.mask_processor.apply_valid_region_mask(frame_b, cached_mask_b, fill_value=0)
 
-                    quality_scores = self._compute_quality_score_pair(frame_a, frame_b)
-
-                    if quality_scores['passes_threshold']:
-                        candidates.append({
-                            'frame_idx': frame_idx,
-                            'quality_scores': quality_scores
-                        })
+                    timestamp = float(frame_idx / max(fps, 1e-6))
+                    if quality_filter_enabled:
+                        raw_a = compute_raw_metrics(frame_a, roi_spec=roi_spec, use_orb=quality_use_orb)
+                        raw_b = compute_raw_metrics(frame_b, roi_spec=roi_spec, use_orb=quality_use_orb)
+                        pair_entries.append(
+                            {
+                                "frame_idx": int(frame_idx),
+                                "timestamp": timestamp,
+                                "lens_a_raw": raw_a,
+                                "lens_b_raw": raw_b,
+                            }
+                        )
+                    else:
+                        quality_scores = self._compute_quality_score_pair(frame_a, frame_b)
+                        if bool(quality_scores.get('passes_threshold', False)):
+                            candidates.append({'frame_idx': frame_idx, 'quality_scores': quality_scores})
+                        self.stage1_quality_records.append(
+                            {
+                                "frame_index": int(frame_idx),
+                                "timestamp": timestamp,
+                                "quality": None,
+                                "is_pass": bool(quality_scores.get('passes_threshold', False)),
+                                "drop_reason": "pass" if bool(quality_scores.get('passes_threshold', False)) else "legacy_threshold",
+                                "legacy_quality_scores": dict(quality_scores),
+                            }
+                        )
 
                     if progress_callback:
                         progress_callback(idx + 1, len(frame_indices))
@@ -1778,73 +1833,234 @@ class KeyframeSelector:
                     cap_a.release()
                 if cap_b is not None:
                     cap_b.release()
+
+            if not quality_filter_enabled:
+                return candidates
+
+            raw_a_list = [entry["lens_a_raw"] for entry in pair_entries]
+            raw_b_list = [entry["lens_b_raw"] for entry in pair_entries]
+            norm_a_list, stats_a = normalize_batch_p10_p90(
+                raw_a_list,
+                p_low=quality_norm_p_low,
+                p_high=quality_norm_p_high,
+                fields=quality_fields,
+            )
+            norm_b_list, stats_b = normalize_batch_p10_p90(
+                raw_b_list,
+                p_low=quality_norm_p_low,
+                p_high=quality_norm_p_high,
+                fields=quality_fields,
+            )
+
+            for entry, norm_a, norm_b in zip(pair_entries, norm_a_list, norm_b_list):
+                frame_idx = int(entry["frame_idx"])
+                raw_a = entry["lens_a_raw"]
+                raw_b = entry["lens_b_raw"]
+                quality_a = compose_quality(norm_a, quality_weights)
+                quality_b = compose_quality(norm_b, quality_weights)
+                quality = float(min(quality_a, quality_b))
+
+                abs_ok_a = apply_abs_guard(raw_a.get("laplacian_var", 0.0), quality_abs_laplacian_min)
+                abs_ok_b = apply_abs_guard(raw_b.get("laplacian_var", 0.0), quality_abs_laplacian_min)
+                abs_ok = bool(abs_ok_a and abs_ok_b)
+                quality_ok = bool(quality >= quality_threshold)
+                passes = bool(quality_ok and abs_ok)
+                drop_reason = "pass"
+                if not abs_ok:
+                    drop_reason = "abs_laplacian_guard"
+                elif not quality_ok:
+                    drop_reason = "quality_below_threshold"
+
+                quality_scores = {
+                    "sharpness": float(min(raw_a.get("laplacian_var", 0.0), raw_b.get("laplacian_var", 0.0))),
+                    "exposure": float(min(raw_a.get("exposure", 0.0), raw_b.get("exposure", 0.0))),
+                    "motion_blur": 0.0,
+                    "softmax_depth": 0.0,
+                    "quality": quality,
+                    "quality_lens_a": quality_a,
+                    "quality_lens_b": quality_b,
+                    "lens_a": {
+                        "raw": dict(raw_a),
+                        "norm": {k: float(norm_a.get(f"norm_{k}", 0.0)) for k in quality_fields},
+                    },
+                    "lens_b": {
+                        "raw": dict(raw_b),
+                        "norm": {k: float(norm_b.get(f"norm_{k}", 0.0)) for k in quality_fields},
+                    },
+                    "passes_threshold": passes,
+                }
+                if passes:
+                    candidates.append({'frame_idx': frame_idx, 'quality_scores': quality_scores})
+
+                self.stage1_quality_records.append(
+                    {
+                        "frame_index": frame_idx,
+                        "timestamp": float(entry["timestamp"]),
+                        "quality": quality,
+                        "quality_lens_a": quality_a,
+                        "quality_lens_b": quality_b,
+                        "is_pass": passes,
+                        "drop_reason": drop_reason,
+                        "lens_a_raw": dict(raw_a),
+                        "lens_a_norm": {k: float(norm_a.get(f"norm_{k}", 0.0)) for k in quality_fields},
+                        "lens_b_raw": dict(raw_b),
+                        "lens_b_norm": {k: float(norm_b.get(f"norm_{k}", 0.0)) for k in quality_fields},
+                    }
+                )
+
+            if quality_debug:
+                passed_count = sum(1 for rec in self.stage1_quality_records if bool(rec.get("is_pass", False)))
+                qualities = np.asarray(
+                    [float(rec.get("quality", 0.0)) for rec in self.stage1_quality_records],
+                    dtype=np.float64,
+                )
+                q50 = float(np.median(qualities)) if qualities.size > 0 else 0.0
+                logger.info(
+                    "stage1_quality_debug,"
+                    f" mode=paired, records={len(self.stage1_quality_records)},"
+                    f" passed={passed_count}, pass_ratio={100.0*passed_count/max(len(self.stage1_quality_records), 1):.2f},"
+                    f" threshold={quality_threshold:.3f}, abs_laplacian_min={quality_abs_laplacian_min:.3f},"
+                    f" q50={q50:.4f}, roi={roi_spec.mode}:{roi_spec.ratio:.2f},"
+                    f" p_low={quality_norm_p_low:.1f}, p_high={quality_norm_p_high:.1f},"
+                    f" stats_a={stats_a}, stats_b={stats_b}"
+                )
             return candidates
 
-        # 単眼: 独立キャプチャ + 並列品質計算
         video_path = getattr(video_loader, "_video_path", None)
         if video_path is None:
             raise RuntimeError("単眼モードのビデオパスが取得できません")
 
+        mono_entries: List[Dict[str, Any]] = []
         cap = self._open_independent_capture(video_path)
         try:
-            num_batches = (len(frame_indices) + batch_size - 1) // batch_size
             last_read_idx = -1
             current_pos = -1
-
             if use_grab and frame_indices:
                 first_idx = frame_indices[0]
                 cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
                 current_pos = first_idx
 
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min((batch_idx + 1) * batch_size, len(frame_indices))
-                batch_indices = frame_indices[start_idx:end_idx]
-
-                frames = []
-                valid_indices = []
-                for frame_idx in batch_indices:
-                    if use_grab:
-                        while current_pos < frame_idx:
-                            ok = cap.grab()
-                            if not ok:
-                                break
-                            current_pos += 1
-
-                        if current_pos != frame_idx:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                            current_pos = frame_idx
-                    else:
-                        if frame_idx != last_read_idx + 1:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-
-                    ret, frame = cap.read()
-                    if use_grab:
+            for idx, frame_idx in enumerate(frame_indices):
+                if use_grab:
+                    while current_pos < frame_idx:
+                        ok = cap.grab()
+                        if not ok:
+                            break
                         current_pos += 1
-                    last_read_idx = frame_idx
-                    if ret and frame is not None:
-                        frames.append(frame)
-                        valid_indices.append(frame_idx)
-
-                if not frames:
+                    if current_pos != frame_idx:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        current_pos = frame_idx
+                else:
+                    if frame_idx != last_read_idx + 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if use_grab:
+                    current_pos += 1
+                last_read_idx = frame_idx
+                if not ret or frame is None:
                     continue
 
-                num_workers = min(self.accelerator.num_threads, len(frames))
-                with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                    quality_list = list(executor.map(self._compute_quality_score, frames))
-
-                for frame_idx, quality_scores in zip(valid_indices, quality_list):
-                    if quality_scores['sharpness'] >= self.config['LAPLACIAN_THRESHOLD'] and \
-                       quality_scores['motion_blur'] <= self.config['MOTION_BLUR_THRESHOLD'] and \
-                       quality_scores['exposure'] >= self.config['EXPOSURE_THRESHOLD']:
+                timestamp = float(frame_idx / max(fps, 1e-6))
+                if quality_filter_enabled:
+                    raw_metrics = compute_raw_metrics(frame, roi_spec=roi_spec, use_orb=quality_use_orb)
+                    mono_entries.append(
+                        {
+                            "frame_idx": int(frame_idx),
+                            "timestamp": timestamp,
+                            "raw": raw_metrics,
+                        }
+                    )
+                else:
+                    quality_scores = self._compute_quality_score(frame)
+                    passes = bool(
+                        quality_scores['sharpness'] >= self.config['LAPLACIAN_THRESHOLD'] and
+                        quality_scores['motion_blur'] <= self.config['MOTION_BLUR_THRESHOLD'] and
+                        quality_scores['exposure'] >= self.config['EXPOSURE_THRESHOLD']
+                    )
+                    quality_scores['passes_threshold'] = passes
+                    if passes:
                         candidates.append({'frame_idx': frame_idx, 'quality_scores': quality_scores})
+                    self.stage1_quality_records.append(
+                        {
+                            "frame_index": int(frame_idx),
+                            "timestamp": timestamp,
+                            "quality": None,
+                            "is_pass": passes,
+                            "drop_reason": "pass" if passes else "legacy_threshold",
+                            "legacy_quality_scores": dict(quality_scores),
+                        }
+                    )
 
                 if progress_callback:
-                    progress_callback(end_idx, len(frame_indices))
-
+                    progress_callback(idx + 1, len(frame_indices))
         finally:
             cap.release()
             logger.debug("Stage 1: 独立キャプチャを解放")
+
+        if not quality_filter_enabled:
+            return candidates
+
+        raw_list = [entry["raw"] for entry in mono_entries]
+        norm_list, stats = normalize_batch_p10_p90(
+            raw_list,
+            p_low=quality_norm_p_low,
+            p_high=quality_norm_p_high,
+            fields=quality_fields,
+        )
+        for entry, norm_rec in zip(mono_entries, norm_list):
+            frame_idx = int(entry["frame_idx"])
+            raw = entry["raw"]
+            quality = compose_quality(norm_rec, quality_weights)
+            abs_ok = apply_abs_guard(raw.get("laplacian_var", 0.0), quality_abs_laplacian_min)
+            quality_ok = bool(quality >= quality_threshold)
+            passes = bool(quality_ok and abs_ok)
+            drop_reason = "pass"
+            if not abs_ok:
+                drop_reason = "abs_laplacian_guard"
+            elif not quality_ok:
+                drop_reason = "quality_below_threshold"
+
+            quality_scores = {
+                "sharpness": float(raw.get("laplacian_var", 0.0)),
+                "exposure": float(raw.get("exposure", 0.0)),
+                "motion_blur": 0.0,
+                "softmax_depth": 0.0,
+                "quality": quality,
+                "raw_metrics": dict(raw),
+                "norm_metrics": {k: float(norm_rec.get(f"norm_{k}", 0.0)) for k in quality_fields},
+                "passes_threshold": passes,
+            }
+            if passes:
+                candidates.append({'frame_idx': frame_idx, 'quality_scores': quality_scores})
+
+            self.stage1_quality_records.append(
+                {
+                    "frame_index": frame_idx,
+                    "timestamp": float(entry["timestamp"]),
+                    "quality": quality,
+                    "is_pass": passes,
+                    "drop_reason": drop_reason,
+                    "raw_metrics": dict(raw),
+                    "norm_metrics": {k: float(norm_rec.get(f"norm_{k}", 0.0)) for k in quality_fields},
+                }
+            )
+
+        if quality_debug:
+            passed_count = sum(1 for rec in self.stage1_quality_records if bool(rec.get("is_pass", False)))
+            qualities = np.asarray(
+                [float(rec.get("quality", 0.0)) for rec in self.stage1_quality_records],
+                dtype=np.float64,
+            )
+            q50 = float(np.median(qualities)) if qualities.size > 0 else 0.0
+            logger.info(
+                "stage1_quality_debug,"
+                f" mode=mono, records={len(self.stage1_quality_records)},"
+                f" passed={passed_count}, pass_ratio={100.0*passed_count/max(len(self.stage1_quality_records), 1):.2f},"
+                f" threshold={quality_threshold:.3f}, abs_laplacian_min={quality_abs_laplacian_min:.3f},"
+                f" q50={q50:.4f}, roi={roi_spec.mode}:{roi_spec.ratio:.2f},"
+                f" p_low={quality_norm_p_low:.1f}, p_high={quality_norm_p_high:.1f},"
+                f" stats={stats}"
+            )
 
         return candidates
 

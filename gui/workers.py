@@ -45,6 +45,7 @@ class FrameScoreData:
     sharpness: float = 0.0
     exposure: float = 0.0
     motion_blur: float = 0.0
+    quality: float = 0.0
     gric: float = 0.0
     ssim: float = 1.0
     combined: float = 0.0
@@ -76,6 +77,12 @@ def _run_stage1_scan(
     on_progress_cb=None,
 ) -> List[FrameScoreData]:
     from core.quality_evaluator import QualityEvaluator
+    from core.quality_score import (
+        compose_quality,
+        compute_raw_metrics,
+        normalize_batch_p10_p90,
+        parse_roi_spec,
+    )
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -90,9 +97,39 @@ def _run_stage1_scan(
             eval_scale=stage1_eval_scale,
             motion_blur_method=str(config.get("MOTION_BLUR_METHOD", config.get("motion_blur_method", "legacy"))),
         )
+        quality_filter_enabled = bool(
+            config.get("QUALITY_FILTER_ENABLED", config.get("quality_filter_enabled", True))
+        )
+        quality_use_orb = bool(config.get("QUALITY_USE_ORB", config.get("quality_use_orb", True)))
+        quality_norm_p_low = float(
+            config.get("QUALITY_NORM_P_LOW", config.get("quality_norm_p_low", 10.0))
+        )
+        quality_norm_p_high = float(
+            config.get("QUALITY_NORM_P_HIGH", config.get("quality_norm_p_high", 90.0))
+        )
+        roi_mode = str(config.get("QUALITY_ROI_MODE", config.get("quality_roi_mode", "circle"))).strip().lower()
+        roi_ratio = float(config.get("QUALITY_ROI_RATIO", config.get("quality_roi_ratio", 0.40)))
+        quality_weights = {
+            "quality_weight_sharpness": float(
+                config.get("QUALITY_WEIGHT_SHARPNESS", config.get("quality_weight_sharpness", 0.40))
+            ),
+            "quality_weight_tenengrad": float(
+                config.get("QUALITY_WEIGHT_TENENGRAD", config.get("quality_weight_tenengrad", 0.30))
+            ),
+            "quality_weight_exposure": float(
+                config.get("QUALITY_WEIGHT_EXPOSURE", config.get("quality_weight_exposure", 0.15))
+            ),
+            "quality_weight_keypoints": float(
+                config.get("QUALITY_WEIGHT_KEYPOINTS", config.get("quality_weight_keypoints", 0.15))
+            ),
+        }
+        roi_spec = parse_roi_spec(f"{roi_mode}:{roi_ratio}")
+        quality_fields = ("laplacian_var", "tenengrad", "exposure", "orb_keypoints")
+        orb_obj = cv2.ORB_create(nfeatures=2000) if quality_use_orb else None
 
         all_scores: List[FrameScoreData] = []
         batch: List[FrameScoreData] = []
+        quality_records: List[dict] = []
         batch_size = int(config.get('STAGE1_BATCH_SIZE', 32))
         frame_indices = list(range(0, total_frames, sample_interval))
         grab_threshold = int(config.get('stage1_grab_threshold', config.get('STAGE1_GRAB_THRESHOLD', 30)))
@@ -129,23 +166,65 @@ def _run_stage1_scan(
             if not ret or frame is None:
                 continue
 
-            scores = evaluator.evaluate_stage1_fast(frame)
-            fsd = FrameScoreData(
-                frame_index=frame_idx,
-                timestamp=frame_idx / fps,
-                sharpness=scores.get('sharpness', 0.0),
-                exposure=scores.get('exposure', 0.0),
-                motion_blur=scores.get('motion_blur', 0.0),
-            )
-            all_scores.append(fsd)
-            batch.append(fsd)
+            if quality_filter_enabled:
+                raw = compute_raw_metrics(
+                    frame,
+                    roi_spec=roi_spec,
+                    use_orb=quality_use_orb,
+                    orb=orb_obj,
+                )
+                quality_records.append(
+                    {
+                        "frame_index": int(frame_idx),
+                        "timestamp": float(frame_idx / fps),
+                        "raw_metrics": raw,
+                    }
+                )
+            else:
+                scores = evaluator.evaluate_stage1_fast(frame)
+                fsd = FrameScoreData(
+                    frame_index=frame_idx,
+                    timestamp=frame_idx / fps,
+                    sharpness=scores.get('sharpness', 0.0),
+                    exposure=scores.get('exposure', 0.0),
+                    motion_blur=scores.get('motion_blur', 0.0),
+                    quality=0.0,
+                )
+                all_scores.append(fsd)
+                batch.append(fsd)
 
-            if len(batch) >= batch_size:
-                if on_batch_cb is not None:
-                    on_batch_cb(list(batch))
-                batch.clear()
+                if len(batch) >= batch_size:
+                    if on_batch_cb is not None:
+                        on_batch_cb(list(batch))
+                    batch.clear()
             if on_progress_cb is not None:
                 on_progress_cb(count + 1, len(frame_indices))
+
+        if quality_filter_enabled:
+            raw_only = [item["raw_metrics"] for item in quality_records]
+            norm_list, _stats = normalize_batch_p10_p90(
+                raw_only,
+                p_low=quality_norm_p_low,
+                p_high=quality_norm_p_high,
+                fields=quality_fields,
+            )
+            for item, norm in zip(quality_records, norm_list):
+                raw = item["raw_metrics"]
+                q = compose_quality(norm, quality_weights)
+                fsd = FrameScoreData(
+                    frame_index=int(item["frame_index"]),
+                    timestamp=float(item["timestamp"]),
+                    sharpness=float(raw.get("laplacian_var", 0.0)),
+                    exposure=float(raw.get("exposure", 0.0)),
+                    motion_blur=0.0,
+                    quality=float(q),
+                )
+                all_scores.append(fsd)
+                batch.append(fsd)
+                if len(batch) >= batch_size:
+                    if on_batch_cb is not None:
+                        on_batch_cb(list(batch))
+                    batch.clear()
 
         if batch and on_batch_cb is not None:
             on_batch_cb(list(batch))
@@ -363,6 +442,7 @@ class Stage2Worker(QThread):
                     sharpness=s1.sharpness,
                     exposure=s1.exposure,
                     motion_blur=s1.motion_blur,
+                    quality=s1.quality,
                 )
                 m = metrics_map.get(s1.frame_index, {})
                 p = pose_map.get(s1.frame_index, {})
@@ -574,6 +654,7 @@ class UnifiedAnalysisWorker(QThread):
                     sharpness=s1.sharpness,
                     exposure=s1.exposure,
                     motion_blur=s1.motion_blur,
+                    quality=s1.quality,
                 )
                 m = metrics_map.get(s1.frame_index, {})
                 p = pose_map.get(s1.frame_index, {})

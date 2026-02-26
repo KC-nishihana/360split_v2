@@ -269,6 +269,26 @@ class SettingsDialog(QDialog):
         adaptive_group.setLayout(adaptive_layout)
         layout.addWidget(adaptive_group)
 
+        # === 品質フィルタ（A案） ===
+        quality_filter_group = QGroupBox("品質フィルタ（ROI + 正規化）")
+        quality_filter_layout = QGridLayout()
+
+        self.quality_filter_enabled = QCheckBox("品質フィルタを有効化")
+        self.quality_filter_enabled.setChecked(bool(self.settings.get("quality_filter_enabled", True)))
+        quality_filter_layout.addWidget(self.quality_filter_enabled, 0, 0, 1, 2)
+
+        quality_filter_layout.addWidget(QLabel("品質しきい値 (0.0-1.0):"), 1, 0)
+        self.quality_threshold = QDoubleSpinBox()
+        self.quality_threshold.setMinimum(0.0)
+        self.quality_threshold.setMaximum(1.0)
+        self.quality_threshold.setSingleStep(0.05)
+        self.quality_threshold.setDecimals(2)
+        self.quality_threshold.setValue(float(self.settings.get("quality_threshold", 0.50)))
+        quality_filter_layout.addWidget(self.quality_threshold, 1, 1)
+
+        quality_filter_group.setLayout(quality_filter_layout)
+        layout.addWidget(quality_filter_group)
+
         # === GRIC パラメータ ===
         gric_group = QGroupBox("GRIC (幾何学的評価)")
         gric_layout = QGridLayout()
@@ -1047,6 +1067,19 @@ class SettingsDialog(QDialog):
             'dynamic_mask_inpaint_module': '',
             'stage1_grab_threshold': 30,
             'stage1_eval_scale': 0.5,
+            'quality_filter_enabled': True,
+            'quality_threshold': 0.50,
+            'quality_roi_mode': 'circle',
+            'quality_roi_ratio': 0.40,
+            'quality_abs_laplacian_min': 35.0,
+            'quality_use_orb': True,
+            'quality_weight_sharpness': 0.40,
+            'quality_weight_tenengrad': 0.30,
+            'quality_weight_exposure': 0.15,
+            'quality_weight_keypoints': 0.15,
+            'quality_norm_p_low': 10.0,
+            'quality_norm_p_high': 90.0,
+            'quality_debug': False,
             'enable_stage0_scan': True,
             'stage0_stride': 5,
             'enable_stage3_refinement': True,
@@ -1089,6 +1122,8 @@ class SettingsDialog(QDialog):
             'weight_geometric': self.geometric_weight_slider.value() / 100,
             'weight_content': self.content_weight_slider.value() / 100,
             'ssim_threshold': self.ssim_threshold.value(),
+            'quality_filter_enabled': self.quality_filter_enabled.isChecked(),
+            'quality_threshold': self.quality_threshold.value(),
             'min_keyframe_interval': self.min_keyframe_interval.value(),
             'max_keyframe_interval': self.max_keyframe_interval.value(),
             'softmax_beta': self.softmax_beta.value(),
@@ -1252,6 +1287,8 @@ class SettingsDialog(QDialog):
             self.ssim_threshold.setValue(
                 params.get('ssim_threshold', 0.85)
             )
+            self.quality_filter_enabled.setChecked(bool(params.get('quality_filter_enabled', True)))
+            self.quality_threshold.setValue(float(params.get('quality_threshold', 0.50)))
             self.min_keyframe_interval.setValue(
                 params.get('min_keyframe_interval', 5)
             )
@@ -1368,6 +1405,8 @@ class SettingsDialog(QDialog):
             self.geometric_weight_slider.setValue(int(0.30 * 100))
             self.content_weight_slider.setValue(int(0.25 * 100))
             self.ssim_threshold.setValue(0.85)
+            self.quality_filter_enabled.setChecked(True)
+            self.quality_threshold.setValue(0.50)
             self.min_keyframe_interval.setValue(5)
             self.max_keyframe_interval.setValue(60)
             self.softmax_beta.setValue(5.0)

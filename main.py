@@ -218,6 +218,36 @@ def parse_arguments():
         help="Stage1品質評価の縮小スケール（0.1-1.0）"
     )
     parser.add_argument(
+        "--quality-filter",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stage1品質フィルタ（ROI+分位点正規化）を有効化/無効化"
+    )
+    parser.add_argument(
+        "--quality-threshold",
+        type=float,
+        default=None,
+        help="品質スコアしきい値（0.0-1.0）"
+    )
+    parser.add_argument(
+        "--quality-roi",
+        type=str,
+        default=None,
+        help="品質評価ROI（例: circle:0.40 / rect:0.60）"
+    )
+    parser.add_argument(
+        "--quality-abs-laplacian-min",
+        type=float,
+        default=None,
+        help="品質フィルタの絶対ラプラシアン下限"
+    )
+    parser.add_argument(
+        "--quality-debug",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="品質フィルタのデバッグ統計ログを有効化/無効化"
+    )
+    parser.add_argument(
         "--disable-stage3-refinement",
         action="store_true",
         default=False,
@@ -503,6 +533,30 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["stage1_grab_threshold"] = max(1, int(args.stage1_grab_threshold))
     if args.stage1_eval_scale is not None:
         config["stage1_eval_scale"] = float(max(0.1, min(1.0, args.stage1_eval_scale)))
+    if args.quality_filter is not None:
+        config["quality_filter_enabled"] = bool(args.quality_filter)
+    if args.quality_threshold is not None:
+        config["quality_threshold"] = float(max(0.0, min(1.0, args.quality_threshold)))
+    if args.quality_roi:
+        roi_text = str(args.quality_roi).strip().lower()
+        if ":" in roi_text:
+            mode, ratio_text = roi_text.split(":", 1)
+            try:
+                ratio = float(ratio_text.strip())
+            except (TypeError, ValueError):
+                ratio = float(config.get("quality_roi_ratio", 0.40))
+            mode = mode.strip()
+        else:
+            mode = roi_text
+            ratio = float(config.get("quality_roi_ratio", 0.40))
+        if mode not in {"circle", "rect"}:
+            mode = "circle"
+        config["quality_roi_mode"] = mode
+        config["quality_roi_ratio"] = float(max(0.05, min(1.0, ratio)))
+    if args.quality_abs_laplacian_min is not None:
+        config["quality_abs_laplacian_min"] = float(max(0.0, args.quality_abs_laplacian_min))
+    if args.quality_debug is not None:
+        config["quality_debug"] = bool(args.quality_debug)
     if args.disable_stage3_refinement:
         config["enable_stage3_refinement"] = False
     if args.stage3_weight_base is not None:
@@ -753,6 +807,83 @@ def write_vo_diagnostics(output_dir: Path, frame_metrics_records: List[Dict[str,
     return diagnostics_path, trajectory_path, diagnostics
 
 
+def summarize_quality_records(quality_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total = int(len(quality_records))
+    passed = 0
+    reasons: Counter = Counter()
+    quality_vals: List[float] = []
+    for rec in quality_records:
+        is_pass = bool(rec.get("is_pass", False))
+        passed += 1 if is_pass else 0
+        reason = str(rec.get("drop_reason", "unknown"))
+        reasons[reason] += 1
+        q = rec.get("quality")
+        if isinstance(q, (int, float)):
+            quality_vals.append(float(q))
+    quality_arr = np.asarray(quality_vals, dtype=np.float64) if quality_vals else np.zeros(0, dtype=np.float64)
+    summary = {
+        "total_records": total,
+        "passed_records": int(passed),
+        "pass_ratio": float(passed / max(total, 1)),
+        "drop_reason_counts": dict(reasons),
+        "quality_min": float(np.min(quality_arr)) if quality_arr.size > 0 else None,
+        "quality_max": float(np.max(quality_arr)) if quality_arr.size > 0 else None,
+        "quality_median": float(np.median(quality_arr)) if quality_arr.size > 0 else None,
+    }
+    return summary
+
+
+def write_quality_metrics(output_dir: Path, quality_records: List[Dict[str, Any]]) -> Tuple[Path, Path, Dict[str, Any]]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary = summarize_quality_records(quality_records)
+
+    json_path = output_dir / "quality_metrics.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "records": quality_records}, f, ensure_ascii=False, indent=2)
+
+    csv_path = output_dir / "quality_metrics.csv"
+    fieldnames = [
+        "frame_index",
+        "timestamp",
+        "quality",
+        "quality_lens_a",
+        "quality_lens_b",
+        "is_pass",
+        "drop_reason",
+        "raw_metrics",
+        "norm_metrics",
+        "lens_a_raw",
+        "lens_a_norm",
+        "lens_b_raw",
+        "lens_b_norm",
+        "legacy_quality_scores",
+    ]
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in quality_records:
+            writer.writerow(
+                {
+                    "frame_index": int(rec.get("frame_index", 0)),
+                    "timestamp": rec.get("timestamp"),
+                    "quality": rec.get("quality"),
+                    "quality_lens_a": rec.get("quality_lens_a"),
+                    "quality_lens_b": rec.get("quality_lens_b"),
+                    "is_pass": bool(rec.get("is_pass", False)),
+                    "drop_reason": str(rec.get("drop_reason", "")),
+                    "raw_metrics": json.dumps(rec.get("raw_metrics", {}), ensure_ascii=False, sort_keys=True),
+                    "norm_metrics": json.dumps(rec.get("norm_metrics", {}), ensure_ascii=False, sort_keys=True),
+                    "lens_a_raw": json.dumps(rec.get("lens_a_raw", {}), ensure_ascii=False, sort_keys=True),
+                    "lens_a_norm": json.dumps(rec.get("lens_a_norm", {}), ensure_ascii=False, sort_keys=True),
+                    "lens_b_raw": json.dumps(rec.get("lens_b_raw", {}), ensure_ascii=False, sort_keys=True),
+                    "lens_b_norm": json.dumps(rec.get("lens_b_norm", {}), ensure_ascii=False, sort_keys=True),
+                    "legacy_quality_scores": json.dumps(rec.get("legacy_quality_scores", {}), ensure_ascii=False, sort_keys=True),
+                }
+            )
+
+    return json_path, csv_path, summary
+
+
 def _normalize_path_value(raw_path: object) -> str:
     s = str(raw_path or "").strip()
     if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
@@ -907,6 +1038,14 @@ def run_cli(args):
         f"stage0={'ON' if config.get('enable_stage0_scan', True) else 'OFF'} "
         f"(stride={config.get('stage0_stride', 5)}), "
         f"stage3={'ON' if config.get('enable_stage3_refinement', True) else 'OFF'}"
+    )
+    logger.info(
+        "品質フィルタ: "
+        f"{'ON' if bool(config.get('quality_filter_enabled', True)) else 'OFF'} "
+        f"(threshold={float(config.get('quality_threshold', 0.50)):.2f}, "
+        f"roi={str(config.get('quality_roi_mode', 'circle'))}:{float(config.get('quality_roi_ratio', 0.40)):.2f}, "
+        f"abs_lap_min={float(config.get('quality_abs_laplacian_min', 35.0)):.1f}, "
+        f"orb={'ON' if bool(config.get('quality_use_orb', True)) else 'OFF'})"
     )
     logger.info("-" * 60)
 
@@ -1241,6 +1380,17 @@ def run_cli(args):
         logger.info(f"  [{i+1}/{len(keyframes)}] Frame {kf.frame_index:6d}{suffix_str} | "
                     f"Time {kf.timestamp:7.2f}s | Score {kf.combined_score:.3f}")
 
+    quality_records = list(getattr(selector, "stage1_quality_records", []) or [])
+    quality_summary = summarize_quality_records(quality_records) if quality_records else {
+        "total_records": 0,
+        "passed_records": 0,
+        "pass_ratio": 0.0,
+        "drop_reason_counts": {},
+        "quality_min": None,
+        "quality_max": None,
+        "quality_median": None,
+    }
+
     # メタデータ出力
     metadata = {
         "video_path": str(Path(video_path).resolve()),
@@ -1255,6 +1405,26 @@ def run_cli(args):
             "rear": summarize_calibration(calibration_from_dict(calibration_runtime.get("rear"))),
         },
         "keyframe_count": len(keyframes),
+        "quality_filter": {
+            "enabled": bool(config.get("quality_filter_enabled", True)),
+            "threshold": float(config.get("quality_threshold", 0.50)),
+            "roi_mode": str(config.get("quality_roi_mode", "circle")),
+            "roi_ratio": float(config.get("quality_roi_ratio", 0.40)),
+            "abs_laplacian_min": float(config.get("quality_abs_laplacian_min", 35.0)),
+            "use_orb": bool(config.get("quality_use_orb", True)),
+            "weights": {
+                "sharpness": float(config.get("quality_weight_sharpness", 0.40)),
+                "tenengrad": float(config.get("quality_weight_tenengrad", 0.30)),
+                "exposure": float(config.get("quality_weight_exposure", 0.15)),
+                "keypoints": float(config.get("quality_weight_keypoints", 0.15)),
+            },
+            "norm_percentiles": {
+                "p_low": float(config.get("quality_norm_p_low", 10.0)),
+                "p_high": float(config.get("quality_norm_p_high", 90.0)),
+            },
+            "debug": bool(config.get("quality_debug", False)),
+        },
+        "quality_summary": round_json_friendly(quality_summary),
         "settings": config,
         "keyframes": [
             {
@@ -1273,6 +1443,16 @@ def run_cli(args):
     metadata_path = output_dir / "keyframe_metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
+    if quality_records:
+        quality_json_path, quality_csv_path, quality_diag = write_quality_metrics(output_dir, quality_records)
+        logger.info(f"品質メトリクス(JSON): {quality_json_path}")
+        logger.info(f"品質メトリクス(CSV): {quality_csv_path}")
+        logger.info(
+            "品質 summary: "
+            f"total={quality_diag['total_records']}, "
+            f"passed={quality_diag['passed_records']}, "
+            f"pass_ratio={quality_diag['pass_ratio']:.3f}"
+        )
     if frame_metrics_records:
         frame_metrics_path = output_dir / "frame_metrics.json"
         with open(frame_metrics_path, "w", encoding="utf-8") as f:

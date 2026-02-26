@@ -219,6 +219,18 @@ class SettingsPanel(QWidget):
         self._motion_blur_th.valueChanged.connect(self._on_live_change)
         sl.addWidget(self._motion_blur_th)
 
+        self._quality_filter_enabled = QCheckBox("品質フィルタを有効化")
+        self._quality_filter_enabled.setChecked(self._config.selection.quality_filter_enabled)
+        self._quality_filter_enabled.toggled.connect(self._on_live_change)
+        sl.addWidget(self._quality_filter_enabled)
+
+        self._quality_threshold = _LinkedSliderSpin(
+            "品質しきい値:", 0.0, 1.0,
+            self._config.selection.quality_threshold,
+        )
+        self._quality_threshold.valueChanged.connect(self._on_live_change)
+        sl.addWidget(self._quality_threshold)
+
         # 最小/最大キーフレーム間隔 (整数)
         interval_row = QHBoxLayout()
         interval_row.addWidget(QLabel("KF間隔 (min/max):"))
@@ -356,6 +368,8 @@ class SettingsPanel(QWidget):
             self._laplacian_th,
             self._ssim_th,
             self._motion_blur_th,
+            self._quality_filter_enabled,
+            self._quality_threshold,
             self._min_interval,
             self._max_interval,
             self._gric_ratio,
@@ -390,6 +404,8 @@ class SettingsPanel(QWidget):
         c.selection.laplacian_threshold = self._laplacian_th.value()
         c.selection.ssim_change_threshold = self._ssim_th.value()
         c.selection.motion_blur_threshold = self._motion_blur_th.value()
+        c.selection.quality_filter_enabled = self._quality_filter_enabled.isChecked()
+        c.selection.quality_threshold = self._quality_threshold.value()
         c.selection.min_keyframe_interval = self._min_interval.value()
         c.selection.max_keyframe_interval = self._max_interval.value()
 
@@ -470,6 +486,8 @@ class SettingsPanel(QWidget):
         self._laplacian_th.setValue(c.selection.laplacian_threshold)
         self._ssim_th.setValue(c.selection.ssim_change_threshold)
         self._motion_blur_th.setValue(c.selection.motion_blur_threshold)
+        self._quality_filter_enabled.setChecked(c.selection.quality_filter_enabled)
+        self._quality_threshold.setValue(c.selection.quality_threshold)
         self._min_interval.setValue(c.selection.min_keyframe_interval)
         self._max_interval.setValue(c.selection.max_keyframe_interval)
 
@@ -551,6 +569,8 @@ class SettingsPanel(QWidget):
             self._laplacian_th.setValue(params.get('laplacian_threshold', 100.0))
             self._ssim_th.setValue(params.get('ssim_threshold', 0.85))
             self._motion_blur_th.setValue(params.get('motion_blur_threshold', 0.3))
+            self._quality_filter_enabled.setChecked(bool(params.get('quality_filter_enabled', True)))
+            self._quality_threshold.setValue(float(params.get('quality_threshold', 0.50)))
             self._min_interval.setValue(params.get('min_keyframe_interval', 5))
             self._max_interval.setValue(params.get('max_keyframe_interval', 60))
 
@@ -607,6 +627,8 @@ class SettingsPanel(QWidget):
         self._laplacian_th.setValue(d.selection.laplacian_threshold)
         self._ssim_th.setValue(d.selection.ssim_change_threshold)
         self._motion_blur_th.setValue(d.selection.motion_blur_threshold)
+        self._quality_filter_enabled.setChecked(d.selection.quality_filter_enabled)
+        self._quality_threshold.setValue(d.selection.quality_threshold)
         self._min_interval.setValue(d.selection.min_keyframe_interval)
         self._max_interval.setValue(d.selection.max_keyframe_interval)
         self._gric_ratio.setValue(d.gric.degeneracy_threshold)

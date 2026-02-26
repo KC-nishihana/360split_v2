@@ -611,6 +611,9 @@ class MainWindow(QMainWindow):
         if not self._stage1_scores:
             return
 
+        quality_enabled = bool(config_dict.get('QUALITY_FILTER_ENABLED', True))
+        quality_th = float(config_dict.get('QUALITY_THRESHOLD', 0.50))
+        abs_lap_min = float(config_dict.get('QUALITY_ABS_LAPLACIAN_MIN', 35.0))
         lap_th = config_dict.get('LAPLACIAN_THRESHOLD', 100.0)
         blur_th = config_dict.get('MOTION_BLUR_THRESHOLD', 0.3)
         min_interval = config_dict.get('MIN_KEYFRAME_INTERVAL', 5)
@@ -619,19 +622,25 @@ class MainWindow(QMainWindow):
         candidates = []
         last_kf = -min_interval
         for s in self._stage1_scores:
-            if s.sharpness >= lap_th and s.motion_blur <= blur_th:
-                if s.frame_index - last_kf >= min_interval:
-                    candidates.append(s.frame_index)
-                    last_kf = s.frame_index
+            if quality_enabled:
+                q = float(getattr(s, "quality", 0.0))
+                lap = float(getattr(s, "sharpness", 0.0))
+                passes = bool(q >= quality_th and lap >= abs_lap_min)
+            else:
+                passes = bool(s.sharpness >= lap_th and s.motion_blur <= blur_th)
+            if not passes:
+                continue
+            if s.frame_index - last_kf >= min_interval:
+                candidates.append(s.frame_index)
+                last_kf = s.frame_index
 
         # マーカーだけ更新（スコアは仮に0.5）
         scores = [0.5] * len(candidates)
         self.timeline.set_keyframes(candidates, scores)
         self.video_player.set_keyframe_indices(candidates)
 
-        self.statusBar().showMessage(
-            f"Live Preview: {len(candidates)} フレームが閾値を通過"
-        )
+        mode_text = f"quality>={quality_th:.2f}" if quality_enabled else f"lap>={lap_th:.1f}, blur<={blur_th:.2f}"
+        self.statusBar().showMessage(f"Live Preview: {len(candidates)} フレームが閾値を通過 ({mode_text})")
 
     @staticmethod
     def _extract_stationary_ranges(scores: List[FrameScoreData]) -> List[tuple[int, int]]:

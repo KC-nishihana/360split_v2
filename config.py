@@ -75,6 +75,19 @@ class SelectionConfig:
     laplacian_threshold: float = 100.0  # Stage 1 鮮明度閾値
     motion_blur_threshold: float = 0.3  # モーションブラー許容閾値
     exposure_threshold: float = 0.35    # 露光スコア最小閾値
+    quality_filter_enabled: bool = True
+    quality_threshold: float = 0.50
+    quality_roi_mode: str = "circle"
+    quality_roi_ratio: float = 0.40
+    quality_abs_laplacian_min: float = 35.0
+    quality_use_orb: bool = True
+    quality_weight_sharpness: float = 0.40
+    quality_weight_tenengrad: float = 0.30
+    quality_weight_exposure: float = 0.15
+    quality_weight_keypoints: float = 0.15
+    quality_norm_p_low: float = 10.0
+    quality_norm_p_high: float = 90.0
+    quality_debug: bool = False
     ssim_change_threshold: float = 0.85  # SSIM変化検知閾値
     softmax_beta: float = 5.0           # Softmax温度パラメータ
     nms_time_window: float = 1.0        # NMS時間ウィンドウ（秒）
@@ -192,6 +205,19 @@ class KeyframeConfig:
             'SSIM_CHANGE_THRESHOLD': self.selection.ssim_change_threshold,
             'MOTION_BLUR_THRESHOLD': self.selection.motion_blur_threshold,
             'EXPOSURE_THRESHOLD': self.selection.exposure_threshold,
+            'QUALITY_FILTER_ENABLED': self.selection.quality_filter_enabled,
+            'QUALITY_THRESHOLD': self.selection.quality_threshold,
+            'QUALITY_ROI_MODE': self.selection.quality_roi_mode,
+            'QUALITY_ROI_RATIO': self.selection.quality_roi_ratio,
+            'QUALITY_ABS_LAPLACIAN_MIN': self.selection.quality_abs_laplacian_min,
+            'QUALITY_USE_ORB': self.selection.quality_use_orb,
+            'QUALITY_WEIGHT_SHARPNESS': self.selection.quality_weight_sharpness,
+            'QUALITY_WEIGHT_TENENGRAD': self.selection.quality_weight_tenengrad,
+            'QUALITY_WEIGHT_EXPOSURE': self.selection.quality_weight_exposure,
+            'QUALITY_WEIGHT_KEYPOINTS': self.selection.quality_weight_keypoints,
+            'QUALITY_NORM_P_LOW': self.selection.quality_norm_p_low,
+            'QUALITY_NORM_P_HIGH': self.selection.quality_norm_p_high,
+            'QUALITY_DEBUG': self.selection.quality_debug,
             'MIN_FEATURE_MATCHES': self.gric.min_matches,
             'STATIONARY_ENABLE': self.selection.stationary_enable,
             'STATIONARY_MIN_DURATION_SEC': self.selection.stationary_min_duration_sec,
@@ -292,6 +318,21 @@ class KeyframeConfig:
         config.selection.laplacian_threshold = float(normalized.get('laplacian_threshold', config.selection.laplacian_threshold))
         config.selection.motion_blur_threshold = float(normalized.get('motion_blur_threshold', config.selection.motion_blur_threshold))
         config.selection.exposure_threshold = float(normalized.get('exposure_threshold', config.selection.exposure_threshold))
+        config.selection.quality_filter_enabled = bool(normalized.get('quality_filter_enabled', config.selection.quality_filter_enabled))
+        config.selection.quality_threshold = float(np.clip(normalized.get('quality_threshold', config.selection.quality_threshold), 0.0, 1.0))
+        config.selection.quality_roi_mode = str(normalized.get('quality_roi_mode', config.selection.quality_roi_mode) or "circle").strip().lower()
+        if config.selection.quality_roi_mode not in {"circle", "rect"}:
+            config.selection.quality_roi_mode = "circle"
+        config.selection.quality_roi_ratio = float(np.clip(normalized.get('quality_roi_ratio', config.selection.quality_roi_ratio), 0.05, 1.0))
+        config.selection.quality_abs_laplacian_min = float(max(0.0, normalized.get('quality_abs_laplacian_min', config.selection.quality_abs_laplacian_min)))
+        config.selection.quality_use_orb = bool(normalized.get('quality_use_orb', config.selection.quality_use_orb))
+        config.selection.quality_weight_sharpness = float(max(0.0, normalized.get('quality_weight_sharpness', config.selection.quality_weight_sharpness)))
+        config.selection.quality_weight_tenengrad = float(max(0.0, normalized.get('quality_weight_tenengrad', config.selection.quality_weight_tenengrad)))
+        config.selection.quality_weight_exposure = float(max(0.0, normalized.get('quality_weight_exposure', config.selection.quality_weight_exposure)))
+        config.selection.quality_weight_keypoints = float(max(0.0, normalized.get('quality_weight_keypoints', config.selection.quality_weight_keypoints)))
+        config.selection.quality_norm_p_low = float(np.clip(normalized.get('quality_norm_p_low', config.selection.quality_norm_p_low), 0.0, 100.0))
+        config.selection.quality_norm_p_high = float(np.clip(normalized.get('quality_norm_p_high', config.selection.quality_norm_p_high), config.selection.quality_norm_p_low, 100.0))
+        config.selection.quality_debug = bool(normalized.get('quality_debug', config.selection.quality_debug))
         config.selection.stationary_enable = bool(normalized.get('stationary_enable', config.selection.stationary_enable))
         config.selection.stationary_min_duration_sec = float(normalized.get(
             'stationary_min_duration_sec', config.selection.stationary_min_duration_sec
@@ -446,6 +487,19 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'laplacian_threshold': 'LAPLACIAN_THRESHOLD',
     'motion_blur_threshold': 'MOTION_BLUR_THRESHOLD',
     'exposure_threshold': 'EXPOSURE_THRESHOLD',
+    'quality_filter_enabled': 'QUALITY_FILTER_ENABLED',
+    'quality_threshold': 'QUALITY_THRESHOLD',
+    'quality_roi_mode': 'QUALITY_ROI_MODE',
+    'quality_roi_ratio': 'QUALITY_ROI_RATIO',
+    'quality_abs_laplacian_min': 'QUALITY_ABS_LAPLACIAN_MIN',
+    'quality_use_orb': 'QUALITY_USE_ORB',
+    'quality_weight_sharpness': 'QUALITY_WEIGHT_SHARPNESS',
+    'quality_weight_tenengrad': 'QUALITY_WEIGHT_TENENGRAD',
+    'quality_weight_exposure': 'QUALITY_WEIGHT_EXPOSURE',
+    'quality_weight_keypoints': 'QUALITY_WEIGHT_KEYPOINTS',
+    'quality_norm_p_low': 'QUALITY_NORM_P_LOW',
+    'quality_norm_p_high': 'QUALITY_NORM_P_HIGH',
+    'quality_debug': 'QUALITY_DEBUG',
     'min_keyframe_interval': 'MIN_KEYFRAME_INTERVAL',
     'max_keyframe_interval': 'MAX_KEYFRAME_INTERVAL',
     'softmax_beta': 'SOFTMAX_BETA',

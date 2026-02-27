@@ -2,7 +2,7 @@
 
 360度動画から、SfM/フォトグラメトリ/3D Gaussian Splatting (3DGS) 向けフレームを抽出する GUI/CLI ツールです。
 
-`Stage0 -> Stage1 -> Stage2 -> Stage3` の統合パイプラインで、
+`Stage1 -> Stage0 -> Stage2 -> Stage3` の統合パイプラインで、
 品質・幾何・運動の観点からキーフレームを選別します。
 
 ## 2026-02 主要アップデート
@@ -184,6 +184,13 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 | `--stage0-stride N` | Stage0サンプリング間隔 |
 | `--stage1-grab-threshold N` | Stage1 grab切替閾値 |
 | `--stage1-eval-scale F` | Stage1評価縮小率 |
+| `--opencv-threads N` | OpenCVスレッド数（0=auto） |
+| `--stage1-process-workers N` | Stage1品質計算プロセス数（0=auto） |
+| `--stage1-prefetch-size N` | Stage1先読みキューサイズ |
+| `--stage1-metrics-batch-size N` | Stage1品質計算バッチサイズ |
+| `--stage1-gpu-batch / --no-stage1-gpu-batch` | Stage1 GPUバッチ品質計算 ON/OFF |
+| `--darwin-capture-backend {auto,avfoundation,ffmpeg}` | macOS VideoCaptureバックエンド指定 |
+| `--mps-min-pixels N` | MPS経路を使う最小画素数 |
 | `--quality-filter / --no-quality-filter` | A案品質フィルタ ON/OFF |
 | `--quality-threshold F` | 品質しきい値 |
 | `--quality-roi SPEC` | `circle:0.40` / `rect:0.60` |
@@ -233,6 +240,10 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 | `--vo-adaptive-roi / --no-vo-adaptive-roi` | VO ROI動的調整 |
 | `--vo-fast-fail-inlier-ratio F` | VO早期失敗比率 |
 | `--vo-step-proxy-clip-px F` | VO step_proxy上限 |
+| `--vo-essential-method {auto,ransac,magsac}` | Essential推定法 |
+| `--vo-subpixel-refine / --no-vo-subpixel-refine` | サブピクセル補正ON/OFF |
+| `--vo-adaptive-subsample / --no-vo-adaptive-subsample` | VO動的サブサンプリングON/OFF |
+| `--vo-subsample-min N` | 動的サブサンプル時の最小間引き |
 
 ### Rerun
 
@@ -265,6 +276,9 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 - `quality_metrics.json`（全Stage1サンプル）
 - `quality_metrics.csv`（全Stage1サンプル）
 
+`vo_trajectory.csv` は `vo_confidence` 列を含みます。  
+`vo_diagnostics.json` は `vo_confidence_mean/p10/p50/p90` を含みます。
+
 `quality_metrics.*` の各レコードには少なくとも次を含みます。
 
 - `frame_index`, `timestamp`
@@ -273,11 +287,14 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 - ペア: `quality_lens_a`, `quality_lens_b`, `lens_a_*`, `lens_b_*`
 - 品質フィルタ無効時: `legacy_quality_scores`
 
+解析中間結果は `~/.360split/tmp_runs/<analysis_run_id>/` に `*.jsonl` で段階保存されます。
+正常終了時は自動削除、失敗時は保持されます。
+
 ## パイプライン概要
 
 ```text
-Stage0: 軽量走査（flow/ssim + VO補助）
-  -> Stage1: 品質フィルタ（A案）
+Stage1: 品質フィルタ（A案）
+  -> Stage0: 軽量走査（flow/ssim + VO補助）
       -> Stage2: 幾何+適応評価
           -> Stage3: 軌跡再評価・再スコア
               -> NMS/間隔補完 -> 出力
@@ -303,7 +320,13 @@ Stage0: 軽量走査（flow/ssim + VO補助）
   "quality_weight_keypoints": 0.15,
   "quality_norm_p_low": 10.0,
   "quality_norm_p_high": 90.0,
-  "quality_debug": false
+  "quality_debug": false,
+  "vo_essential_method": "auto",
+  "vo_subpixel_refine": true,
+  "vo_adaptive_subsample": false,
+  "vo_subsample_min": 1,
+  "vo_confidence_low_threshold": 0.35,
+  "vo_confidence_mid_threshold": 0.55
 }
 ```
 

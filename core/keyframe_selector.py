@@ -6,13 +6,14 @@
 
 import cv2
 import numpy as np
+import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from collections import deque
 from time import perf_counter
 
-from .video_loader import VideoLoader, VideoMetadata
+from .video_loader import VideoLoader, VideoMetadata, create_video_capture
 from .quality_evaluator import QualityEvaluator
 from .quality_score import (
     apply_abs_guard,
@@ -28,6 +29,7 @@ from processing.fisheye_rig import FisheyeRigProcessor
 from processing.mask_processor import MaskProcessor
 from .visual_odometry import KLTVisualOdometry, calibration_from_dict, integrate_relative_trajectory
 from .pipeline import run_stage1_filter, run_stage2_evaluator, run_stage3_refiner
+from .stage_temp_store import StageTempStore
 from .exceptions import (
     GeometricDegeneracyError,
     EstimationFailureError,
@@ -124,6 +126,14 @@ class Stage2FrameRecord:
     points_world: Optional[np.ndarray] = None
 
 
+@dataclass
+class Stage1ScanArtifact:
+    candidates: List[Dict[str, Any]]
+    records: List[Dict[str, Any]]
+    sampled_frames: int
+    total_frames: int
+
+
 class KeyframeSelector:
     """
     キーフレーム選択パイプライン（最適化版）
@@ -190,6 +200,13 @@ class KeyframeSelector:
             'STAGE1_BATCH_SIZE': 32,
             'STAGE1_GRAB_THRESHOLD': 30,
             'STAGE1_EVAL_SCALE': 0.5,
+            'OPENCV_THREAD_COUNT': 0,
+            'STAGE1_PROCESS_WORKERS': 0,
+            'STAGE1_PREFETCH_SIZE': 32,
+            'STAGE1_METRICS_BATCH_SIZE': 64,
+            'STAGE1_GPU_BATCH_ENABLED': True,
+            'DARWIN_CAPTURE_BACKEND': 'auto',
+            'MPS_MIN_PIXELS': 256 * 256,
             'ENABLE_RIG_STITCHING': True,
             'EQUIRECT_WIDTH': 4096,
             'EQUIRECT_HEIGHT': 2048,
@@ -261,6 +278,12 @@ class KeyframeSelector:
             'VO_ADAPTIVE_ROI_MAX': 0.70,
             'VO_FAST_FAIL_INLIER_RATIO': 0.12,
             'VO_STEP_PROXY_CLIP_PX': 80.0,
+            'VO_ESSENTIAL_METHOD': 'auto',
+            'VO_SUBPIXEL_REFINE': True,
+            'VO_ADAPTIVE_SUBSAMPLE': False,
+            'VO_SUBSAMPLE_MIN': 1,
+            'VO_CONFIDENCE_LOW_THRESHOLD': 0.35,
+            'VO_CONFIDENCE_MID_THRESHOLD': 0.55,
             'CALIB_XML': '',
             'FRONT_CALIB_XML': '',
             'REAR_CALIB_XML': '',
@@ -333,6 +356,7 @@ class KeyframeSelector:
 
         # アクセレータから情報を取得
         self.accelerator = get_accelerator()
+        self.accelerator.configure_runtime(self.config)
         logger.info(
             f"アクセレータ: device={self.accelerator.device_name}, "
             f"thread_count={self.accelerator.num_threads}"
@@ -355,6 +379,8 @@ class KeyframeSelector:
             downscale_long_edge=int(self.config.get('VO_DOWNSCALE_LONG_EDGE', 1000)),
             fast_fail_inlier_ratio=float(self.config.get('VO_FAST_FAIL_INLIER_RATIO', 0.12)),
             step_proxy_clip_px=float(self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)),
+            essential_method=str(self.config.get('VO_ESSENTIAL_METHOD', 'auto')),
+            subpixel_refine=bool(self.config.get('VO_SUBPIXEL_REFINE', True)),
         )
         self.stage1_quality_records: List[Dict[str, Any]] = []
 
@@ -579,7 +605,14 @@ class KeyframeSelector:
         RuntimeError
             ビデオファイルが開けない場合
         """
-        cap = cv2.VideoCapture(str(video_path))
+        backend_pref = str(
+            self.config.get(
+                "DARWIN_CAPTURE_BACKEND",
+                self.config.get("darwin_capture_backend", "auto"),
+            )
+            or "auto"
+        )
+        cap = create_video_capture(str(video_path), backend_preference=backend_pref)
         if not cap.isOpened():
             raise RuntimeError(f"分析用ビデオキャプチャを開けません: {video_path}")
         return cap
@@ -969,6 +1002,18 @@ class KeyframeSelector:
                 record.metrics["vo_inlier_ratio"] = float(m.get("vo_inlier_ratio", 0.0))
             if "vo_rot_deg" in m:
                 record.metrics["vo_rot_deg"] = float(m.get("vo_rot_deg", 0.0))
+            if "vo_confidence" in m:
+                record.metrics["vo_confidence"] = float(m.get("vo_confidence", 0.0))
+            if "vo_feature_uniformity" in m:
+                record.metrics["vo_feature_uniformity"] = float(m.get("vo_feature_uniformity", 0.0))
+            if "vo_track_sufficiency" in m:
+                record.metrics["vo_track_sufficiency"] = float(m.get("vo_track_sufficiency", 0.0))
+            if "vo_pose_plausibility" in m:
+                record.metrics["vo_pose_plausibility"] = float(m.get("vo_pose_plausibility", 0.0))
+            if "vo_tracked_count" in m:
+                record.metrics["vo_tracked_count"] = float(m.get("vo_tracked_count", 0.0))
+            if "vo_essential_method" in m:
+                record.metrics["vo_essential_method"] = str(m.get("vo_essential_method", "none"))
             if "vo_status_reason" in m:
                 record.metrics["vo_status_reason"] = str(m.get("vo_status_reason", "unknown"))
 
@@ -995,6 +1040,8 @@ class KeyframeSelector:
             stage_label="Stage0",
         )
         vo_subsample = max(1, int(self.config.get('VO_FRAME_SUBSAMPLE', 1)))
+        vo_adaptive_subsample = bool(self.config.get('VO_ADAPTIVE_SUBSAMPLE', False))
+        vo_subsample_min = int(max(1, min(vo_subsample, int(self.config.get('VO_SUBSAMPLE_MIN', 1)))))
         adaptive_roi_enable = bool(self.config.get('VO_ADAPTIVE_ROI_ENABLE', True))
         roi_min = float(np.clip(self.config.get('VO_ADAPTIVE_ROI_MIN', 0.45), 0.2, 1.0))
         roi_max = float(np.clip(self.config.get('VO_ADAPTIVE_ROI_MAX', 0.70), roi_min, 1.0))
@@ -1047,7 +1094,13 @@ class KeyframeSelector:
             if adaptive_roi_enable:
                 flow_norm = float(np.clip(flow_mag / flow_norm_factor, 0.0, 1.0))
                 roi_ratio = float(np.clip(roi_min + (roi_max - roi_min) * flow_norm, roi_min, roi_max))
-            vo_should_run = bool(vo_enabled and prev_vo_frame is not None and (idx % vo_subsample == 0))
+            flow_norm_for_subsample = float(np.clip(flow_mag / flow_norm_factor, 0.0, 1.0))
+            if vo_adaptive_subsample and vo_subsample > vo_subsample_min:
+                effective_subsample = int(round(vo_subsample_min + (1.0 - flow_norm_for_subsample) * (vo_subsample - vo_subsample_min)))
+            else:
+                effective_subsample = int(vo_subsample)
+            effective_subsample = max(1, effective_subsample)
+            vo_should_run = bool(vo_enabled and prev_vo_frame is not None and (idx % effective_subsample == 0))
             vo = self.vo_estimator.estimate(
                 prev_vo_frame,
                 frame_vo_cur,
@@ -1060,6 +1113,12 @@ class KeyframeSelector:
                 step_proxy = min(step_proxy, step_clip)
             t_dir = [float(x) for x in getattr(vo, "t_dir", [0.0, 0.0, 0.0])] if vo_valid else [0.0, 0.0, 0.0]
             r_rel_q = [float(x) for x in getattr(vo, "r_rel_q_wxyz", [1.0, 0.0, 0.0, 0.0])] if vo_valid else [1.0, 0.0, 0.0, 0.0]
+            vo_confidence = float(vo.vo_confidence if vo else 0.0)
+            vo_feature_uniformity = float(vo.feature_uniformity if vo else 0.0)
+            vo_track_sufficiency = float(vo.track_sufficiency if vo else 0.0)
+            vo_pose_plausibility = float(vo.pose_plausibility if vo else 0.0)
+            vo_tracked_count = float(vo.tracked_count if vo else 0.0)
+            vo_essential_method = str(vo.essential_method_used if vo else "none")
             trajectory_samples.append(
                 {
                     "frame_idx": int(frame_idx),
@@ -1081,11 +1140,18 @@ class KeyframeSelector:
                 "vo_rot_deg": float(vo.rotation_delta_deg if vo else 0.0),
                 "match_count": float(vo.match_count if vo else 0.0),
                 "vo_inlier_ratio": float(vo.inlier_ratio if vo else 0.0),
+                "vo_confidence": vo_confidence,
+                "vo_feature_uniformity": vo_feature_uniformity,
+                "vo_track_sufficiency": vo_track_sufficiency,
+                "vo_pose_plausibility": vo_pose_plausibility,
+                "vo_tracked_count": vo_tracked_count,
+                "vo_essential_method": vo_essential_method,
                 "vo_valid": 1.0 if vo_valid else 0.0,
                 "vo_attempted": 1.0 if vo_should_run else 0.0,
                 "vo_pose_valid": 0.0,
                 "vo_t_dir": t_dir,
                 "vo_r_rel_q_wxyz": r_rel_q,
+                "vo_effective_subsample": float(effective_subsample),
                 "vo_status_reason": (
                     "frame_subsample_skip" if (vo_enabled and prev_vo_frame is not None and not vo_should_run)
                     else ("enabled" if vo_valid else ("estimate_failed_or_low_inlier" if vo_should_run else vo_status_reason))
@@ -1169,8 +1235,11 @@ class KeyframeSelector:
             for kf in stage2_candidates:
                 base = float(kf.combined_score)
                 risk = float(np.clip(self._lookup_stage0_metrics(kf.frame_index, stage0_metrics).get("motion_risk", 0.0), 0.0, 1.0))
+                vo_conf = float(np.clip(self._lookup_stage0_metrics(kf.frame_index, stage0_metrics).get("vo_confidence", 0.0), 0.0, 1.0))
                 kf.stage3_scores = {
                     "trajectory_consistency": 0.5,
+                    "trajectory_consistency_effective": float(0.5 * (0.5 + 0.5 * vo_conf)),
+                    "vo_confidence": vo_conf,
                     "stage0_motion_risk": risk,
                     "combined_stage2": base,
                     "combined_stage3": base,
@@ -1183,7 +1252,10 @@ class KeyframeSelector:
             stage_label="Stage3",
         )
         vo_subsample = max(1, int(self.config.get('VO_FRAME_SUBSAMPLE', 1)))
+        vo_adaptive_subsample = bool(self.config.get('VO_ADAPTIVE_SUBSAMPLE', False))
+        vo_subsample_min = int(max(1, min(vo_subsample, int(self.config.get('VO_SUBSAMPLE_MIN', 1)))))
         step_clip = float(max(0.0, self.config.get('VO_STEP_PROXY_CLIP_PX', 80.0)))
+        flow_norm_factor = max(1e-6, float(self.normalization.OPTICAL_FLOW_NORM_FACTOR))
 
         frame_cache: Dict[int, Optional[np.ndarray]] = {}
 
@@ -1214,11 +1286,17 @@ class KeyframeSelector:
                 "r_rel_q_wxyz": [1.0, 0.0, 0.0, 0.0],
             }
         ]
-        per_frame_vo: Dict[int, Dict[str, float]] = {
+        per_frame_vo: Dict[int, Dict[str, Any]] = {
             int(tracked_indices[0]): {
                 "vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0,
                 "vo_status_reason": "init",
                 "vo_attempted": 0.0,
+                "confidence": float(np.clip(self._lookup_stage0_metrics(int(tracked_indices[0]), stage0_metrics).get("vo_confidence", 0.0), 0.0, 1.0)),
+                "feature_uniformity": 0.0,
+                "track_sufficiency": 0.0,
+                "pose_plausibility": 0.0,
+                "tracked_count": 0.0,
+                "essential_method": "none",
             }
         }
         step_proxy_raw: Dict[int, float] = {tracked_indices[0]: 0.0}
@@ -1246,6 +1324,12 @@ class KeyframeSelector:
                 per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
                 per_frame_vo[int(cur_idx)]["vo_status_reason"] = vo_status_reason
                 per_frame_vo[int(cur_idx)]["vo_attempted"] = 0.0
+                per_frame_vo[int(cur_idx)]["confidence"] = float(np.clip(self._lookup_stage0_metrics(int(cur_idx), stage0_metrics).get("vo_confidence", 0.0), 0.0, 1.0))
+                per_frame_vo[int(cur_idx)]["feature_uniformity"] = 0.0
+                per_frame_vo[int(cur_idx)]["track_sufficiency"] = 0.0
+                per_frame_vo[int(cur_idx)]["pose_plausibility"] = 0.0
+                per_frame_vo[int(cur_idx)]["tracked_count"] = 0.0
+                per_frame_vo[int(cur_idx)]["essential_method"] = "none"
                 step_proxy_raw[int(cur_idx)] = 0.0
                 continue
             prev_idx = tracked_indices[i - 1]
@@ -1269,11 +1353,28 @@ class KeyframeSelector:
                 per_frame_vo[int(cur_idx)] = {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0}
                 per_frame_vo[int(cur_idx)]["vo_status_reason"] = "frame_unavailable"
                 per_frame_vo[int(cur_idx)]["vo_attempted"] = 0.0
+                per_frame_vo[int(cur_idx)]["confidence"] = float(np.clip(self._lookup_stage0_metrics(int(cur_idx), stage0_metrics).get("vo_confidence", 0.0), 0.0, 1.0))
+                per_frame_vo[int(cur_idx)]["feature_uniformity"] = 0.0
+                per_frame_vo[int(cur_idx)]["track_sufficiency"] = 0.0
+                per_frame_vo[int(cur_idx)]["pose_plausibility"] = 0.0
+                per_frame_vo[int(cur_idx)]["tracked_count"] = 0.0
+                per_frame_vo[int(cur_idx)]["essential_method"] = "none"
                 step_proxy_raw[int(cur_idx)] = 0.0
                 prev_valid = False
                 continue
 
-            vo_should_run = bool(vo_enabled and (i % vo_subsample == 0))
+            stage0_cur = self._lookup_stage0_metrics(int(cur_idx), stage0_metrics)
+            flow_light = float(stage0_cur.get("flow_mag_light", np.nan))
+            if np.isfinite(flow_light):
+                motion_norm = float(np.clip(flow_light / flow_norm_factor, 0.0, 1.0))
+            else:
+                motion_norm = float(np.clip(stage0_cur.get("motion_risk", 0.0), 0.0, 1.0))
+            if vo_adaptive_subsample and vo_subsample > vo_subsample_min:
+                effective_subsample = int(round(vo_subsample_min + (1.0 - motion_norm) * (vo_subsample - vo_subsample_min)))
+            else:
+                effective_subsample = int(vo_subsample)
+            effective_subsample = max(1, effective_subsample)
+            vo_should_run = bool(vo_enabled and (i % effective_subsample == 0))
             vo = self.vo_estimator.estimate(
                 prev_frame,
                 cur_frame,
@@ -1298,6 +1399,12 @@ class KeyframeSelector:
                     "vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0,
                     "vo_status_reason": "frame_subsample_skip",
                     "vo_attempted": 0.0,
+                    "confidence": float(np.clip(stage0_cur.get("vo_confidence", 0.0), 0.0, 1.0)),
+                    "feature_uniformity": 0.0,
+                    "track_sufficiency": 0.0,
+                    "pose_plausibility": 0.0,
+                    "tracked_count": 0.0,
+                    "essential_method": "none",
                 }
                 step_proxy_raw[int(cur_idx)] = 0.0
                 prev_valid = False
@@ -1320,6 +1427,12 @@ class KeyframeSelector:
                     "vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0,
                     "vo_status_reason": "estimate_failed_or_low_inlier",
                     "vo_attempted": 1.0,
+                    "confidence": float(np.clip(stage0_cur.get("vo_confidence", 0.0), 0.0, 1.0)),
+                    "feature_uniformity": 0.0,
+                    "track_sufficiency": 0.0,
+                    "pose_plausibility": 0.0,
+                    "tracked_count": 0.0,
+                    "essential_method": "none",
                 }
                 step_proxy_raw[int(cur_idx)] = 0.0
                 prev_valid = False
@@ -1372,6 +1485,12 @@ class KeyframeSelector:
                 "rot_deg": float(vo.rotation_delta_deg),
                 "vo_status_reason": "enabled",
                 "vo_attempted": 1.0,
+                "confidence": float(getattr(vo, "vo_confidence", 0.0)),
+                "feature_uniformity": float(getattr(vo, "feature_uniformity", 0.0)),
+                "track_sufficiency": float(getattr(vo, "track_sufficiency", 0.0)),
+                "pose_plausibility": float(getattr(vo, "pose_plausibility", 0.0)),
+                "tracked_count": float(getattr(vo, "tracked_count", 0.0)),
+                "essential_method": str(getattr(vo, "essential_method_used", "none")),
             }
             step_proxy_raw[int(cur_idx)] = float(step_val)
             prev_rot = float(vo.rotation_delta_deg)
@@ -1400,13 +1519,27 @@ class KeyframeSelector:
         for kf in stage2_candidates:
             base_score = float(kf.combined_score)
             traj = float(np.clip(trajectory_consistency.get(int(kf.frame_index), 0.5), 0.0, 1.0))
+            vo_info = per_frame_vo.get(int(kf.frame_index), {})
+            vo_conf = float(
+                np.clip(
+                    vo_info.get(
+                        "confidence",
+                        self._lookup_stage0_metrics(int(kf.frame_index), stage0_metrics).get("vo_confidence", 0.0),
+                    ),
+                    0.0,
+                    1.0,
+                )
+            )
+            traj_effective = float(np.clip(traj * (0.5 + 0.5 * vo_conf), 0.0, 1.0))
             risk = float(np.clip(
                 self._lookup_stage0_metrics(int(kf.frame_index), stage0_metrics).get("motion_risk", 0.0),
                 0.0, 1.0
             ))
-            combined_stage3 = float(np.clip(w_base * base_score + w_traj * traj - w_risk * risk, 0.0, 1.0))
+            combined_stage3 = float(np.clip(w_base * base_score + w_traj * traj_effective - w_risk * risk, 0.0, 1.0))
             kf.stage3_scores = {
                 "trajectory_consistency": traj,
+                "trajectory_consistency_effective": traj_effective,
+                "vo_confidence": vo_conf,
                 "stage0_motion_risk": risk,
                 "combined_stage2": base_score,
                 "combined_stage3": combined_stage3,
@@ -1416,6 +1549,8 @@ class KeyframeSelector:
             record = record_map.get(int(kf.frame_index))
             if record is not None:
                 record.metrics["trajectory_consistency"] = traj
+                record.metrics["trajectory_consistency_effective"] = traj_effective
+                record.metrics["vo_confidence"] = vo_conf
                 record.metrics["combined_stage2"] = base_score
                 record.metrics["combined_stage3"] = combined_stage3
                 record.metrics["stage0_motion_risk"] = risk
@@ -1436,23 +1571,130 @@ class KeyframeSelector:
                 record.q_wxyz = [float(x) for x in pose.get("q_wxyz", [1.0, 0.0, 0.0, 0.0])]
             pose_direct = bool(int(idx) in trajectory_map)
             record.metrics["vo_pose_valid"] = 1.0 if pose_direct else 0.0
-            vo_info = per_frame_vo.get(int(idx), {"vo_valid": 0.0, "step_proxy": 0.0, "inlier_ratio": 0.0, "rot_deg": 0.0})
+            vo_info = per_frame_vo.get(
+                int(idx),
+                {
+                    "vo_valid": 0.0,
+                    "step_proxy": 0.0,
+                    "inlier_ratio": 0.0,
+                    "rot_deg": 0.0,
+                    "confidence": 0.0,
+                    "feature_uniformity": 0.0,
+                    "track_sufficiency": 0.0,
+                    "pose_plausibility": 0.0,
+                    "tracked_count": 0.0,
+                    "essential_method": "none",
+                },
+            )
             record.metrics["vo_valid"] = float(vo_info.get("vo_valid", record.metrics.get("vo_valid", 0.0)))
             record.metrics["vo_inlier_ratio"] = float(vo_info.get("inlier_ratio", record.metrics.get("vo_inlier_ratio", 0.0)))
             record.metrics["vo_step_proxy"] = float(vo_info.get("step_proxy", 0.0))
             record.metrics["vo_step_proxy_norm"] = float(vo_step_proxy_norm.get(int(idx), 0.0))
             record.metrics["vo_dir_cos_prev"] = float(vo_dir_cos_prev.get(int(idx), 0.5))
             record.metrics["vo_rot_deg"] = float(vo_rot_deg.get(int(idx), vo_info.get("rot_deg", 0.0)))
+            record.metrics["vo_confidence"] = float(np.clip(vo_info.get("confidence", record.metrics.get("vo_confidence", 0.0)), 0.0, 1.0))
+            record.metrics["vo_feature_uniformity"] = float(vo_info.get("feature_uniformity", 0.0))
+            record.metrics["vo_track_sufficiency"] = float(vo_info.get("track_sufficiency", 0.0))
+            record.metrics["vo_pose_plausibility"] = float(vo_info.get("pose_plausibility", 0.0))
+            record.metrics["vo_tracked_count"] = float(vo_info.get("tracked_count", 0.0))
+            record.metrics["vo_essential_method"] = str(vo_info.get("essential_method", "none"))
             record.metrics["vo_status_reason"] = str(vo_info.get("vo_status_reason", vo_status_reason))
             record.metrics["vo_attempted"] = float(vo_info.get("vo_attempted", 0.0))
 
         return stage2_candidates
+
+    @staticmethod
+    def _serialize_keyframe_info(candidate: KeyframeInfo) -> Dict[str, Any]:
+        return {
+            "frame_index": int(candidate.frame_index),
+            "timestamp": float(candidate.timestamp),
+            "quality_scores": dict(candidate.quality_scores or {}),
+            "geometric_scores": dict(candidate.geometric_scores or {}),
+            "adaptive_scores": dict(candidate.adaptive_scores or {}),
+            "combined_score": float(candidate.combined_score),
+            "is_rescue_mode": bool(candidate.is_rescue_mode),
+            "is_force_inserted": bool(candidate.is_force_inserted),
+            "is_stationary": bool(candidate.is_stationary),
+            "stationary_penalty_applied": bool(candidate.stationary_penalty_applied),
+            "stage3_scores": dict(candidate.stage3_scores or {}),
+        }
+
+    @staticmethod
+    def _deserialize_keyframe_info(row: Dict[str, Any]) -> KeyframeInfo:
+        return KeyframeInfo(
+            frame_index=int(row.get("frame_index", 0)),
+            timestamp=float(row.get("timestamp", 0.0)),
+            quality_scores=dict(row.get("quality_scores", {}) or {}),
+            geometric_scores=dict(row.get("geometric_scores", {}) or {}),
+            adaptive_scores=dict(row.get("adaptive_scores", {}) or {}),
+            combined_score=float(row.get("combined_score", 0.0)),
+            thumbnail=None,
+            is_rescue_mode=bool(row.get("is_rescue_mode", False)),
+            is_force_inserted=bool(row.get("is_force_inserted", False)),
+            dynamic_mask=None,
+            is_stationary=bool(row.get("is_stationary", False)),
+            stationary_penalty_applied=bool(row.get("stationary_penalty_applied", False)),
+            stage3_scores=dict(row.get("stage3_scores", {}) or {}),
+        )
+
+    @staticmethod
+    def _serialize_stage2_record(record: Stage2FrameRecord) -> Dict[str, Any]:
+        return {
+            "frame_index": int(record.frame_index),
+            "quality_scores": dict(record.quality_scores or {}),
+            "geometric_scores": dict(record.geometric_scores or {}),
+            "adaptive_scores": dict(record.adaptive_scores or {}),
+            "metrics": dict(record.metrics or {}),
+            "is_candidate": bool(record.is_candidate),
+            "is_keyframe": bool(record.is_keyframe),
+            "t_xyz": list(record.t_xyz) if record.t_xyz is not None else None,
+            "q_wxyz": list(record.q_wxyz) if record.q_wxyz is not None else None,
+        }
+
+    @staticmethod
+    def _deserialize_stage2_record(row: Dict[str, Any]) -> Stage2FrameRecord:
+        t_xyz_raw = row.get("t_xyz")
+        q_wxyz_raw = row.get("q_wxyz")
+        t_xyz = [float(v) for v in t_xyz_raw] if isinstance(t_xyz_raw, (list, tuple)) and len(t_xyz_raw) == 3 else None
+        q_wxyz = [float(v) for v in q_wxyz_raw] if isinstance(q_wxyz_raw, (list, tuple)) and len(q_wxyz_raw) == 4 else None
+        return Stage2FrameRecord(
+            frame_index=int(row.get("frame_index", 0)),
+            frame=None,
+            quality_scores=dict(row.get("quality_scores", {}) or {}),
+            geometric_scores=dict(row.get("geometric_scores", {}) or {}),
+            adaptive_scores=dict(row.get("adaptive_scores", {}) or {}),
+            metrics=dict(row.get("metrics", {}) or {}),
+            is_candidate=bool(row.get("is_candidate", False)),
+            is_keyframe=bool(row.get("is_keyframe", False)),
+            t_xyz=t_xyz,
+            q_wxyz=q_wxyz,
+            points_world=None,
+        )
+
+    def run_stage1_scan(
+        self,
+        video_loader,
+        metadata: VideoMetadata,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Stage1ScanArtifact:
+        candidates = run_stage1_filter(self, video_loader, metadata, progress_callback)
+        records = list(self.stage1_quality_records or [])
+        total_frames = int(getattr(metadata, "frame_count", 0) or 0)
+        sample_interval = max(1, int(self.config.get("SAMPLE_INTERVAL", 1)))
+        sampled_frames = len(range(0, total_frames, sample_interval))
+        return Stage1ScanArtifact(
+            candidates=list(candidates),
+            records=records,
+            sampled_frames=int(sampled_frames),
+            total_frames=int(total_frames),
+        )
 
     def select_keyframes(
         self,
         video_loader,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         frame_log_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        stage_temp_store: Optional[StageTempStore] = None,
     ) -> List[KeyframeInfo]:
         """
         ビデオからキーフレームを自動選択（2段階パイプライン）
@@ -1517,6 +1759,15 @@ class KeyframeSelector:
         mode_enable_stage0 = bool(self.config.get('ENABLE_STAGE0_SCAN', True))
         mode_enable_stage3 = bool(self.config.get('ENABLE_STAGE3_REFINEMENT', True))
         profile_enabled = bool(self.config.get('ENABLE_PROFILE', False))
+        current_stage = "init"
+        success = False
+
+        if run_id in {"", "n/a", "none", "null"}:
+            run_id = str(uuid.uuid4())
+            self.config["analysis_run_id"] = run_id
+            self.config["ANALYSIS_RUN_ID"] = run_id
+
+        store = stage_temp_store if stage_temp_store is not None else StageTempStore(run_id)
 
         def _profile_log(stage: str, elapsed_s: float, frames: int) -> None:
             if not profile_enabled:
@@ -1542,144 +1793,233 @@ class KeyframeSelector:
             mode_enable_stage0 = True
             mode_enable_stage3 = True
 
-        # ===== Stage 0: 軽量走査 =====
-        stage0_metrics: Dict[int, Dict[str, Any]] = {}
-        if mode_enable_stage0:
-            t_stage0 = perf_counter() if profile_enabled else 0.0
-            _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
-            logger.info("Stage 0: 軽量運動量走査開始")
-            stage0_metrics = self._stage0_lightweight_motion_scan(
-                video_loader, metadata, progress_callback, frame_log_callback
+        try:
+            # ===== Stage 0 only mode =====
+            if analysis_mode == "stage0":
+                current_stage = "0"
+                stage0_metrics: Dict[int, Dict[str, Any]] = {}
+                if mode_enable_stage0:
+                    t_stage0 = perf_counter() if profile_enabled else 0.0
+                    _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
+                    logger.info("Stage 0: 軽量運動量走査開始")
+                    stage0_metrics = self._stage0_lightweight_motion_scan(
+                        video_loader, metadata, progress_callback, frame_log_callback
+                    )
+                    stage0_path = store.save_stage0(stage0_metrics)
+                    stage0_metrics = store.load_stage0()
+                    store.mark_stage_done(
+                        "0",
+                        files={"metrics": stage0_path},
+                        counts={"samples": len(stage0_metrics)},
+                    )
+                    logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
+                    _stage_summary("0", samples=len(stage0_metrics), temp_file=stage0_path)
+                    if profile_enabled:
+                        _profile_log("0", perf_counter() - t_stage0, len(stage0_metrics))
+                logger.info("Stage 0モードのため Stage1/2/3 をスキップ")
+                logger.info(
+                    f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
+                    " keyframes=0, note=stage0_only"
+                )
+                success = True
+                return []
+
+            # ===== Stage 1: 高速フィルタリング =====
+            current_stage = "1"
+            t_stage1 = perf_counter() if profile_enabled else 0.0
+            _stage_start("1", total_frames=total_frames)
+            if store.has_stage1():
+                logger.info("Stage 1: テンポラリ結果を再利用")
+            else:
+                logger.info("Stage 1: 高速品質フィルタリング開始")
+                stage1_artifact = self.run_stage1_scan(video_loader, metadata, progress_callback)
+                stage1_files = store.save_stage1(stage1_artifact.candidates, stage1_artifact.records)
+                store.mark_stage_done(
+                    "1",
+                    files=stage1_files,
+                    counts={
+                        "candidates": len(stage1_artifact.candidates),
+                        "records": len(stage1_artifact.records),
+                        "sampled_frames": int(stage1_artifact.sampled_frames),
+                    },
+                )
+            stage1_candidates, stage1_records = store.load_stage1()
+            self.stage1_quality_records = list(stage1_records)
+            stage1_candidates = sorted(
+                [dict(c) for c in stage1_candidates if isinstance(c, dict)],
+                key=lambda x: int(x.get("frame_idx", 0)),
             )
-            logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
-            _stage_summary("0", samples=len(stage0_metrics))
+            logger.info(
+                f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
+                f"({100*len(stage1_candidates)/max(total_frames, 1):.1f}%)"
+            )
+            _stage_summary(
+                "1",
+                passed=len(stage1_candidates),
+                total=total_frames,
+                records=len(stage1_records),
+                temp_file=str(store.run_dir / store.STAGE1_CANDIDATES_FILE),
+                pass_ratio=f"{100*len(stage1_candidates)/max(total_frames, 1):.2f}",
+            )
             if profile_enabled:
-                _profile_log("0", perf_counter() - t_stage0, len(stage0_metrics))
-        if analysis_mode == "stage0":
-            logger.info("Stage 0モードのため Stage1/2/3 をスキップ")
+                sample_interval = max(1, int(self.config.get('SAMPLE_INTERVAL', 1)))
+                stage1_samples = len(range(0, total_frames, sample_interval))
+                _profile_log("1", perf_counter() - t_stage1, stage1_samples)
+
+            if not stage1_candidates:
+                logger.warning("Stage 1でフレームが残りませんでした")
+                logger.info(
+                    f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
+                    " keyframes=0, note=stage1_empty"
+                )
+                success = True
+                return []
+
+            # ===== Stage 0: 軽量走査 =====
+            current_stage = "0"
+            stage0_metrics = {}
+            if mode_enable_stage0:
+                t_stage0 = perf_counter() if profile_enabled else 0.0
+                _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
+                logger.info("Stage 0: 軽量運動量走査開始")
+                stage0_metrics = self._stage0_lightweight_motion_scan(
+                    video_loader, metadata, progress_callback, frame_log_callback
+                )
+                stage0_path = store.save_stage0(stage0_metrics)
+                stage0_metrics = store.load_stage0()
+                store.mark_stage_done(
+                    "0",
+                    files={"metrics": stage0_path},
+                    counts={"samples": len(stage0_metrics)},
+                )
+                logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
+                _stage_summary("0", samples=len(stage0_metrics), temp_file=stage0_path)
+                if profile_enabled:
+                    _profile_log("0", perf_counter() - t_stage0, len(stage0_metrics))
+
+            # ===== Stage 2: 精密評価 =====
+            current_stage = "2"
+            t_stage2 = perf_counter() if profile_enabled else 0.0
+            _stage_start("2", candidates=len(stage1_candidates))
+            stage2_parallel = bool(self.config.get("ENABLE_STAGE2_PIPELINE_PARALLEL", False))
             logger.info(
-                f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
-                " keyframes=0, note=stage0_only"
+                f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム, "
+                f"parallel={'on' if stage2_parallel else 'off'}）"
             )
-            return []
-
-        # ===== Stage 1: 高速フィルタリング =====
-        t_stage1 = perf_counter() if profile_enabled else 0.0
-        _stage_start("1", total_frames=total_frames)
-        logger.info("Stage 1: 高速品質フィルタリング開始")
-        stage1_candidates = run_stage1_filter(self, video_loader, metadata, progress_callback)
-        logger.info(
-            f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
-            f"({100*len(stage1_candidates)/max(total_frames, 1):.1f}%)"
-        )
-        _stage_summary(
-            "1",
-            passed=len(stage1_candidates),
-            total=total_frames,
-            pass_ratio=f"{100*len(stage1_candidates)/max(total_frames, 1):.2f}",
-        )
-        if profile_enabled:
-            sample_interval = max(1, int(self.config.get('SAMPLE_INTERVAL', 1)))
-            stage1_samples = len(range(0, total_frames, sample_interval))
-            _profile_log("1", perf_counter() - t_stage1, stage1_samples)
-
-        if not stage1_candidates:
-            logger.warning("Stage 1でフレームが残りませんでした")
-            logger.info(
-                f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
-                " keyframes=0, note=stage1_empty"
-            )
-            return []
-
-        # ===== Stage 2: 精密評価 =====
-        t_stage2 = perf_counter() if profile_enabled else 0.0
-        _stage_start("2", candidates=len(stage1_candidates))
-        stage2_parallel = bool(self.config.get("ENABLE_STAGE2_PIPELINE_PARALLEL", False))
-        logger.info(
-            f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム, "
-            f"parallel={'on' if stage2_parallel else 'off'}）"
-        )
-        stage2_candidates, stage2_records = run_stage2_evaluator(
-            self,
-            video_loader,
-            metadata,
-            stage1_candidates,
-            progress_callback,
-            frame_log_callback,
-            stage0_metrics,
-        )
-        logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
-        _stage_summary("2", candidates=len(stage2_candidates), records=len(stage2_records))
-        if profile_enabled:
-            _profile_log("2", perf_counter() - t_stage2, len(stage1_candidates))
-
-        self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
-
-        # 停止区間に対するソフト抑制を適用
-        stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
-
-        # Stage2の従来最終（Stage3入力用）
-        stage2_keyframes_pre_stage3 = self._enforce_max_interval(
-            self._apply_nms(stage2_candidates),
-            metadata.fps,
-            source_candidates=stage2_candidates,
-        )
-
-        # ===== Stage 3: 軌跡再評価 =====
-        keyframes = stage2_keyframes_pre_stage3
-        if mode_enable_stage3:
-            t_stage3 = perf_counter() if profile_enabled else 0.0
-            _stage_start("3", input_candidates=len(stage2_candidates))
-            logger.info("Stage 3: 軌跡再評価開始")
-            stage2_candidates = run_stage3_refiner(
+            stage2_candidates, stage2_records = run_stage2_evaluator(
                 self,
-                metadata=metadata,
-                stage2_candidates=stage2_candidates,
-                stage2_final=stage2_keyframes_pre_stage3,
-                stage2_records=stage2_records,
-                stage0_metrics=stage0_metrics,
-                video_loader=video_loader,
+                video_loader,
+                metadata,
+                stage1_candidates,
+                progress_callback,
+                frame_log_callback,
+                stage0_metrics,
             )
-            keyframes = self._enforce_max_interval(
+
+            self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
+            stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
+
+            stage2_candidate_rows = [self._serialize_keyframe_info(c) for c in stage2_candidates]
+            stage2_record_rows = [self._serialize_stage2_record(r) for r in stage2_records]
+            stage2_files = store.save_stage2(stage2_candidate_rows, stage2_record_rows)
+            store.mark_stage_done(
+                "2",
+                files=stage2_files,
+                counts={"candidates": len(stage2_candidate_rows), "records": len(stage2_record_rows)},
+            )
+            stage2_candidate_rows, stage2_record_rows = store.load_stage2()
+            stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
+            stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+
+            logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
+            _stage_summary(
+                "2",
+                candidates=len(stage2_candidates),
+                records=len(stage2_records),
+                temp_file=str(store.run_dir / store.STAGE2_CANDIDATES_FILE),
+            )
+            if profile_enabled:
+                _profile_log("2", perf_counter() - t_stage2, len(stage1_candidates))
+
+            stage2_keyframes_pre_stage3 = self._enforce_max_interval(
                 self._apply_nms(stage2_candidates),
                 metadata.fps,
                 source_candidates=stage2_candidates,
             )
-            logger.info(f"Stage 3完了: {len(keyframes)}個")
-            _stage_summary("3", keyframes=len(keyframes))
-            if profile_enabled:
-                _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
 
-        if frame_log_callback:
-            selected_idx = {kf.frame_index for kf in keyframes}
-            for record in stage2_records:
-                record.is_keyframe = record.frame_index in selected_idx
-                record.metrics["keyframe_flag"] = 1.0 if record.is_keyframe else 0.0
-                record.metrics["stage3_selected_flag"] = 1.0 if record.is_keyframe else 0.0
-                self._emit_frame_log(
-                    frame_log_callback,
-                    {
-                        "frame_index": record.frame_index,
-                        "frame": record.frame,
-                        "is_keyframe": record.is_keyframe,
-                        "metrics": record.metrics,
-                        "quality_scores": record.quality_scores,
-                        "geometric_scores": record.geometric_scores,
-                        "adaptive_scores": record.adaptive_scores,
-                        "t_xyz": record.t_xyz,
-                        "q_wxyz": record.q_wxyz,
-                        "points_world": record.points_world,
-                    },
+            # ===== Stage 3: 軌跡再評価 =====
+            current_stage = "3"
+            keyframes = stage2_keyframes_pre_stage3
+            if mode_enable_stage3:
+                t_stage3 = perf_counter() if profile_enabled else 0.0
+                _stage_start("3", input_candidates=len(stage2_candidates))
+                logger.info("Stage 3: 軌跡再評価開始")
+                stage2_candidates = run_stage3_refiner(
+                    self,
+                    metadata=metadata,
+                    stage2_candidates=stage2_candidates,
+                    stage2_final=stage2_keyframes_pre_stage3,
+                    stage2_records=stage2_records,
+                    stage0_metrics=stage0_metrics,
+                    video_loader=video_loader,
                 )
+                keyframes = self._enforce_max_interval(
+                    self._apply_nms(stage2_candidates),
+                    metadata.fps,
+                    source_candidates=stage2_candidates,
+                )
+                if profile_enabled:
+                    _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
+            stage3_rows = [self._serialize_keyframe_info(kf) for kf in keyframes]
+            stage3_path = store.save_stage3(stage3_rows)
+            store.mark_stage_done("3", files={"keyframes": stage3_path}, counts={"keyframes": len(stage3_rows)})
+            keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
 
-        logger.info(f"最終キーフレーム数: {len(keyframes)}個")
-        mean_score = float(np.mean([kf.combined_score for kf in keyframes])) if keyframes else 0.0
-        logger.info(
-            f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
-            f" keyframes={len(keyframes)}, mean_score={mean_score:.4f}"
-        )
+            logger.info(f"Stage 3完了: {len(keyframes)}個")
+            _stage_summary("3", keyframes=len(keyframes), temp_file=stage3_path)
 
-        return keyframes
+            if frame_log_callback:
+                selected_idx = {kf.frame_index for kf in keyframes}
+                for record in stage2_records:
+                    record.is_keyframe = record.frame_index in selected_idx
+                    record.metrics["keyframe_flag"] = 1.0 if record.is_keyframe else 0.0
+                    record.metrics["stage3_selected_flag"] = 1.0 if record.is_keyframe else 0.0
+                    self._emit_frame_log(
+                        frame_log_callback,
+                        {
+                            "frame_index": record.frame_index,
+                            "frame": record.frame,
+                            "is_keyframe": record.is_keyframe,
+                            "metrics": record.metrics,
+                            "quality_scores": record.quality_scores,
+                            "geometric_scores": record.geometric_scores,
+                            "adaptive_scores": record.adaptive_scores,
+                            "t_xyz": record.t_xyz,
+                            "q_wxyz": record.q_wxyz,
+                            "points_world": record.points_world,
+                        },
+                    )
+
+            logger.info(f"最終キーフレーム数: {len(keyframes)}個")
+            mean_score = float(np.mean([kf.combined_score for kf in keyframes])) if keyframes else 0.0
+            logger.info(
+                f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
+                f" keyframes={len(keyframes)}, mean_score={mean_score:.4f}"
+            )
+            success = True
+            return keyframes
+        except Exception as e:
+            try:
+                store.mark_failed(current_stage, str(e))
+            except Exception:
+                pass
+            raise
+        finally:
+            if success:
+                try:
+                    store.cleanup_on_success()
+                except Exception:
+                    logger.debug("stage temp cleanup failed")
 
     def _stage1_fast_filter(self, video_loader, metadata: VideoMetadata,
                            progress_callback: Optional[Callable[[int, int], None]]) -> List[Dict]:
@@ -1930,139 +2270,17 @@ class KeyframeSelector:
         if video_path is None:
             raise RuntimeError("単眼モードのビデオパスが取得できません")
 
-        mono_entries: List[Dict[str, Any]] = []
-        cap = self._open_independent_capture(video_path)
-        try:
-            last_read_idx = -1
-            current_pos = -1
-            if use_grab and frame_indices:
-                first_idx = frame_indices[0]
-                cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
-                current_pos = first_idx
+        from .stage1_engine import run_stage1_mono_scan
 
-            for idx, frame_idx in enumerate(frame_indices):
-                if use_grab:
-                    while current_pos < frame_idx:
-                        ok = cap.grab()
-                        if not ok:
-                            break
-                        current_pos += 1
-                    if current_pos != frame_idx:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                        current_pos = frame_idx
-                else:
-                    if frame_idx != last_read_idx + 1:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                ret, frame = cap.read()
-                if use_grab:
-                    current_pos += 1
-                last_read_idx = frame_idx
-                if not ret or frame is None:
-                    continue
-
-                timestamp = float(frame_idx / max(fps, 1e-6))
-                if quality_filter_enabled:
-                    raw_metrics = compute_raw_metrics(frame, roi_spec=roi_spec, use_orb=quality_use_orb)
-                    mono_entries.append(
-                        {
-                            "frame_idx": int(frame_idx),
-                            "timestamp": timestamp,
-                            "raw": raw_metrics,
-                        }
-                    )
-                else:
-                    quality_scores = self._compute_quality_score(frame)
-                    passes = bool(
-                        quality_scores['sharpness'] >= self.config['LAPLACIAN_THRESHOLD'] and
-                        quality_scores['motion_blur'] <= self.config['MOTION_BLUR_THRESHOLD'] and
-                        quality_scores['exposure'] >= self.config['EXPOSURE_THRESHOLD']
-                    )
-                    quality_scores['passes_threshold'] = passes
-                    if passes:
-                        candidates.append({'frame_idx': frame_idx, 'quality_scores': quality_scores})
-                    self.stage1_quality_records.append(
-                        {
-                            "frame_index": int(frame_idx),
-                            "timestamp": timestamp,
-                            "quality": None,
-                            "is_pass": passes,
-                            "drop_reason": "pass" if passes else "legacy_threshold",
-                            "legacy_quality_scores": dict(quality_scores),
-                        }
-                    )
-
-                if progress_callback:
-                    progress_callback(idx + 1, len(frame_indices))
-        finally:
-            cap.release()
-            logger.debug("Stage 1: 独立キャプチャを解放")
-
-        if not quality_filter_enabled:
-            return candidates
-
-        raw_list = [entry["raw"] for entry in mono_entries]
-        norm_list, stats = normalize_batch_p10_p90(
-            raw_list,
-            p_low=quality_norm_p_low,
-            p_high=quality_norm_p_high,
-            fields=quality_fields,
+        result = run_stage1_mono_scan(
+            video_path=str(video_path),
+            config=self.config,
+            sample_interval=sample_interval,
+            is_running_cb=lambda: True,
+            on_progress_cb=progress_callback,
         )
-        for entry, norm_rec in zip(mono_entries, norm_list):
-            frame_idx = int(entry["frame_idx"])
-            raw = entry["raw"]
-            quality = compose_quality(norm_rec, quality_weights)
-            abs_ok = apply_abs_guard(raw.get("laplacian_var", 0.0), quality_abs_laplacian_min)
-            quality_ok = bool(quality >= quality_threshold)
-            passes = bool(quality_ok and abs_ok)
-            drop_reason = "pass"
-            if not abs_ok:
-                drop_reason = "abs_laplacian_guard"
-            elif not quality_ok:
-                drop_reason = "quality_below_threshold"
-
-            quality_scores = {
-                "sharpness": float(raw.get("laplacian_var", 0.0)),
-                "exposure": float(raw.get("exposure", 0.0)),
-                "motion_blur": 0.0,
-                "softmax_depth": 0.0,
-                "quality": quality,
-                "raw_metrics": dict(raw),
-                "norm_metrics": {k: float(norm_rec.get(f"norm_{k}", 0.0)) for k in quality_fields},
-                "passes_threshold": passes,
-            }
-            if passes:
-                candidates.append({'frame_idx': frame_idx, 'quality_scores': quality_scores})
-
-            self.stage1_quality_records.append(
-                {
-                    "frame_index": frame_idx,
-                    "timestamp": float(entry["timestamp"]),
-                    "quality": quality,
-                    "is_pass": passes,
-                    "drop_reason": drop_reason,
-                    "raw_metrics": dict(raw),
-                    "norm_metrics": {k: float(norm_rec.get(f"norm_{k}", 0.0)) for k in quality_fields},
-                }
-            )
-
-        if quality_debug:
-            passed_count = sum(1 for rec in self.stage1_quality_records if bool(rec.get("is_pass", False)))
-            qualities = np.asarray(
-                [float(rec.get("quality", 0.0)) for rec in self.stage1_quality_records],
-                dtype=np.float64,
-            )
-            q50 = float(np.median(qualities)) if qualities.size > 0 else 0.0
-            logger.info(
-                "stage1_quality_debug,"
-                f" mode=mono, records={len(self.stage1_quality_records)},"
-                f" passed={passed_count}, pass_ratio={100.0*passed_count/max(len(self.stage1_quality_records), 1):.2f},"
-                f" threshold={quality_threshold:.3f}, abs_laplacian_min={quality_abs_laplacian_min:.3f},"
-                f" q50={q50:.4f}, roi={roi_spec.mode}:{roi_spec.ratio:.2f},"
-                f" p_low={quality_norm_p_low:.1f}, p_high={quality_norm_p_high:.1f},"
-                f" stats={stats}"
-            )
-
-        return candidates
+        self.stage1_quality_records = list(result.get("records", []))
+        return list(result.get("candidates", []))
 
     def _stage2_precise_evaluation(
         self,
@@ -2144,6 +2362,12 @@ class KeyframeSelector:
                 "vo_inlier_ratio": 0.0,
                 "vo_rot_deg": float(max(0.0, 1.0 - ssim) * 180.0),
                 "vo_dir_cos_prev": 0.5,
+                "vo_confidence": 0.0,
+                "vo_feature_uniformity": 0.0,
+                "vo_track_sufficiency": 0.0,
+                "vo_pose_plausibility": 0.0,
+                "vo_tracked_count": 0.0,
+                "vo_essential_method": "none",
                 "laplacian_var": float(q_scores.get("sharpness", 0.0)),
                 "match_count": float(g_scores.get("feature_match_count", q_scores.get("seam_features_cur", 0.0))),
                 "overlap_ratio": float(g_scores.get("gric", 0.0)),
@@ -2157,6 +2381,7 @@ class KeyframeSelector:
                 "stationary_penalty_applied": 0.0,
                 "stage0_motion_risk": float(np.clip(stage0_motion_risk, 0.0, 1.0)),
                 "trajectory_consistency": 0.5,
+                "trajectory_consistency_effective": 0.25,
                 "combined_stage2": float(combined),
                 "combined_stage3": float(combined),
                 "stage3_selected_flag": 0.0,

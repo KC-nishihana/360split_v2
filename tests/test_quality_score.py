@@ -5,6 +5,7 @@ from core.quality_score import (
     apply_abs_guard,
     compose_quality,
     compute_raw_metrics,
+    compute_raw_metrics_batch,
     normalize_batch_p10_p90,
 )
 
@@ -22,6 +23,17 @@ def test_compute_raw_metrics_roi_returns_finite(checkerboard_bgr):
     ):
         assert key in metrics
         assert math.isfinite(float(metrics[key]))
+
+
+def test_compute_raw_metrics_batch_matches_single(checkerboard_bgr, gradient_bgr):
+    frames = [checkerboard_bgr, gradient_bgr]
+    singles = [compute_raw_metrics(f, roi_spec="circle:0.4", use_orb=False) for f in frames]
+    batched = compute_raw_metrics_batch(frames, roi_spec="circle:0.4", use_orb=False, gpu_batch_enabled=False)
+    assert len(singles) == len(batched)
+    for a, b in zip(singles, batched):
+        assert a["laplacian_var"] == pytest.approx(b["laplacian_var"], rel=1e-6, abs=1e-6)
+        assert a["tenengrad"] == pytest.approx(b["tenengrad"], rel=1e-6, abs=1e-6)
+        assert a["exposure"] == pytest.approx(b["exposure"], rel=1e-6, abs=1e-6)
 
 
 def test_normalize_batch_p10_p90_bounds():

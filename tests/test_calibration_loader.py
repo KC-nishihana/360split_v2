@@ -12,8 +12,9 @@ def test_load_agisoft_fisheye_xml() -> None:
     assert calib.model == "fisheye"
     assert calib.image_size == (3840, 3840)
     assert calib.dist.shape[0] == 4
-    assert calib.camera_matrix[0, 0] == pytest.approx(1051.5084494794, rel=1e-6)
-    assert calib.camera_matrix[1, 1] == pytest.approx(1052.4021243397, rel=1e-6)
+    # Agisoft schema stores f, b1 where fx = f + b1 and fy = f.
+    assert calib.camera_matrix[0, 0] == pytest.approx(1047.5471925995, rel=1e-6)
+    assert calib.camera_matrix[1, 1] == pytest.approx(1048.7178278271, rel=1e-6)
 
 
 def test_load_agisoft_as_opencv_model() -> None:

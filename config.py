@@ -151,6 +151,13 @@ class KeyframeConfig:
     stage1_batch_size: int = 32        # Stage 1 バッチサイズ
     stage1_grab_threshold: int = 30    # Stage1でgrab方式を使う最大サンプル間隔
     stage1_eval_scale: float = 0.5     # Stage1品質評価の縮小スケール
+    opencv_thread_count: int = 0       # 0=auto
+    stage1_process_workers: int = 0    # 0=auto
+    stage1_prefetch_size: int = 32
+    stage1_metrics_batch_size: int = 64
+    stage1_gpu_batch_enabled: bool = True
+    darwin_capture_backend: str = "auto"  # auto|avfoundation|ffmpeg
+    mps_min_pixels: int = 256 * 256
     thumbnail_size: Tuple[int, int] = (192, 108)
     enable_rerun_logging: bool = False  # GUI実行時のRerunログ有効化
     enable_stage0_scan: bool = True
@@ -170,6 +177,12 @@ class KeyframeConfig:
     vo_adaptive_roi_max: float = 0.70
     vo_fast_fail_inlier_ratio: float = 0.12
     vo_step_proxy_clip_px: float = 80.0
+    vo_essential_method: str = "auto"
+    vo_subpixel_refine: bool = True
+    vo_adaptive_subsample: bool = False
+    vo_subsample_min: int = 1
+    vo_confidence_low_threshold: float = 0.35
+    vo_confidence_mid_threshold: float = 0.55
     calib_xml: str = ""
     front_calib_xml: str = ""
     rear_calib_xml: str = ""
@@ -259,6 +272,13 @@ class KeyframeConfig:
             'STAGE1_BATCH_SIZE': self.stage1_batch_size,
             'STAGE1_GRAB_THRESHOLD': self.stage1_grab_threshold,
             'STAGE1_EVAL_SCALE': self.stage1_eval_scale,
+            'OPENCV_THREAD_COUNT': self.opencv_thread_count,
+            'STAGE1_PROCESS_WORKERS': self.stage1_process_workers,
+            'STAGE1_PREFETCH_SIZE': self.stage1_prefetch_size,
+            'STAGE1_METRICS_BATCH_SIZE': self.stage1_metrics_batch_size,
+            'STAGE1_GPU_BATCH_ENABLED': self.stage1_gpu_batch_enabled,
+            'DARWIN_CAPTURE_BACKEND': self.darwin_capture_backend,
+            'MPS_MIN_PIXELS': self.mps_min_pixels,
             'enable_rerun_logging': self.enable_rerun_logging,
             'ENABLE_STAGE0_SCAN': self.enable_stage0_scan,
             'STAGE0_STRIDE': self.stage0_stride,
@@ -277,6 +297,12 @@ class KeyframeConfig:
             'VO_ADAPTIVE_ROI_MAX': self.vo_adaptive_roi_max,
             'VO_FAST_FAIL_INLIER_RATIO': self.vo_fast_fail_inlier_ratio,
             'VO_STEP_PROXY_CLIP_PX': self.vo_step_proxy_clip_px,
+            'VO_ESSENTIAL_METHOD': self.vo_essential_method,
+            'VO_SUBPIXEL_REFINE': self.vo_subpixel_refine,
+            'VO_ADAPTIVE_SUBSAMPLE': self.vo_adaptive_subsample,
+            'VO_SUBSAMPLE_MIN': self.vo_subsample_min,
+            'VO_CONFIDENCE_LOW_THRESHOLD': self.vo_confidence_low_threshold,
+            'VO_CONFIDENCE_MID_THRESHOLD': self.vo_confidence_mid_threshold,
             'CALIB_XML': self.calib_xml,
             'FRONT_CALIB_XML': self.front_calib_xml,
             'REAR_CALIB_XML': self.rear_calib_xml,
@@ -312,6 +338,17 @@ class KeyframeConfig:
         config.stage1_batch_size = int(max(1, normalized.get('stage1_batch_size', config.stage1_batch_size)))
         config.stage1_grab_threshold = int(max(1, normalized.get('stage1_grab_threshold', config.stage1_grab_threshold)))
         config.stage1_eval_scale = float(np.clip(normalized.get('stage1_eval_scale', config.stage1_eval_scale), 0.1, 1.0))
+        config.opencv_thread_count = int(max(0, normalized.get('opencv_thread_count', config.opencv_thread_count)))
+        config.stage1_process_workers = int(max(0, normalized.get('stage1_process_workers', config.stage1_process_workers)))
+        config.stage1_prefetch_size = int(max(1, normalized.get('stage1_prefetch_size', config.stage1_prefetch_size)))
+        config.stage1_metrics_batch_size = int(max(1, normalized.get('stage1_metrics_batch_size', config.stage1_metrics_batch_size)))
+        config.stage1_gpu_batch_enabled = bool(normalized.get('stage1_gpu_batch_enabled', config.stage1_gpu_batch_enabled))
+        config.darwin_capture_backend = str(
+            normalized.get('darwin_capture_backend', config.darwin_capture_backend) or "auto"
+        ).strip().lower()
+        if config.darwin_capture_backend not in {"auto", "avfoundation", "ffmpeg"}:
+            config.darwin_capture_backend = "auto"
+        config.mps_min_pixels = int(max(1, normalized.get('mps_min_pixels', config.mps_min_pixels)))
         config.selection.min_keyframe_interval = int(normalized.get('min_keyframe_interval', config.selection.min_keyframe_interval))
         config.selection.max_keyframe_interval = int(normalized.get('max_keyframe_interval', config.selection.max_keyframe_interval))
         config.selection.softmax_beta = float(normalized.get('softmax_beta', config.selection.softmax_beta))
@@ -464,6 +501,22 @@ class KeyframeConfig:
         config.vo_adaptive_roi_max = float(np.clip(normalized.get('vo_adaptive_roi_max', config.vo_adaptive_roi_max), config.vo_adaptive_roi_min, 1.0))
         config.vo_fast_fail_inlier_ratio = float(np.clip(normalized.get('vo_fast_fail_inlier_ratio', config.vo_fast_fail_inlier_ratio), 0.0, 1.0))
         config.vo_step_proxy_clip_px = float(max(0.0, normalized.get('vo_step_proxy_clip_px', config.vo_step_proxy_clip_px)))
+        config.vo_essential_method = str(normalized.get('vo_essential_method', config.vo_essential_method) or "auto").strip().lower()
+        if config.vo_essential_method not in {"auto", "ransac", "magsac"}:
+            config.vo_essential_method = "auto"
+        config.vo_subpixel_refine = bool(normalized.get('vo_subpixel_refine', config.vo_subpixel_refine))
+        config.vo_adaptive_subsample = bool(normalized.get('vo_adaptive_subsample', config.vo_adaptive_subsample))
+        config.vo_subsample_min = int(max(1, normalized.get('vo_subsample_min', config.vo_subsample_min)))
+        config.vo_confidence_low_threshold = float(
+            np.clip(normalized.get('vo_confidence_low_threshold', config.vo_confidence_low_threshold), 0.0, 1.0)
+        )
+        config.vo_confidence_mid_threshold = float(
+            np.clip(
+                normalized.get('vo_confidence_mid_threshold', config.vo_confidence_mid_threshold),
+                config.vo_confidence_low_threshold,
+                1.0,
+            )
+        )
         config.calib_xml = str(normalized.get('calib_xml', config.calib_xml) or "")
         config.front_calib_xml = str(normalized.get('front_calib_xml', config.front_calib_xml) or "")
         config.rear_calib_xml = str(normalized.get('rear_calib_xml', config.rear_calib_xml) or "")
@@ -536,6 +589,13 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'detection_device': 'DETECTION_DEVICE',
     'stage1_grab_threshold': 'STAGE1_GRAB_THRESHOLD',
     'stage1_eval_scale': 'STAGE1_EVAL_SCALE',
+    'opencv_thread_count': 'OPENCV_THREAD_COUNT',
+    'stage1_process_workers': 'STAGE1_PROCESS_WORKERS',
+    'stage1_prefetch_size': 'STAGE1_PREFETCH_SIZE',
+    'stage1_metrics_batch_size': 'STAGE1_METRICS_BATCH_SIZE',
+    'stage1_gpu_batch_enabled': 'STAGE1_GPU_BATCH_ENABLED',
+    'darwin_capture_backend': 'DARWIN_CAPTURE_BACKEND',
+    'mps_min_pixels': 'MPS_MIN_PIXELS',
     'enable_profile': 'ENABLE_PROFILE',
     'stage2_perf_profile': 'STAGE2_PERF_PROFILE',
     'stage2_mask_cache_ttl_frames': 'STAGE2_MASK_CACHE_TTL_FRAMES',
@@ -582,6 +642,12 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'vo_adaptive_roi_max': 'VO_ADAPTIVE_ROI_MAX',
     'vo_fast_fail_inlier_ratio': 'VO_FAST_FAIL_INLIER_RATIO',
     'vo_step_proxy_clip_px': 'VO_STEP_PROXY_CLIP_PX',
+    'vo_essential_method': 'VO_ESSENTIAL_METHOD',
+    'vo_subpixel_refine': 'VO_SUBPIXEL_REFINE',
+    'vo_adaptive_subsample': 'VO_ADAPTIVE_SUBSAMPLE',
+    'vo_subsample_min': 'VO_SUBSAMPLE_MIN',
+    'vo_confidence_low_threshold': 'VO_CONFIDENCE_LOW_THRESHOLD',
+    'vo_confidence_mid_threshold': 'VO_CONFIDENCE_MID_THRESHOLD',
     'calib_xml': 'CALIB_XML',
     'front_calib_xml': 'FRONT_CALIB_XML',
     'rear_calib_xml': 'REAR_CALIB_XML',

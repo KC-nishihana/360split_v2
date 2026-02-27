@@ -11,6 +11,7 @@ Apple Silicon (Metal/MPS) と Windows (CUDA) の両環境で
 
 import platform
 import os
+import subprocess
 from enum import Enum
 from typing import Optional
 from functools import lru_cache
@@ -61,6 +62,10 @@ class Accelerator:
         self._cuda_device_name = ""
         self._mps_available = False
         self._num_threads = os.cpu_count() or 4
+        self._opencv_threads = self._num_threads
+        self._manual_thread_count = 0
+        self._mps_min_pixels = 256 * 256
+        self._lap_kernel = None
 
         self._detect_hardware()
         self._configure_opencv_threads()
@@ -113,17 +118,68 @@ class Accelerator:
         # --- CPU最適化 ---
         self._backend = AccelBackend.CPU_OPTIMIZED
 
-    def _configure_opencv_threads(self):
+    def _detect_macos_performance_cores(self) -> Optional[int]:
+        """macOSでPコア数を推定する。失敗時はNone。"""
+        if self._system != "Darwin" or self._machine != "arm64":
+            return None
+        try:
+            res = subprocess.run(
+                ["sysctl", "-n", "hw.perflevel0.logicalcpu"],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            if res.returncode != 0:
+                return None
+            value = int((res.stdout or "").strip())
+            if value > 0:
+                return value
+        except Exception:
+            return None
+        return None
+
+    def _configure_opencv_threads(self, manual_threads: Optional[int] = None):
         """OpenCVのスレッド数を最適化"""
-        # Apple Siliconでは効率コア+パフォーマンスコアの構成を考慮
-        if self._system == "Darwin" and self._machine == "arm64":
-            # Apple Silicon: パフォーマンスコア数を推定（全コアの半分）
-            optimal_threads = max(self._num_threads // 2, 4)
+        override = self._manual_thread_count if manual_threads is None else int(manual_threads)
+        if override > 0:
+            optimal_threads = int(override)
+        elif self._system == "Darwin" and self._machine == "arm64":
+            # Apple Silicon: Pコア優先。取得失敗時は75%をフォールバック
+            perf_cores = self._detect_macos_performance_cores()
+            if perf_cores is not None:
+                optimal_threads = max(int(perf_cores), 4)
+            else:
+                optimal_threads = max(int(round(self._num_threads * 0.75)), 4)
         else:
             optimal_threads = self._num_threads
 
         cv2.setNumThreads(optimal_threads)
+        self._opencv_threads = int(optimal_threads)
         logger.info(f"OpenCVスレッド数: {optimal_threads}")
+
+    def configure_runtime(self, config: Optional[dict] = None) -> None:
+        """
+        実行時設定を反映する。
+
+        対応キー:
+        - OPENCV_THREAD_COUNT / opencv_thread_count
+        - MPS_MIN_PIXELS / mps_min_pixels
+        """
+        cfg = config or {}
+        manual_threads = int(
+            cfg.get(
+                "OPENCV_THREAD_COUNT",
+                cfg.get("opencv_thread_count", self._manual_thread_count),
+            )
+            or 0
+        )
+        self._manual_thread_count = max(0, manual_threads)
+        self._mps_min_pixels = max(
+            1,
+            int(cfg.get("MPS_MIN_PIXELS", cfg.get("mps_min_pixels", self._mps_min_pixels)) or self._mps_min_pixels),
+        )
+        self._configure_opencv_threads()
 
     # === プロパティ ===
 
@@ -160,7 +216,7 @@ class Accelerator:
     @property
     def num_threads(self) -> int:
         """最適スレッド数"""
-        return self._num_threads
+        return self._opencv_threads
 
     @property
     def device_name(self) -> str:
@@ -172,7 +228,7 @@ class Accelerator:
         elif self._backend == AccelBackend.OPENCV_CUDA:
             return f"OpenCV CUDA: {self._cuda_device_name}"
         else:
-            return f"CPU ({self._num_threads} threads)"
+            return f"CPU ({self._opencv_threads} threads)"
 
     # === GPU画像処理ユーティリティ ===
 
@@ -254,6 +310,24 @@ class Accelerator:
             except Exception:
                 pass
 
+        if self._torch_available and self._torch_device is not None and isinstance(frame, np.ndarray):
+            try:
+                import torch
+
+                if code == cv2.COLOR_BGR2GRAY and frame.ndim == 3 and frame.shape[2] >= 3:
+                    t = torch.from_numpy(frame[:, :, :3].astype(np.float32)).to(self._torch_device)
+                    b = t[:, :, 0]
+                    g = t[:, :, 1]
+                    r = t[:, :, 2]
+                    gray = 0.114 * b + 0.587 * g + 0.299 * r
+                    return gray.clamp(0.0, 255.0).to(dtype=torch.uint8).cpu().numpy()
+                if code == cv2.COLOR_GRAY2BGR and frame.ndim == 2:
+                    t = torch.from_numpy(frame.astype(np.float32)).to(self._torch_device)
+                    rgb = torch.stack([t, t, t], dim=-1)
+                    return rgb.clamp(0.0, 255.0).to(dtype=torch.uint8).cpu().numpy()
+            except Exception:
+                pass
+
         return cv2.cvtColor(frame, code)
 
     def gpu_filter2D(self, src: np.ndarray, ddepth: int,
@@ -287,6 +361,34 @@ class Accelerator:
             except Exception:
                 pass
 
+        if self._torch_available and self._torch_device is not None:
+            try:
+                import torch
+                import torch.nn.functional as F
+
+                src_f32 = src.astype(np.float32, copy=False)
+                if src_f32.ndim == 2:
+                    src_t = torch.from_numpy(src_f32).unsqueeze(0).unsqueeze(0).to(self._torch_device)
+                else:
+                    src_t = torch.from_numpy(src_f32).permute(2, 0, 1).unsqueeze(0).to(self._torch_device)
+                ker = torch.from_numpy(kernel.astype(np.float32, copy=False)).to(self._torch_device)
+                kh, kw = int(ker.shape[0]), int(ker.shape[1])
+                ker = ker.unsqueeze(0).unsqueeze(0)
+                if src_t.shape[1] > 1:
+                    ker = ker.repeat(src_t.shape[1], 1, 1, 1)
+                    out = F.conv2d(src_t, ker, padding=(kh // 2, kw // 2), groups=src_t.shape[1])
+                else:
+                    out = F.conv2d(src_t, ker, padding=(kh // 2, kw // 2))
+                if src.ndim == 2:
+                    out_np = out.squeeze(0).squeeze(0).cpu().numpy()
+                else:
+                    out_np = out.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                if src.dtype == np.uint8:
+                    return np.clip(out_np, 0, 255).astype(np.uint8)
+                return out_np.astype(src.dtype, copy=False)
+            except Exception:
+                pass
+
         return cv2.filter2D(src, ddepth, kernel)
 
     def gpu_resize(self, src: np.ndarray, dsize: tuple,
@@ -315,6 +417,33 @@ class Accelerator:
                 gpu_dst = cv2.cuda.resize(gpu_src, dsize,
                                           interpolation=interpolation)
                 return gpu_dst.download()
+            except Exception:
+                pass
+
+        if self._torch_available and self._torch_device is not None:
+            try:
+                import torch
+                import torch.nn.functional as F
+
+                mode = "nearest" if interpolation == cv2.INTER_NEAREST else "bilinear"
+                if src.ndim == 2:
+                    src_t = torch.from_numpy(src.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).to(self._torch_device)
+                else:
+                    src_t = torch.from_numpy(src.astype(np.float32, copy=False)).permute(2, 0, 1).unsqueeze(0).to(self._torch_device)
+                interp_kwargs = {
+                    "size": (int(dsize[1]), int(dsize[0])),
+                    "mode": mode,
+                }
+                if mode != "nearest":
+                    interp_kwargs["align_corners"] = False
+                out = F.interpolate(src_t, **interp_kwargs)
+                if src.ndim == 2:
+                    out_np = out.squeeze(0).squeeze(0).cpu().numpy()
+                else:
+                    out_np = out.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                if src.dtype == np.uint8:
+                    return np.clip(out_np, 0, 255).astype(np.uint8)
+                return out_np.astype(src.dtype, copy=False)
             except Exception:
                 pass
 
@@ -354,6 +483,36 @@ class Accelerator:
             except Exception:
                 pass
 
+        if self._torch_available and self._torch_device is not None:
+            try:
+                import torch
+                import torch.nn.functional as F
+
+                h, w = src.shape[:2]
+                mode = "nearest" if interpolation == cv2.INTER_NEAREST else "bilinear"
+                gx = map_x.astype(np.float32, copy=False)
+                gy = map_y.astype(np.float32, copy=False)
+                grid_x = (2.0 * gx / max(w - 1, 1)) - 1.0
+                grid_y = (2.0 * gy / max(h - 1, 1)) - 1.0
+                grid = np.stack([grid_x, grid_y], axis=-1)
+                grid_t = torch.from_numpy(grid).unsqueeze(0).to(self._torch_device)
+
+                if src.ndim == 2:
+                    src_t = torch.from_numpy(src.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0).to(self._torch_device)
+                else:
+                    src_t = torch.from_numpy(src.astype(np.float32, copy=False)).permute(2, 0, 1).unsqueeze(0).to(self._torch_device)
+
+                out = F.grid_sample(src_t, grid_t, mode=mode, padding_mode="border", align_corners=True)
+                if src.ndim == 2:
+                    out_np = out.squeeze(0).squeeze(0).cpu().numpy()
+                else:
+                    out_np = out.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                if src.dtype == np.uint8:
+                    return np.clip(out_np, 0, 255).astype(np.uint8)
+                return out_np.astype(src.dtype, copy=False)
+            except Exception:
+                pass
+
         return cv2.remap(src, map_x.astype(np.float32),
                          map_y.astype(np.float32), interpolation)
 
@@ -389,20 +548,63 @@ class Accelerator:
                 import torch
                 import torch.nn.functional as F
 
-                kernel = torch.tensor(
-                    [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
-                    dtype=torch.float32, device=self._torch_device
-                ).unsqueeze(0).unsqueeze(0)
+                if gray.size < self._mps_min_pixels:
+                    raise RuntimeError("small_image_cpu_fallback")
+
+                if self._lap_kernel is None:
+                    self._lap_kernel = torch.tensor(
+                        [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+                        dtype=torch.float32,
+                        device=self._torch_device,
+                    ).unsqueeze(0).unsqueeze(0)
 
                 img = torch.from_numpy(gray.astype(np.float32)).unsqueeze(0).unsqueeze(0)
                 img = img.to(self._torch_device)
-                lap = F.conv2d(img, kernel, padding=1)
+                lap = F.conv2d(img, self._lap_kernel, padding=1)
                 return float(lap.var().cpu().item())
             except Exception:
                 pass
 
         lap = cv2.Laplacian(gray, cv2.CV_32F)
         return float(lap.var())
+
+    def batch_laplacian_var(self, grays: list[np.ndarray]) -> list[float]:
+        """
+        複数グレースケール画像のLaplacian分散をバッチ計算する。
+        """
+        if not grays:
+            return []
+        if (
+            (not self._torch_available)
+            or (self._torch_device is None)
+            or (grays[0].size < self._mps_min_pixels)
+        ):
+            return [float(cv2.Laplacian(g, cv2.CV_32F).var()) for g in grays]
+
+        first_shape = grays[0].shape[:2]
+        if any(g.shape[:2] != first_shape for g in grays):
+            return [self.compute_laplacian_var(g) for g in grays]
+
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            if self._lap_kernel is None:
+                self._lap_kernel = torch.tensor(
+                    [[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+                    dtype=torch.float32,
+                    device=self._torch_device,
+                ).unsqueeze(0).unsqueeze(0)
+
+            batch = torch.stack(
+                [torch.from_numpy(g.astype(np.float32, copy=False)) for g in grays],
+                dim=0,
+            ).unsqueeze(1).to(self._torch_device)
+            laps = F.conv2d(batch, self._lap_kernel, padding=1)
+            variances = laps.var(dim=[1, 2, 3])
+            return [float(v) for v in variances.cpu().tolist()]
+        except Exception:
+            return [float(cv2.Laplacian(g, cv2.CV_32F).var()) for g in grays]
 
     def compute_optical_flow_sparse(
         self, prev_gray: np.ndarray, curr_gray: np.ndarray,

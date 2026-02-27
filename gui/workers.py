@@ -14,6 +14,7 @@ ExportWorker:
 import cv2
 import numpy as np
 import os
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -66,6 +67,10 @@ class FrameScoreData:
     vo_pose_valid: bool = False
     vo_attempted: bool = False
     vo_valid: bool = False
+    vo_confidence: float = 0.0
+    vo_feature_uniformity: float = 0.0
+    vo_track_sufficiency: float = 0.0
+    vo_pose_plausibility: float = 0.0
 
 
 def _run_stage1_scan(
@@ -76,161 +81,70 @@ def _run_stage1_scan(
     on_batch_cb=None,
     on_progress_cb=None,
 ) -> List[FrameScoreData]:
-    from core.quality_evaluator import QualityEvaluator
-    from core.quality_score import (
-        compose_quality,
-        compute_raw_metrics,
-        normalize_batch_p10_p90,
-        parse_roi_spec,
-    )
+    from core.video_loader import VideoLoader, DualVideoLoader
+    from core.keyframe_selector import KeyframeSelector
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"ビデオを開けません: {video_path}")
+    if not is_running_cb():
+        return []
+    local_config = dict(config or {})
+    local_config["SAMPLE_INTERVAL"] = int(max(1, sample_interval))
 
+    backend_pref = str(local_config.get("darwin_capture_backend", local_config.get("DARWIN_CAPTURE_BACKEND", "auto")) or "auto")
+    if str(video_path).lower().endswith(".osv"):
+        loader = DualVideoLoader(backend_preference=backend_pref)
+    else:
+        loader = VideoLoader(config=local_config)
     try:
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        stage1_eval_scale = float(config.get('stage1_eval_scale', config.get('STAGE1_EVAL_SCALE', 0.5)))
-        stage1_eval_scale = max(0.1, min(1.0, stage1_eval_scale))
-        evaluator = QualityEvaluator(
-            eval_scale=stage1_eval_scale,
-            motion_blur_method=str(config.get("MOTION_BLUR_METHOD", config.get("motion_blur_method", "legacy"))),
-        )
-        quality_filter_enabled = bool(
-            config.get("QUALITY_FILTER_ENABLED", config.get("quality_filter_enabled", True))
-        )
-        quality_use_orb = bool(config.get("QUALITY_USE_ORB", config.get("quality_use_orb", True)))
-        quality_norm_p_low = float(
-            config.get("QUALITY_NORM_P_LOW", config.get("quality_norm_p_low", 10.0))
-        )
-        quality_norm_p_high = float(
-            config.get("QUALITY_NORM_P_HIGH", config.get("quality_norm_p_high", 90.0))
-        )
-        roi_mode = str(config.get("QUALITY_ROI_MODE", config.get("quality_roi_mode", "circle"))).strip().lower()
-        roi_ratio = float(config.get("QUALITY_ROI_RATIO", config.get("quality_roi_ratio", 0.40)))
-        quality_weights = {
-            "quality_weight_sharpness": float(
-                config.get("QUALITY_WEIGHT_SHARPNESS", config.get("quality_weight_sharpness", 0.40))
-            ),
-            "quality_weight_tenengrad": float(
-                config.get("QUALITY_WEIGHT_TENENGRAD", config.get("quality_weight_tenengrad", 0.30))
-            ),
-            "quality_weight_exposure": float(
-                config.get("QUALITY_WEIGHT_EXPOSURE", config.get("quality_weight_exposure", 0.15))
-            ),
-            "quality_weight_keypoints": float(
-                config.get("QUALITY_WEIGHT_KEYPOINTS", config.get("quality_weight_keypoints", 0.15))
-            ),
-        }
-        roi_spec = parse_roi_spec(f"{roi_mode}:{roi_ratio}")
-        quality_fields = ("laplacian_var", "tenengrad", "exposure", "orb_keypoints")
-        orb_obj = cv2.ORB_create(nfeatures=2000) if quality_use_orb else None
+        if str(video_path).lower().endswith(".osv"):
+            loader.load(video_path)
+        else:
+            loader.load(video_path)
+        _ensure_runtime_calibration(local_config, loader)
+        metadata = loader.get_metadata()
+        if metadata is None:
+            raise RuntimeError("Stage1: メタデータ取得に失敗しました")
 
-        all_scores: List[FrameScoreData] = []
-        batch: List[FrameScoreData] = []
-        quality_records: List[dict] = []
-        batch_size = int(config.get('STAGE1_BATCH_SIZE', 32))
-        frame_indices = list(range(0, total_frames, sample_interval))
-        grab_threshold = int(config.get('stage1_grab_threshold', config.get('STAGE1_GRAB_THRESHOLD', 30)))
-        use_grab = (sample_interval > 1 and sample_interval <= grab_threshold)
-        last_read = -1
-        current_pos = -1
-
-        if use_grab and frame_indices:
-            first_idx = frame_indices[0]
-            cap.set(cv2.CAP_PROP_POS_FRAMES, first_idx)
-            current_pos = first_idx
-
-        for count, frame_idx in enumerate(frame_indices):
-            if not is_running_cb():
-                break
-
-            if use_grab:
-                while current_pos < frame_idx:
-                    ok = cap.grab()
-                    if not ok:
-                        break
-                    current_pos += 1
-                if current_pos != frame_idx:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                    current_pos = frame_idx
-            else:
-                if frame_idx != last_read + 1:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if use_grab:
-                current_pos += 1
-            last_read = frame_idx
-
-            if not ret or frame is None:
-                continue
-
-            if quality_filter_enabled:
-                raw = compute_raw_metrics(
-                    frame,
-                    roi_spec=roi_spec,
-                    use_orb=quality_use_orb,
-                    orb=orb_obj,
-                )
-                quality_records.append(
-                    {
-                        "frame_index": int(frame_idx),
-                        "timestamp": float(frame_idx / fps),
-                        "raw_metrics": raw,
-                    }
-                )
-            else:
-                scores = evaluator.evaluate_stage1_fast(frame)
-                fsd = FrameScoreData(
-                    frame_index=frame_idx,
-                    timestamp=frame_idx / fps,
-                    sharpness=scores.get('sharpness', 0.0),
-                    exposure=scores.get('exposure', 0.0),
-                    motion_blur=scores.get('motion_blur', 0.0),
-                    quality=0.0,
-                )
-                all_scores.append(fsd)
-                batch.append(fsd)
-
-                if len(batch) >= batch_size:
-                    if on_batch_cb is not None:
-                        on_batch_cb(list(batch))
-                    batch.clear()
-            if on_progress_cb is not None:
-                on_progress_cb(count + 1, len(frame_indices))
-
-        if quality_filter_enabled:
-            raw_only = [item["raw_metrics"] for item in quality_records]
-            norm_list, _stats = normalize_batch_p10_p90(
-                raw_only,
-                p_low=quality_norm_p_low,
-                p_high=quality_norm_p_high,
-                fields=quality_fields,
-            )
-            for item, norm in zip(quality_records, norm_list):
-                raw = item["raw_metrics"]
-                q = compose_quality(norm, quality_weights)
-                fsd = FrameScoreData(
-                    frame_index=int(item["frame_index"]),
-                    timestamp=float(item["timestamp"]),
-                    sharpness=float(raw.get("laplacian_var", 0.0)),
-                    exposure=float(raw.get("exposure", 0.0)),
-                    motion_blur=0.0,
-                    quality=float(q),
-                )
-                all_scores.append(fsd)
-                batch.append(fsd)
-                if len(batch) >= batch_size:
-                    if on_batch_cb is not None:
-                        on_batch_cb(list(batch))
-                    batch.clear()
-
-        if batch and on_batch_cb is not None:
-            on_batch_cb(list(batch))
-        return all_scores
+        selector = KeyframeSelector(config=local_config)
+        selector.run_stage1_scan(loader, metadata, progress_callback=on_progress_cb)
+        records = list(selector.stage1_quality_records or [])
     finally:
-        cap.release()
+        loader.close()
+
+    all_scores: List[FrameScoreData] = []
+    batch: List[FrameScoreData] = []
+    batch_size = int(config.get("STAGE1_BATCH_SIZE", 32))
+
+    for rec in records:
+        legacy = rec.get("legacy_quality_scores")
+        raw = rec.get("raw_metrics", {})
+        if isinstance(legacy, dict):
+            fsd = FrameScoreData(
+                frame_index=int(rec.get("frame_index", 0)),
+                timestamp=float(rec.get("timestamp", 0.0)),
+                sharpness=float(legacy.get("sharpness", 0.0)),
+                exposure=float(legacy.get("exposure", 0.0)),
+                motion_blur=float(legacy.get("motion_blur", 0.0)),
+                quality=0.0,
+            )
+        else:
+            fsd = FrameScoreData(
+                frame_index=int(rec.get("frame_index", 0)),
+                timestamp=float(rec.get("timestamp", 0.0)),
+                sharpness=float(raw.get("laplacian_var", 0.0)),
+                exposure=float(raw.get("exposure", 0.0)),
+                motion_blur=0.0,
+                quality=float(rec.get("quality", 0.0) or 0.0),
+            )
+        all_scores.append(fsd)
+        batch.append(fsd)
+        if len(batch) >= batch_size:
+            if on_batch_cb is not None:
+                on_batch_cb(list(batch))
+            batch.clear()
+
+    if batch and on_batch_cb is not None:
+        on_batch_cb(list(batch))
+    return all_scores
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +260,13 @@ class Stage2Worker(QThread):
         try:
             from core.video_loader import VideoLoader, DualVideoLoader
             from core.keyframe_selector import KeyframeSelector
+            from core.stage_temp_store import StageTempStore
             stage_label = str(self.config.get("analysis_stage_label", "Stage 2"))
+            run_id = str(self.config.get("analysis_run_id", self.config.get("ANALYSIS_RUN_ID", "")) or "").strip()
+            if run_id in {"", "n/a", "none", "null"}:
+                run_id = str(uuid.uuid4())
+                self.config["analysis_run_id"] = run_id
+                self.config["ANALYSIS_RUN_ID"] = run_id
             logger.info(
                 "worker_start, worker=Stage2Worker,"
                 f" stage_label={stage_label},"
@@ -359,15 +279,66 @@ class Stage2Worker(QThread):
             )
 
             if str(self.video_path).lower().endswith(".osv"):
-                loader = DualVideoLoader()
+                backend_pref = str(
+                    self.config.get("darwin_capture_backend", self.config.get("DARWIN_CAPTURE_BACKEND", "auto")) or "auto"
+                )
+                loader = DualVideoLoader(backend_preference=backend_pref)
                 loader.load(self.video_path)
                 logger.info("Stage2Worker: OSV入力をDualVideoLoaderで解析します（paired mode）")
             else:
-                loader = VideoLoader()
+                loader = VideoLoader(config=self.config)
                 loader.load(self.video_path)
             _ensure_runtime_calibration(self.config, loader)
 
             selector = KeyframeSelector(config=self.config)
+            stage_store = StageTempStore(run_id=run_id)
+            if self.stage1_scores:
+                quality_filter_enabled = bool(self.config.get("QUALITY_FILTER_ENABLED", self.config.get("quality_filter_enabled", True)))
+                quality_threshold = float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50)))
+                abs_lap = float(self.config.get("QUALITY_ABS_LAPLACIAN_MIN", self.config.get("quality_abs_laplacian_min", 35.0)))
+                lap_th = float(self.config.get("LAPLACIAN_THRESHOLD", self.config.get("laplacian_threshold", 100.0)))
+                blur_th = float(self.config.get("MOTION_BLUR_THRESHOLD", self.config.get("motion_blur_threshold", 0.3)))
+                exp_th = float(self.config.get("EXPOSURE_THRESHOLD", self.config.get("exposure_threshold", 0.35)))
+
+                stage1_candidates = []
+                stage1_records = []
+                for s1 in self.stage1_scores:
+                    quality = float(getattr(s1, "quality", 0.0))
+                    sharpness = float(getattr(s1, "sharpness", 0.0))
+                    exposure = float(getattr(s1, "exposure", 0.0))
+                    motion_blur = float(getattr(s1, "motion_blur", 0.0))
+                    if quality_filter_enabled:
+                        passes = bool(quality >= quality_threshold and sharpness >= abs_lap)
+                        drop_reason = "pass" if passes else ("abs_laplacian_guard" if sharpness < abs_lap else "quality_below_threshold")
+                    else:
+                        passes = bool(sharpness >= lap_th and motion_blur <= blur_th and exposure >= exp_th)
+                        drop_reason = "pass" if passes else "legacy_threshold"
+                    q_scores = {
+                        "sharpness": sharpness,
+                        "exposure": exposure,
+                        "motion_blur": motion_blur,
+                        "quality": quality,
+                        "passes_threshold": passes,
+                    }
+                    if passes:
+                        stage1_candidates.append({"frame_idx": int(s1.frame_index), "quality_scores": dict(q_scores)})
+                    stage1_records.append(
+                        {
+                            "frame_index": int(s1.frame_index),
+                            "timestamp": float(s1.timestamp),
+                            "quality": quality if quality_filter_enabled else None,
+                            "is_pass": bool(passes),
+                            "drop_reason": drop_reason,
+                            "legacy_quality_scores": None if quality_filter_enabled else dict(q_scores),
+                        }
+                    )
+                files = stage_store.save_stage1(stage1_candidates, stage1_records)
+                stage_store.mark_stage_done(
+                    "1",
+                    files=files,
+                    counts={"candidates": len(stage1_candidates), "records": len(stage1_records)},
+                )
+
             rerun_logger = None
             metrics_map: Dict[int, Dict[str, float]] = {}
             pose_map: Dict[int, Dict[str, Optional[List[float]]]] = {}
@@ -424,6 +395,7 @@ class Stage2Worker(QThread):
                 loader,
                 progress_callback=progress_cb,
                 frame_log_callback=frame_log_cb,
+                stage_temp_store=stage_store,
             )
 
             loader.close()
@@ -462,6 +434,10 @@ class Stage2Worker(QThread):
                 fsd.vo_pose_valid = bool(float(m.get('vo_pose_valid', 0.0)) > 0.5)
                 fsd.vo_attempted = bool(float(m.get('vo_attempted', 0.0)) > 0.5)
                 fsd.vo_valid = bool(float(m.get('vo_valid', 0.0)) > 0.5)
+                fsd.vo_confidence = float(m.get('vo_confidence', 0.0))
+                fsd.vo_feature_uniformity = float(m.get('vo_feature_uniformity', 0.0))
+                fsd.vo_track_sufficiency = float(m.get('vo_track_sufficiency', 0.0))
+                fsd.vo_pose_plausibility = float(m.get('vo_pose_plausibility', 0.0))
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
@@ -533,7 +509,12 @@ class UnifiedAnalysisWorker(QThread):
         try:
             from core.video_loader import VideoLoader, DualVideoLoader
             from core.keyframe_selector import KeyframeSelector
-            run_id = str(self.config.get("analysis_run_id", "n/a"))
+            from core.stage_temp_store import StageTempStore
+            run_id = str(self.config.get("analysis_run_id", self.config.get("ANALYSIS_RUN_ID", "")) or "").strip()
+            if run_id in {"", "n/a", "none", "null"}:
+                run_id = str(uuid.uuid4())
+                self.config["analysis_run_id"] = run_id
+                self.config["ANALYSIS_RUN_ID"] = run_id
             logger.info(
                 "worker_start, worker=UnifiedAnalysisWorker,"
                 f" analysis_run_id={run_id},"
@@ -542,7 +523,6 @@ class UnifiedAnalysisWorker(QThread):
                 f" enable_stage3_refinement={bool(self.config.get('enable_stage3_refinement', self.config.get('ENABLE_STAGE3_REFINEMENT', True)))}"
             )
 
-            # ----- Stage 1: 高速品質スキャン -----
             self.progress.emit(0, 100, "Stage 1: 品質スキャン開始...")
 
             sample_interval = int(self.config.get('SAMPLE_INTERVAL', 1))
@@ -555,92 +535,144 @@ class UnifiedAnalysisWorker(QThread):
                 pct = int(current / max(total, 1) * stage1_weight_pct)
                 self.progress.emit(pct, 100, f"Stage 1: {current}/{max(total, 1)}")
 
-            all_scores = _run_stage1_scan(
-                video_path=self.video_path,
-                config=self.config,
-                sample_interval=sample_interval,
-                is_running_cb=lambda: self._is_running,
-                on_batch_cb=lambda items: self.stage1_batch.emit(items),
-                on_progress_cb=_on_progress,
+            backend_pref = str(
+                self.config.get("darwin_capture_backend", self.config.get("DARWIN_CAPTURE_BACKEND", "auto")) or "auto"
             )
-
-            if not self._is_running:
-                return
-
-            self.stage1_finished.emit(all_scores)
-            self.progress.emit(stage1_weight_pct, 100, "Stage 1 完了。Stage 2/3 開始...")
-
-            # ----- Stage 2: 精密評価 -----
             if str(self.video_path).lower().endswith(".osv"):
-                loader = DualVideoLoader()
+                loader = DualVideoLoader(backend_preference=backend_pref)
                 loader.load(self.video_path)
                 logger.info("UnifiedAnalysisWorker: OSV入力をDualVideoLoaderで解析します（paired mode）")
             else:
-                loader = VideoLoader()
+                loader = VideoLoader(config=self.config)
                 loader.load(self.video_path)
-            _ensure_runtime_calibration(self.config, loader)
+            try:
+                _ensure_runtime_calibration(self.config, loader)
+                metadata = loader.get_metadata()
+                if metadata is None:
+                    raise RuntimeError("メタデータ取得に失敗しました")
 
-            selector = KeyframeSelector(config=self.config)
-            rerun_logger = None
-            metrics_map: Dict[int, Dict[str, float]] = {}
-            pose_map: Dict[int, Dict[str, Optional[List[float]]]] = {}
-            if bool(self.config.get("enable_rerun_logging", False)):
-                rerun_logger = RerunKeyframeLogger(
-                    app_id="keyframe_check_gui_full",
-                    spawn=bool(self.config.get("rerun_spawn", True)),
-                    save_path=self.config.get("rerun_save_path"),
-                    timeline_name="frame",
+                selector = KeyframeSelector(config=self.config)
+                stage_store = StageTempStore(run_id=run_id)
+
+                # ----- Stage 1 -----
+                stage1_artifact = selector.run_stage1_scan(
+                    loader,
+                    metadata,
+                    progress_callback=_on_progress,
+                )
+                stage1_files = stage_store.save_stage1(stage1_artifact.candidates, stage1_artifact.records)
+                stage_store.mark_stage_done(
+                    "1",
+                    files=stage1_files,
+                    counts={
+                        "candidates": len(stage1_artifact.candidates),
+                        "records": len(stage1_artifact.records),
+                        "sampled_frames": int(stage1_artifact.sampled_frames),
+                    },
                 )
 
-            def progress_cb(current, total, message=""):
-                if not self._is_running:
-                    return
-                pct = stage1_weight_pct + int(current / max(total, 1) * (100 - stage1_weight_pct))
-                pct = max(stage1_weight_pct, min(100, pct))
-                self.progress.emit(pct, 100,
-                                   f"解析: {current}/{total} {message}")
+                records = list(stage1_artifact.records or [])
+                all_scores: List[FrameScoreData] = []
+                batch: List[FrameScoreData] = []
+                batch_size = int(self.config.get("STAGE1_BATCH_SIZE", 32))
+                for rec in records:
+                    legacy = rec.get("legacy_quality_scores")
+                    raw = rec.get("raw_metrics", {})
+                    if isinstance(legacy, dict):
+                        fsd = FrameScoreData(
+                            frame_index=int(rec.get("frame_index", 0)),
+                            timestamp=float(rec.get("timestamp", 0.0)),
+                            sharpness=float(legacy.get("sharpness", 0.0)),
+                            exposure=float(legacy.get("exposure", 0.0)),
+                            motion_blur=float(legacy.get("motion_blur", 0.0)),
+                            quality=0.0,
+                        )
+                    else:
+                        fsd = FrameScoreData(
+                            frame_index=int(rec.get("frame_index", 0)),
+                            timestamp=float(rec.get("timestamp", 0.0)),
+                            sharpness=float(raw.get("laplacian_var", 0.0)),
+                            exposure=float(raw.get("exposure", 0.0)),
+                            motion_blur=0.0,
+                            quality=float(rec.get("quality", 0.0) or 0.0),
+                        )
+                    all_scores.append(fsd)
+                    batch.append(fsd)
+                    if len(batch) >= batch_size:
+                        self.stage1_batch.emit(list(batch))
+                        batch.clear()
+                if batch:
+                    self.stage1_batch.emit(list(batch))
 
-            def frame_log_cb(payload: dict):
                 if not self._is_running:
                     return
-                frame_idx = int(payload.get("frame_index", 0))
-                metrics_map[frame_idx] = dict(payload.get("metrics", {}))
-                t_xyz = payload.get("t_xyz")
-                q_wxyz = payload.get("q_wxyz")
-                t_xyz_list = [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None
-                q_wxyz_list = [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None
-                pose_map[frame_idx] = {
-                    "t_xyz": t_xyz_list,
-                    "q_wxyz": q_wxyz_list,
-                }
-                if t_xyz_list is not None:
-                    self.trajectory_updated.emit(
-                        {
-                            "frame_index": frame_idx,
-                            "t_xyz": t_xyz_list,
-                            "q_wxyz": q_wxyz_list,
-                            "is_keyframe": bool(payload.get("is_keyframe", False)),
-                            "is_stationary": bool(float(metrics_map[frame_idx].get("is_stationary", 0.0)) > 0.5),
-                        }
+
+                self.stage1_finished.emit(all_scores)
+                self.progress.emit(stage1_weight_pct, 100, "Stage 1 完了。Stage 0/2/3 開始...")
+
+                # ----- Stage 0/2/3 via selector -----
+                rerun_logger = None
+                metrics_map: Dict[int, Dict[str, float]] = {}
+                pose_map: Dict[int, Dict[str, Optional[List[float]]]] = {}
+                if bool(self.config.get("enable_rerun_logging", False)):
+                    rerun_logger = RerunKeyframeLogger(
+                        app_id="keyframe_check_gui_full",
+                        spawn=bool(self.config.get("rerun_spawn", True)),
+                        save_path=self.config.get("rerun_save_path"),
+                        timeline_name="frame",
                     )
-                if rerun_logger is None or not rerun_logger.enabled:
-                    return
-                rerun_logger.log_frame(
-                    frame_idx=frame_idx,
-                    img=payload.get("frame"),
-                    t_xyz=payload.get("t_xyz"),
-                    q_wxyz=payload.get("q_wxyz"),
-                    is_keyframe=bool(payload.get("is_keyframe", False)),
-                    metrics=payload.get("metrics", {}),
-                    points_world=payload.get("points_world"),
-                )
 
-            keyframes = selector.select_keyframes(
-                loader,
-                progress_callback=progress_cb,
-                frame_log_callback=frame_log_cb,
-            )
-            loader.close()
+                def progress_cb(current, total, message=""):
+                    if not self._is_running:
+                        return
+                    pct = stage1_weight_pct + int(current / max(total, 1) * (100 - stage1_weight_pct))
+                    pct = max(stage1_weight_pct, min(100, pct))
+                    self.progress.emit(pct, 100,
+                                       f"解析: {current}/{total} {message}")
+
+                def frame_log_cb(payload: dict):
+                    if not self._is_running:
+                        return
+                    frame_idx = int(payload.get("frame_index", 0))
+                    metrics_map[frame_idx] = dict(payload.get("metrics", {}))
+                    t_xyz = payload.get("t_xyz")
+                    q_wxyz = payload.get("q_wxyz")
+                    t_xyz_list = [float(v) for v in t_xyz] if isinstance(t_xyz, (list, tuple)) and len(t_xyz) == 3 else None
+                    q_wxyz_list = [float(v) for v in q_wxyz] if isinstance(q_wxyz, (list, tuple)) and len(q_wxyz) == 4 else None
+                    pose_map[frame_idx] = {
+                        "t_xyz": t_xyz_list,
+                        "q_wxyz": q_wxyz_list,
+                    }
+                    if t_xyz_list is not None:
+                        self.trajectory_updated.emit(
+                            {
+                                "frame_index": frame_idx,
+                                "t_xyz": t_xyz_list,
+                                "q_wxyz": q_wxyz_list,
+                                "is_keyframe": bool(payload.get("is_keyframe", False)),
+                                "is_stationary": bool(float(metrics_map[frame_idx].get("is_stationary", 0.0)) > 0.5),
+                            }
+                        )
+                    if rerun_logger is None or not rerun_logger.enabled:
+                        return
+                    rerun_logger.log_frame(
+                        frame_idx=frame_idx,
+                        img=payload.get("frame"),
+                        t_xyz=payload.get("t_xyz"),
+                        q_wxyz=payload.get("q_wxyz"),
+                        is_keyframe=bool(payload.get("is_keyframe", False)),
+                        metrics=payload.get("metrics", {}),
+                        points_world=payload.get("points_world"),
+                    )
+
+                keyframes = selector.select_keyframes(
+                    loader,
+                    progress_callback=progress_cb,
+                    frame_log_callback=frame_log_cb,
+                    stage_temp_store=stage_store,
+                )
+            finally:
+                loader.close()
 
             if not self._is_running:
                 return
@@ -674,6 +706,10 @@ class UnifiedAnalysisWorker(QThread):
                 fsd.vo_pose_valid = bool(float(m.get('vo_pose_valid', 0.0)) > 0.5)
                 fsd.vo_attempted = bool(float(m.get('vo_attempted', 0.0)) > 0.5)
                 fsd.vo_valid = bool(float(m.get('vo_valid', 0.0)) > 0.5)
+                fsd.vo_confidence = float(m.get('vo_confidence', 0.0))
+                fsd.vo_feature_uniformity = float(m.get('vo_feature_uniformity', 0.0))
+                fsd.vo_track_sufficiency = float(m.get('vo_track_sufficiency', 0.0))
+                fsd.vo_pose_plausibility = float(m.get('vo_pose_plausibility', 0.0))
                 kf = keyframe_map.get(s1.frame_index)
                 if kf is not None:
                     fsd.gric = kf.geometric_scores.get('gric', 0.0)
@@ -1127,10 +1163,16 @@ class ExportWorker(QThread):
     def run(self):
         write_executor = None
         try:
+            from core.video_loader import create_video_capture
+
             output_path = Path(self.output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             stereo_images_root = output_path / "images"
             masks_root = output_path / self.mask_output_dirname
+            backend_pref = str(
+                self.export_runtime_config.get("darwin_capture_backend", self.export_runtime_config.get("DARWIN_CAPTURE_BACKEND", "auto"))
+                or "auto"
+            )
             max_write_workers = int(self.export_runtime_config.get("export_write_workers", min(4, os.cpu_count() or 2)))
             max_write_workers = max(1, min(8, max_write_workers))
             if max_write_workers > 1:
@@ -1139,8 +1181,8 @@ class ExportWorker(QThread):
             # ステレオ判定
             if self.is_stereo and self.stereo_left_path and self.stereo_right_path:
                 # ステレオペア出力モード
-                cap_l = cv2.VideoCapture(self.stereo_left_path)
-                cap_r = cv2.VideoCapture(self.stereo_right_path)
+                cap_l = create_video_capture(self.stereo_left_path, backend_preference=backend_pref)
+                cap_r = create_video_capture(self.stereo_right_path, backend_preference=backend_pref)
                 if not cap_l.isOpened() or not cap_r.isOpened():
                     self.error.emit(f"ステレオストリームを開けません")
                     return
@@ -1148,7 +1190,7 @@ class ExportWorker(QThread):
                 cap = None  # 単眼キャプチャは使用しない
             else:
                 # 通常の単眼モード
-                cap = cv2.VideoCapture(self.video_path)
+                cap = create_video_capture(self.video_path, backend_preference=backend_pref)
                 if not cap.isOpened():
                     self.error.emit(f"ビデオを開けません: {self.video_path}")
                     return

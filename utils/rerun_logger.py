@@ -46,6 +46,7 @@ class RerunKeyframeLogger:
     ) -> None:
         self.timeline_name = timeline_name
         self._trajectory: list[np.ndarray] = []
+        self._trajectory_colors: list[np.ndarray] = []
         self._keyframes: list[np.ndarray] = []
         self._rr = None
 
@@ -89,6 +90,23 @@ class RerunKeyframeLogger:
             # Fallback for SDK variants expecting XYZW.
             return self._rr.Quaternion(xyzw=np.asarray([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=np.float32))
 
+    @staticmethod
+    def _confidence_to_color(vo_valid: bool, confidence: float) -> np.ndarray:
+        if not vo_valid:
+            return np.asarray([120, 120, 120], dtype=np.uint8)
+        c = float(np.clip(confidence, 0.0, 1.0))
+        if c >= 0.5:
+            t = (c - 0.5) / 0.5
+            r = int(round(255 * (1.0 - t)))
+            g = 255
+            b = 0
+            return np.asarray([r, g, b], dtype=np.uint8)
+        t = c / 0.5
+        r = 255
+        g = int(round(255 * t))
+        b = 0
+        return np.asarray([r, g, b], dtype=np.uint8)
+
     def log_frame(
         self,
         frame_idx: int,
@@ -122,15 +140,18 @@ class RerunKeyframeLogger:
         )
 
         self._trajectory.append(translation.astype(np.float32))
+        vo_valid_metric = bool(float((metrics or {}).get("vo_valid", 0.0)) > 0.5)
+        vo_conf = float((metrics or {}).get("vo_confidence", 0.0))
+        self._trajectory_colors.append(self._confidence_to_color(vo_valid_metric, vo_conf))
         traj = np.asarray(self._trajectory, dtype=np.float32)
-        traj_colors = np.tile(np.asarray([[70, 130, 255]], dtype=np.uint8), (traj.shape[0], 1))
+        traj_colors = np.asarray(self._trajectory_colors, dtype=np.uint8)
         if hasattr(self._rr, "LineStrips3D"):
             try:
-                self._rr.log("world/trajectory", self._rr.LineStrips3D([traj], colors=np.asarray([[70, 130, 255]], dtype=np.uint8)))
+                self._rr.log("world/trajectory/line", self._rr.LineStrips3D([traj], colors=np.asarray([[130, 130, 130]], dtype=np.uint8)))
             except Exception:
-                self._rr.log("world/trajectory", self._rr.Points3D(traj, colors=traj_colors))
-        else:
-            self._rr.log("world/trajectory", self._rr.Points3D(traj, colors=traj_colors))
+                pass
+        self._rr.log("world/trajectory/points", self._rr.Points3D(traj, colors=traj_colors))
+        self._rr.log("world/trajectory", self._rr.Points3D(traj, colors=traj_colors))
 
         if is_keyframe:
             self._keyframes.append(translation.astype(np.float32))

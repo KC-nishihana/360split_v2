@@ -10,7 +10,7 @@
 機能:
   - ドラッグ＆ドロップでの動画読み込み
   - メニューバー: ファイル(F), 表示(V)
-  - 単一解析実行（Stage0→1→2→3）
+  - 単一解析実行（Stage1→0→2→3）
   - Live Preview (パラメータ変更 → 判定再実行)
 """
 
@@ -19,6 +19,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional, List
+import numpy as np
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -264,11 +265,13 @@ class MainWindow(QMainWindow):
         # タイムライン → ビデオプレーヤー同期
         self.timeline.positionChanged.connect(self.video_player.seek_to_frame)
         self.timeline.keyframeClicked.connect(self.video_player.seek_to_frame)
+        self.timeline.keyframeAddRequested.connect(self._on_manual_mark)
+        self.timeline.keyframeRemoveRequested.connect(self._on_manual_unmark)
         self.trajectory.frameSelected.connect(self.video_player.seek_to_frame)
 
         # キーフレーム一覧 → ビデオプレーヤー
         self.keyframe_list.keyframe_selected.connect(self.video_player.seek_to_frame)
-        self.keyframe_list.keyframe_deleted.connect(self.timeline.remove_keyframe)
+        self.keyframe_list.keyframe_deleted.connect(self._on_keyframe_deleted)
 
         # 設定パネル → Live Preview
         self.settings_panel.setting_changed.connect(self._on_live_preview)
@@ -418,7 +421,7 @@ class MainWindow(QMainWindow):
             logger.info("設定パネルを再読み込みしました")
 
     # ==================================================================
-    # 解析実行（Stage0->1->2->3）
+    # 解析実行（Stage1->0->2->3）
     # ==================================================================
 
     def _run_analysis(self, trigger_source: str = "unknown"):
@@ -433,7 +436,7 @@ class MainWindow(QMainWindow):
         self.trajectory.reset_runtime_trajectory()
 
         config = self.settings_panel.get_selector_dict()
-        # GUI統合モードでは常に Stage0->1->2->3 を実行する
+        # GUI統合モードでは常に Stage1->0->2->3 を実行する
         config["enable_stage0_scan"] = True
         config["ENABLE_STAGE0_SCAN"] = True
         config["enable_stage3_refinement"] = True
@@ -444,7 +447,7 @@ class MainWindow(QMainWindow):
         config["ANALYSIS_RUN_ID"] = self._analysis_run_id
         self._log_analysis_request(
             trigger_source=trigger_source,
-            stage_mode_label="Unified(Stage0->1->2->3)",
+            stage_mode_label="Unified(Stage1->0->2->3)",
             config=config,
             overrides={},
         )
@@ -461,7 +464,7 @@ class MainWindow(QMainWindow):
 
         self._progress_bar.setVisible(True)
         self._progress_bar.setValue(0)
-        self.statusBar().showMessage("解析実行中... (Stage0→1→2→3)")
+        self.statusBar().showMessage("解析実行中... (Stage1→0→2→3)")
         self._analysis_worker.start()
 
     def _on_stage1_batch(self, batch: list):
@@ -483,7 +486,15 @@ class MainWindow(QMainWindow):
         norm_factor = 1000.0
         indices = [s.frame_index for s in all_scores]
         sharpness = [min(s.sharpness / norm_factor, 1.0) for s in all_scores]
-        self.timeline.set_score_data(indices, sharpness)
+        vo_conf = [float(getattr(s, "vo_confidence", 0.0)) for s in all_scores]
+        vo_low, vo_mid = self._get_vo_conf_thresholds()
+        self.timeline.set_score_data(
+            indices,
+            sharpness,
+            vo_confidence=vo_conf,
+            vo_confidence_low_threshold=vo_low,
+            vo_confidence_mid_threshold=vo_mid,
+        )
         self.timeline.set_stationary_ranges([])
         vo_summary = self._compute_vo_summary(all_scores)
         self._last_vo_summary = vo_summary
@@ -502,6 +513,8 @@ class MainWindow(QMainWindow):
         sharpness = [min(s.sharpness / norm_factor, 1.0) for s in updated]
         gric = [s.gric for s in updated]
         ssim_change = [1.0 - s.ssim for s in updated]
+        vo_conf = [float(getattr(s, "vo_confidence", 0.0)) for s in updated]
+        vo_low, vo_mid = self._get_vo_conf_thresholds()
 
         # GRICデータがあるか確認
         has_gric = any(g > 0 for g in gric)
@@ -510,7 +523,10 @@ class MainWindow(QMainWindow):
         self.timeline.set_score_data(
             indices, sharpness,
             gric=gric if has_gric else None,
-            ssim_change=ssim_change if has_ssim else None
+            ssim_change=ssim_change if has_ssim else None,
+            vo_confidence=vo_conf,
+            vo_confidence_low_threshold=vo_low,
+            vo_confidence_mid_threshold=vo_mid,
         )
         self.timeline.set_stationary_ranges(self._extract_stationary_ranges(updated))
         vo_summary = self._compute_vo_summary(updated)
@@ -562,11 +578,9 @@ class MainWindow(QMainWindow):
             for kf in keyframes
             if getattr(kf, "dynamic_mask", None) is not None
         }
-
-        self.timeline.set_keyframes(frames, scores)
         self.keyframe_list.set_keyframes(frames, scores)
-        self.video_player.set_keyframe_indices(frames)
-        self.trajectory.set_frame_data(self._stage1_scores, frames, vo_summary=self._compute_vo_summary(self._stage1_scores))
+        self._apply_keyframe_view_state(frames, scores)
+        self._suggest_keyframe_gaps()
 
     def _on_trajectory_updated(self, payload: dict):
         self._trajectory_runtime_counter += 1
@@ -584,19 +598,79 @@ class MainWindow(QMainWindow):
         """手動キーフレームマーク"""
         if frame_idx not in self.keyframe_list.keyframe_frames:
             self.keyframe_list.keyframe_frames.append(frame_idx)
-            self.keyframe_list.keyframe_scores.append(0.5)
-            self.keyframe_list._load_thumbnail_images()
-            self.keyframe_list._update_display()
-            self.timeline.set_keyframes(
-                self.keyframe_list.keyframe_frames,
-                self.keyframe_list.keyframe_scores
+            self.keyframe_list.keyframe_scores.append(self._compute_manual_stage3_score(frame_idx))
+            self._refresh_manual_keyframes()
+            self._suggest_keyframe_gaps()
+
+    def _on_manual_unmark(self, frame_idx: int):
+        if frame_idx in self.keyframe_list.keyframe_frames:
+            idx = self.keyframe_list.keyframe_frames.index(frame_idx)
+            self.keyframe_list.keyframe_frames.pop(idx)
+            if idx < len(self.keyframe_list.keyframe_scores):
+                self.keyframe_list.keyframe_scores.pop(idx)
+            self._refresh_manual_keyframes()
+            self._suggest_keyframe_gaps()
+
+    def _on_keyframe_deleted(self, frame_idx: int):
+        self.timeline.remove_keyframe(frame_idx)
+        self._refresh_manual_keyframes()
+        self._suggest_keyframe_gaps()
+
+    def _refresh_manual_keyframes(self):
+        pairs = sorted(
+            zip(self.keyframe_list.keyframe_frames, self.keyframe_list.keyframe_scores),
+            key=lambda x: int(x[0]),
+        )
+        self.keyframe_list.keyframe_frames = [int(p[0]) for p in pairs]
+        self.keyframe_list.keyframe_scores = [float(p[1]) for p in pairs]
+        self.keyframe_list._load_thumbnail_images()
+        self.keyframe_list._update_display()
+        self._apply_keyframe_view_state(self.keyframe_list.keyframe_frames, self.keyframe_list.keyframe_scores)
+
+    def _compute_manual_stage3_score(self, frame_idx: int) -> float:
+        if not self._stage1_scores:
+            return 0.5
+        score = next((s for s in self._stage1_scores if int(getattr(s, "frame_index", -1)) == int(frame_idx)), None)
+        if score is None:
+            return 0.5
+        cfg = self.settings_panel.get_selector_dict()
+        w_base = float(cfg.get("STAGE3_WEIGHT_BASE", 0.70))
+        w_traj = float(cfg.get("STAGE3_WEIGHT_TRAJECTORY", 0.25))
+        w_risk = float(cfg.get("STAGE3_WEIGHT_STAGE0_RISK", 0.05))
+        base = float(getattr(score, "combined_stage2", getattr(score, "combined", 0.5)))
+        traj = float(np.clip(getattr(score, "trajectory_consistency", 0.5), 0.0, 1.0))
+        vo_conf = float(np.clip(getattr(score, "vo_confidence", 0.0), 0.0, 1.0))
+        traj_effective = float(np.clip(traj * (0.5 + 0.5 * vo_conf), 0.0, 1.0))
+        risk = float(np.clip(getattr(score, "stage0_motion_risk", 0.0), 0.0, 1.0))
+        return float(np.clip(w_base * base + w_traj * traj_effective - w_risk * risk, 0.0, 1.0))
+
+    def _suggest_keyframe_gaps(self):
+        if not self._stage1_scores or len(self.keyframe_list.keyframe_frames) < 2:
+            return
+        cfg = self.settings_panel.get_selector_dict()
+        max_interval = int(cfg.get("MAX_KEYFRAME_INTERVAL", 60))
+        gap_threshold = int(max(2, round(max_interval * 1.5)))
+        frames_sorted = sorted(int(f) for f in self.keyframe_list.keyframe_frames)
+        for left, right in zip(frames_sorted[:-1], frames_sorted[1:]):
+            if (right - left) <= gap_threshold:
+                continue
+            candidates = [
+                s for s in self._stage1_scores
+                if left < int(getattr(s, "frame_index", -1)) < right
+            ]
+            if not candidates:
+                continue
+            best = max(candidates, key=lambda s: self._compute_manual_stage3_score(int(getattr(s, "frame_index", -1))))
+            best_idx = int(getattr(best, "frame_index", -1))
+            self.statusBar().showMessage(
+                f"キーフレーム間隔が大きい区間を検出: {left}-{right}。候補フレーム {best_idx} を右クリックで追加できます。"
             )
-            self.video_player.set_keyframe_indices(self.keyframe_list.keyframe_frames)
-            self.trajectory.set_frame_data(
-                self._stage1_scores,
-                self.keyframe_list.keyframe_frames,
-                vo_summary=self._compute_vo_summary(self._stage1_scores),
-            )
+            break
+
+    def _apply_keyframe_view_state(self, frames: list[int], scores: list[float]):
+        self.timeline.set_keyframes(frames, scores)
+        self.video_player.set_keyframe_indices(frames)
+        self.trajectory.set_frame_data(self._stage1_scores, frames, vo_summary=self._compute_vo_summary(self._stage1_scores))
 
     # ==================================================================
     # Live Preview
@@ -659,6 +733,12 @@ class MainWindow(QMainWindow):
         if start_idx is not None and end_idx is not None:
             ranges.append((start_idx, end_idx))
         return ranges
+
+    def _get_vo_conf_thresholds(self) -> tuple[float, float]:
+        cfg = self.settings_panel.get_selector_dict()
+        low = float(np.clip(cfg.get("VO_CONFIDENCE_LOW_THRESHOLD", 0.35), 0.0, 1.0))
+        mid = float(np.clip(cfg.get("VO_CONFIDENCE_MID_THRESHOLD", 0.55), low, 1.0))
+        return low, mid
 
     @staticmethod
     def _compute_vo_summary(scores: List[FrameScoreData]) -> Dict[str, object]:

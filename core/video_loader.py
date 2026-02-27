@@ -23,6 +23,45 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def create_video_capture(
+    video_path: str,
+    *,
+    backend_preference: str = "auto",
+) -> cv2.VideoCapture:
+    """
+    プラットフォームに応じて最適な VideoCapture を作成する。
+
+    backend_preference:
+      - auto
+      - avfoundation (Darwin)
+      - ffmpeg
+    """
+    system = platform.system()
+    pref = str(backend_preference or "auto").strip().lower()
+
+    if system == "Darwin":
+        if pref not in {"auto", "avfoundation", "ffmpeg"}:
+            pref = "auto"
+        order = (
+            [cv2.CAP_FFMPEG, cv2.CAP_AVFOUNDATION]
+            if pref == "ffmpeg"
+            else [cv2.CAP_AVFOUNDATION, cv2.CAP_FFMPEG]
+        )
+        for backend in order:
+            try:
+                cap = cv2.VideoCapture(video_path, backend)
+                if cap.isOpened():
+                    logger.debug(f"VideoCapture opened: path={video_path}, backend={backend}")
+                    return cap
+                cap.release()
+            except Exception:
+                continue
+    cap = cv2.VideoCapture(video_path)
+    if cap.isOpened():
+        logger.debug(f"VideoCapture opened: path={video_path}, backend=auto-default")
+    return cap
+
+
 @dataclass
 class VideoMetadata:
     """
@@ -152,7 +191,13 @@ class FramePrefetcher:
     シーク操作を最小化して読み込み性能を向上させる。
     """
 
-    def __init__(self, video_path: str, frame_count: int, prefetch_size: int = 10):
+    def __init__(
+        self,
+        video_path: str,
+        frame_count: int,
+        prefetch_size: int = 32,
+        backend_preference: str = "auto",
+    ):
         """
         初期化
 
@@ -166,6 +211,7 @@ class FramePrefetcher:
             先読みキューサイズ
         """
         self._video_path = video_path
+        self._backend_preference = str(backend_preference or "auto")
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame_count = frame_count
         self._queue: queue.Queue = queue.Queue(maxsize=prefetch_size)
@@ -182,7 +228,7 @@ class FramePrefetcher:
             return
         if self._frame_count <= 0:
             return
-        self._cap = cv2.VideoCapture(self._video_path)
+        self._cap = create_video_capture(self._video_path, backend_preference=self._backend_preference)
         if self._cap is None or not self._cap.isOpened():
             logger.warning(f"プリフェッチ用キャプチャを開けません: {self._video_path}")
             self._cap = None
@@ -314,7 +360,7 @@ class VideoLoader:
     コンテキストマネージャ対応。
     """
 
-    def __init__(self):
+    def __init__(self, config: Optional[Dict[str, object]] = None):
         """
         初期化
         """
@@ -322,7 +368,24 @@ class VideoLoader:
         self._metadata = None
         self._current_frame_idx = -1
         self._video_path = None
+        self._config = dict(config or {})
+        self._capture_backend = str(
+            self._config.get(
+                "DARWIN_CAPTURE_BACKEND",
+                self._config.get("darwin_capture_backend", "auto"),
+            )
+            or "auto"
+        ).strip().lower()
+        prefetch_raw = self._config.get(
+            "STAGE1_PREFETCH_SIZE",
+            self._config.get("stage1_prefetch_size", 32),
+        )
+        try:
+            self._prefetch_size = max(1, int(prefetch_raw or 32))
+        except (TypeError, ValueError):
+            self._prefetch_size = 32
         self._accel = get_accelerator()
+        self._accel.configure_runtime(self._config)
         self._frame_buffer = FrameBuffer(max_size=100)
         self._prefetcher: Optional[FramePrefetcher] = None
 
@@ -365,7 +428,7 @@ class VideoLoader:
 
         if self._cap is None or not self._cap.isOpened():
             # フォールバック: 標準デコード
-            self._cap = cv2.VideoCapture(str(path))
+            self._cap = create_video_capture(str(path), backend_preference=self._capture_backend)
             if not self._cap.isOpened():
                 raise RuntimeError(f"ビデオファイルを開けません: {path}")
             logger.info(f"ソフトウェアデコードで開きました: {path}")
@@ -405,7 +468,12 @@ class VideoLoader:
         # プリフェッチャーを初期化
         if self._prefetcher is not None:
             self._prefetcher.stop()
-        self._prefetcher = FramePrefetcher(str(path), frame_count, prefetch_size=10)
+        self._prefetcher = FramePrefetcher(
+            str(path),
+            frame_count,
+            prefetch_size=self._prefetch_size,
+            backend_preference=self._capture_backend,
+        )
         self._prefetcher.start()
 
         logger.info(
@@ -451,11 +519,11 @@ class VideoLoader:
         # macOS: CAP_FFMPEG ヒント
         if system == "Darwin":
             try:
-                cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+                cap = create_video_capture(path, backend_preference=self._capture_backend)
                 if cap.isOpened():
                     return cap
             except Exception as e:
-                logger.debug(f"macOS CAP_FFMPEG 失敗: {e}")
+                logger.debug(f"macOS capture open 失敗: {e}")
 
         return None
 
@@ -743,7 +811,7 @@ class DualVideoLoader:
         分離後の右目映像パス
     """
 
-    def __init__(self, temp_dir: str = "temp_streams"):
+    def __init__(self, temp_dir: str = "temp_streams", backend_preference: str = "auto"):
         """
         初期化
 
@@ -756,6 +824,7 @@ class DualVideoLoader:
         self.left_path: Optional[str] = None
         self.right_path: Optional[str] = None
         self.temp_dir = Path(temp_dir)
+        self.backend_preference = str(backend_preference or "auto")
 
         self.cap_l: Optional[cv2.VideoCapture] = None
         self.cap_r: Optional[cv2.VideoCapture] = None
@@ -805,8 +874,8 @@ class DualVideoLoader:
             self._split_osv_streams()
 
         # 左右のストリームを開く
-        self.cap_l = cv2.VideoCapture(self.left_path)
-        self.cap_r = cv2.VideoCapture(self.right_path)
+        self.cap_l = create_video_capture(self.left_path, backend_preference=self.backend_preference)
+        self.cap_r = create_video_capture(self.right_path, backend_preference=self.backend_preference)
 
         if not self.cap_l.isOpened() or not self.cap_r.isOpened():
             raise RuntimeError(f"OSV ストリームを開けません: {osv_path}")
@@ -1027,9 +1096,10 @@ class FrontRearVideoLoader:
     2つの独立動画（front/rear）を同期して読み込み、VideoLoader互換APIを提供する。
     """
 
-    def __init__(self):
+    def __init__(self, backend_preference: str = "auto"):
         self.front_path: Optional[str] = None
         self.rear_path: Optional[str] = None
+        self.backend_preference = str(backend_preference or "auto")
         self.cap_front: Optional[cv2.VideoCapture] = None
         self.cap_rear: Optional[cv2.VideoCapture] = None
         self._metadata: Optional[VideoMetadata] = None
@@ -1048,8 +1118,8 @@ class FrontRearVideoLoader:
         self.front_path = str(front)
         self.rear_path = str(rear)
 
-        self.cap_front = cv2.VideoCapture(self.front_path)
-        self.cap_rear = cv2.VideoCapture(self.rear_path)
+        self.cap_front = create_video_capture(self.front_path, backend_preference=self.backend_preference)
+        self.cap_rear = create_video_capture(self.rear_path, backend_preference=self.backend_preference)
         if not self.cap_front.isOpened() or not self.cap_rear.isOpened():
             raise RuntimeError(f"前後動画を開けません: front={front}, rear={rear}")
 

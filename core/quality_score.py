@@ -8,6 +8,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from core.accelerator import get_accelerator
+
 
 @dataclass(frozen=True)
 class QualityROISpec:
@@ -131,6 +133,76 @@ def compute_raw_metrics(
     }
 
 
+def compute_raw_metrics_batch(
+    frames: List[np.ndarray],
+    roi_spec: str | QualityROISpec | None = None,
+    *,
+    use_orb: bool = True,
+    orb: Optional[cv2.ORB] = None,
+    gpu_batch_enabled: bool = True,
+) -> List[Dict[str, float]]:
+    """Compute raw quality metrics for a batch of frames."""
+    if not frames:
+        return []
+
+    grays = [_to_gray(f) for f in frames]
+    spec = parse_roi_spec(roi_spec)
+    accelerator = get_accelerator()
+
+    full_roi = bool(spec.mode == "rect" and spec.ratio >= 0.999)
+    if gpu_batch_enabled and full_roi:
+        lap_vars: List[Optional[float]] = [float(v) for v in accelerator.batch_laplacian_var(grays)]
+    else:
+        lap_vars = [None] * len(grays)
+
+    cache_masks: Dict[Tuple[int, int], np.ndarray] = {}
+    out: List[Dict[str, float]] = []
+    for gray, lap_var in zip(grays, lap_vars):
+        shape_key = (int(gray.shape[0]), int(gray.shape[1]))
+        mask = cache_masks.get(shape_key)
+        if mask is None:
+            mask = _build_roi_mask(gray, spec)
+            cache_masks[shape_key] = mask
+
+        vals = _masked_values(gray.astype(np.float64), mask)
+        if lap_var is None:
+            lap = cv2.Laplacian(gray, cv2.CV_64F)
+            lap_vals = _masked_values(lap, mask)
+            lap_var = float(np.var(lap_vals)) if lap_vals.size > 0 else 0.0
+        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        tenengrad_map = (sobel_x * sobel_x) + (sobel_y * sobel_y)
+        tenengrad_vals = _masked_values(tenengrad_map, mask)
+        tenengrad = float(np.mean(tenengrad_vals)) if tenengrad_vals.size > 0 else 0.0
+
+        black_clip = float(np.mean(vals <= 16.0)) if vals.size > 0 else 1.0
+        white_clip = float(np.mean(vals >= 245.0)) if vals.size > 0 else 1.0
+        contrast = float(np.std(vals)) if vals.size > 0 else 0.0
+        contrast_norm = float(np.clip(contrast / 64.0, 0.0, 1.0))
+        clip_penalty = float(np.clip(black_clip + white_clip, 0.0, 1.0))
+        exposure = float(np.clip(0.7 * contrast_norm + 0.3 * (1.0 - clip_penalty), 0.0, 1.0))
+
+        orb_keypoints = 0.0
+        if use_orb:
+            orb_obj = orb if orb is not None else cv2.ORB_create(nfeatures=2000)
+            keypoints = orb_obj.detect(gray, mask=mask)
+            orb_keypoints = float(len(keypoints) if keypoints is not None else 0.0)
+
+        out.append(
+            {
+                "laplacian_var": float(lap_var),
+                "tenengrad": tenengrad,
+                "exposure": exposure,
+                "orb_keypoints": orb_keypoints,
+                "black_clip": black_clip,
+                "white_clip": white_clip,
+                "contrast": contrast,
+                "roi_pixel_count": float(int(np.count_nonzero(mask))),
+            }
+        )
+    return out
+
+
 def normalize_batch_p10_p90(
     records: List[Dict[str, float]],
     *,
@@ -204,6 +276,7 @@ __all__ = [
     "QualityROISpec",
     "parse_roi_spec",
     "compute_raw_metrics",
+    "compute_raw_metrics_batch",
     "normalize_batch_p10_p90",
     "compose_quality",
     "apply_abs_guard",

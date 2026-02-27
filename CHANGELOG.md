@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Stage別ベンチマークCLI `scripts/benchmark.py` を追加（JSON/CSV出力、比較表示）。
+- Stage1共通エンジン `core/stage1_engine.py` を追加（GUI/Selector共通のmono走査）。
+- Stage結果テンポラリ保存 `core/stage_temp_store.py` を追加。
+- 性能設定キーを追加:
+  - `opencv_thread_count`
+  - `stage1_process_workers`
+  - `stage1_prefetch_size`
+  - `stage1_metrics_batch_size`
+  - `stage1_gpu_batch_enabled`
+  - `darwin_capture_backend`
+  - `mps_min_pixels`
+
+### Changed
+- 解析順序を `Stage1 -> Stage0 -> Stage2 -> Stage3` に統一。
+- GUI/CLIでStage中間結果を `~/.360split/tmp_runs/<analysis_run_id>/` にJSONL保存する方式へ変更（成功時削除、失敗時保持）。
+- `core/accelerator.py`:
+  - macOS arm64で `sysctl hw.perflevel0.logicalcpu` に基づくOpenCVスレッド最適化を実装。
+  - runtime再設定API `configure_runtime()` を追加。
+  - MPS向け `gpu_cvtColor/gpu_filter2D/gpu_resize/gpu_remap` 経路を追加（失敗時CPUフォールバック）。
+  - `batch_laplacian_var()` を追加。
+- `core/video_loader.py`:
+  - `create_video_capture()` を追加し、macOSバックエンド優先順を統一。
+  - prefetch既定値を 10 -> 32 に変更。
+- `core/quality_score.py`:
+  - `compute_raw_metrics_batch()` を追加し、Stage1バッチ品質計算に対応。
+- `main.py`:
+  - 上記性能キーに対応するCLIオプションを追加。
+- `gui/settings_dialog.py`:
+  - 上記性能キーを設定ダイアログから編集・保存可能に変更。
 
 ## [1.1.0] - 2026-02-21
 ### Added

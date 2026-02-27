@@ -17,6 +17,7 @@ import argparse
 import json
 import csv
 import os
+import uuid
 from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -218,6 +219,49 @@ def parse_arguments():
         help="Stage1品質評価の縮小スケール（0.1-1.0）"
     )
     parser.add_argument(
+        "--opencv-threads",
+        type=int,
+        default=None,
+        help="OpenCVスレッド数（0=auto）"
+    )
+    parser.add_argument(
+        "--stage1-process-workers",
+        type=int,
+        default=None,
+        help="Stage1品質計算プロセス数（0=auto）"
+    )
+    parser.add_argument(
+        "--stage1-prefetch-size",
+        type=int,
+        default=None,
+        help="Stage1先読みキューサイズ（1以上）"
+    )
+    parser.add_argument(
+        "--stage1-metrics-batch-size",
+        type=int,
+        default=None,
+        help="Stage1品質計算バッチサイズ（1以上）"
+    )
+    parser.add_argument(
+        "--stage1-gpu-batch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stage1品質計算でGPUバッチ処理を有効化/無効化"
+    )
+    parser.add_argument(
+        "--darwin-capture-backend",
+        type=str,
+        choices=["auto", "avfoundation", "ffmpeg"],
+        default=None,
+        help="macOSのVideoCaptureバックエンド"
+    )
+    parser.add_argument(
+        "--mps-min-pixels",
+        type=int,
+        default=None,
+        help="MPS経路を使う最小画素数（1以上）"
+    )
+    parser.add_argument(
         "--quality-filter",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -402,6 +446,31 @@ def parse_arguments():
         default=None,
         help="VO step_proxy の上限クリップ値（px）"
     )
+    parser.add_argument(
+        "--vo-essential-method",
+        type=str,
+        choices=["auto", "ransac", "magsac"],
+        default=None,
+        help="VO Essential Matrix 推定法"
+    )
+    parser.add_argument(
+        "--vo-subpixel-refine",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="VO追跡点をサブピクセル補正する（--no-vo-subpixel-refine で無効化）"
+    )
+    parser.add_argument(
+        "--vo-adaptive-subsample",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="VOサブサンプル間隔を動き量に応じて動的調整する"
+    )
+    parser.add_argument(
+        "--vo-subsample-min",
+        type=int,
+        default=None,
+        help="VO動的サブサンプル時の最小間引き間隔"
+    )
 
     parser.add_argument(
         "--verbose", "-v",
@@ -533,6 +602,20 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["stage1_grab_threshold"] = max(1, int(args.stage1_grab_threshold))
     if args.stage1_eval_scale is not None:
         config["stage1_eval_scale"] = float(max(0.1, min(1.0, args.stage1_eval_scale)))
+    if args.opencv_threads is not None:
+        config["opencv_thread_count"] = int(max(0, args.opencv_threads))
+    if args.stage1_process_workers is not None:
+        config["stage1_process_workers"] = int(max(0, args.stage1_process_workers))
+    if args.stage1_prefetch_size is not None:
+        config["stage1_prefetch_size"] = int(max(1, args.stage1_prefetch_size))
+    if args.stage1_metrics_batch_size is not None:
+        config["stage1_metrics_batch_size"] = int(max(1, args.stage1_metrics_batch_size))
+    if args.stage1_gpu_batch is not None:
+        config["stage1_gpu_batch_enabled"] = bool(args.stage1_gpu_batch)
+    if args.darwin_capture_backend is not None:
+        config["darwin_capture_backend"] = str(args.darwin_capture_backend).strip().lower()
+    if args.mps_min_pixels is not None:
+        config["mps_min_pixels"] = int(max(1, args.mps_min_pixels))
     if args.quality_filter is not None:
         config["quality_filter_enabled"] = bool(args.quality_filter)
     if args.quality_threshold is not None:
@@ -619,6 +702,14 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["vo_fast_fail_inlier_ratio"] = float(max(0.0, min(1.0, args.vo_fast_fail_inlier_ratio)))
     if args.vo_step_proxy_clip_px is not None:
         config["vo_step_proxy_clip_px"] = float(max(0.0, args.vo_step_proxy_clip_px))
+    if args.vo_essential_method is not None:
+        config["vo_essential_method"] = str(args.vo_essential_method).strip().lower()
+    if args.vo_subpixel_refine is not None:
+        config["vo_subpixel_refine"] = bool(args.vo_subpixel_refine)
+    if args.vo_adaptive_subsample is not None:
+        config["vo_adaptive_subsample"] = bool(args.vo_adaptive_subsample)
+    if args.vo_subsample_min is not None:
+        config["vo_subsample_min"] = int(max(1, args.vo_subsample_min))
     if args.profile:
         config["enable_profile"] = True
         config["stage2_perf_profile"] = True
@@ -635,12 +726,15 @@ def resolve_output_dir(video_path: str, output_arg: str = None) -> Path:
     return output_dir
 
 
-def create_loader(video_path: str, args, is_front_rear: bool, is_osv: bool):
+def create_loader(video_path: str, args, is_front_rear: bool, is_osv: bool, config: Optional[dict] = None):
     """入力モードに応じてローダーを初期化する。"""
     from core.video_loader import VideoLoader, DualVideoLoader, FrontRearVideoLoader
 
+    cfg = dict(config or {})
+    backend_pref = str(cfg.get("darwin_capture_backend", cfg.get("DARWIN_CAPTURE_BACKEND", "auto")) or "auto")
+
     if is_front_rear:
-        loader = FrontRearVideoLoader()
+        loader = FrontRearVideoLoader(backend_preference=backend_pref)
         try:
             loader.load(args.front_video, args.rear_video)
             logger.info(f"前後ストリームを読み込みました: F={args.front_video}, R={args.rear_video}")
@@ -650,7 +744,7 @@ def create_loader(video_path: str, args, is_front_rear: bool, is_osv: bool):
             sys.exit(1)
 
     if is_osv:
-        loader = DualVideoLoader()
+        loader = DualVideoLoader(backend_preference=backend_pref)
         try:
             loader.load(video_path)
             logger.info(f"ステレオストリームを分離しました: L={loader.left_path}, R={loader.right_path}")
@@ -659,7 +753,7 @@ def create_loader(video_path: str, args, is_front_rear: bool, is_osv: bool):
             logger.error(f"OSVファイルの読み込みに失敗しました: {e}")
             sys.exit(1)
 
-    loader = VideoLoader()
+    loader = VideoLoader(config=cfg)
     try:
         loader.load(video_path)
         return loader
@@ -736,6 +830,7 @@ def summarize_vo_diagnostics(frame_metrics_records: List[Dict[str, Any]]) -> Dic
     vo_valid = 0
     vo_pose_valid = 0
     with_pose = 0
+    confidences: List[float] = []
     for rec in frame_metrics_records:
         metrics = rec.get("metrics", {}) if isinstance(rec, dict) else {}
         reason = str(metrics.get("vo_status_reason", "unknown"))
@@ -744,9 +839,13 @@ def summarize_vo_diagnostics(frame_metrics_records: List[Dict[str, Any]]) -> Dic
         vo_valid += 1 if float(metrics.get("vo_valid", 0.0)) > 0.5 else 0
         vo_pose_valid += 1 if float(metrics.get("vo_pose_valid", 0.0)) > 0.5 else 0
         with_pose += 1 if isinstance(rec.get("t_xyz"), list) and len(rec.get("t_xyz")) == 3 else 0
+        conf = metrics.get("vo_confidence")
+        if isinstance(conf, (float, int)):
+            confidences.append(float(conf))
 
     dominant_reason = reason_counter.most_common(1)[0][0] if reason_counter else "unknown"
     valid_ratio = float(vo_valid / vo_attempted) if vo_attempted > 0 else 0.0
+    conf_arr = np.asarray(confidences, dtype=np.float64) if confidences else np.zeros(0, dtype=np.float64)
     return {
         "total_records": int(len(frame_metrics_records)),
         "vo_attempted_frames": int(vo_attempted),
@@ -756,6 +855,10 @@ def summarize_vo_diagnostics(frame_metrics_records: List[Dict[str, Any]]) -> Dic
         "trajectory_points": int(with_pose),
         "vo_status_reason_counts": dict(reason_counter),
         "dominant_vo_status_reason": str(dominant_reason),
+        "vo_confidence_mean": float(np.mean(conf_arr)) if conf_arr.size > 0 else 0.0,
+        "vo_confidence_p10": float(np.percentile(conf_arr, 10.0)) if conf_arr.size > 0 else 0.0,
+        "vo_confidence_p50": float(np.percentile(conf_arr, 50.0)) if conf_arr.size > 0 else 0.0,
+        "vo_confidence_p90": float(np.percentile(conf_arr, 90.0)) if conf_arr.size > 0 else 0.0,
     }
 
 
@@ -782,6 +885,7 @@ def write_vo_diagnostics(output_dir: Path, frame_metrics_records: List[Dict[str,
                 "vo_valid",
                 "vo_inlier_ratio",
                 "vo_step_proxy",
+                "vo_confidence",
             ],
         )
         writer.writeheader()
@@ -802,6 +906,7 @@ def write_vo_diagnostics(output_dir: Path, frame_metrics_records: List[Dict[str,
                     "vo_valid": float(metrics.get("vo_valid", 0.0)),
                     "vo_inlier_ratio": float(metrics.get("vo_inlier_ratio", 0.0)),
                     "vo_step_proxy": float(metrics.get("vo_step_proxy", 0.0)),
+                    "vo_confidence": float(metrics.get("vo_confidence", 0.0)),
                 }
             )
     return diagnostics_path, trajectory_path, diagnostics
@@ -972,6 +1077,7 @@ def _load_calibrations_for_runtime(
 def run_cli(args):
     """CLIモードでキーフレーム抽出を実行する。"""
     from core.keyframe_selector import KeyframeSelector
+    from core.stage_temp_store import StageTempStore
     from processing.equirectangular import EquirectangularProcessor
     from processing.fisheye_splitter import Cross5FisheyeSplitter, Cross5SplitConfig
     from processing.mask_processor import MaskProcessor
@@ -989,6 +1095,11 @@ def run_cli(args):
     # 設定ロード（プリセット → 設定ファイル → CLI引数の順で優先）
     config = load_config(args.config, args.preset)
     apply_cli_overrides(config, args)
+    run_id = str(config.get("analysis_run_id", config.get("ANALYSIS_RUN_ID", "")) or "").strip()
+    if not run_id:
+        run_id = str(uuid.uuid4())
+    config["analysis_run_id"] = run_id
+    config["ANALYSIS_RUN_ID"] = run_id
     output_dir = resolve_output_dir(video_path, args.output)
 
     logger.info("=" * 60)
@@ -1049,7 +1160,7 @@ def run_cli(args):
     )
     logger.info("-" * 60)
 
-    loader = create_loader(video_path, args, is_front_rear, is_osv)
+    loader = create_loader(video_path, args, is_front_rear, is_osv, config=config)
 
     meta = loader.get_metadata()
     try:
@@ -1151,6 +1262,7 @@ def run_cli(args):
         loader,
         progress_callback=progress_callback,
         frame_log_callback=frame_log_callback,
+        stage_temp_store=StageTempStore(run_id=run_id),
     )
 
     if not keyframes:
@@ -1467,6 +1579,7 @@ def run_cli(args):
             f"valid={vo_diag['vo_valid_frames']}, "
             f"valid_ratio={vo_diag['vo_valid_ratio']:.3f}, "
             f"pose_valid={vo_diag['vo_pose_valid_frames']}, "
+            f"conf_mean={vo_diag['vo_confidence_mean']:.3f}, "
             f"reason={vo_diag['dominant_vo_status_reason']}"
         )
 

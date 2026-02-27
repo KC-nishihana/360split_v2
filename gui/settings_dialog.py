@@ -14,7 +14,7 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QLabel, QSlider,
     QPushButton, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
-    QFileDialog, QMessageBox, QGroupBox, QGridLayout
+    QFileDialog, QMessageBox, QGroupBox, QGridLayout, QScrollArea
     , QLineEdit
 )
 from PySide6.QtCore import Qt
@@ -54,7 +54,8 @@ class SettingsDialog(QDialog):
         """
         super().__init__(parent)
         self.setWindowTitle("設定")
-        self.setGeometry(200, 200, 700, 800)
+        self.resize(860, 720)
+        self.setMinimumSize(700, 520)
 
         # 設定を読み込み
         self.settings = self._load_settings()
@@ -69,30 +70,31 @@ class SettingsDialog(QDialog):
 
         # === タブウィジェット ===
         tab_widget = QTabWidget()
+        tab_widget.setUsesScrollButtons(True)
 
         # Tab 1: キーフレーム選択
         keyframe_tab = self._create_keyframe_tab()
-        tab_widget.addTab(keyframe_tab, "キーフレーム選択")
+        tab_widget.addTab(self._wrap_scroll_tab(keyframe_tab), "キーフレーム選択")
 
         # Tab 2: 360度処理
         stage03_tab = self._create_stage03_tab()
-        tab_widget.addTab(stage03_tab, "Stage0/Stage3")
+        tab_widget.addTab(self._wrap_scroll_tab(stage03_tab), "Stage0/Stage3")
 
         # Tab 3: 360度処理
         processing_tab = self._create_processing_tab()
-        tab_widget.addTab(processing_tab, "360度処理")
+        tab_widget.addTab(self._wrap_scroll_tab(processing_tab), "360度処理")
 
         # Tab 4: マスク処理
         mask_tab = self._create_mask_tab()
-        tab_widget.addTab(mask_tab, "マスク処理")
+        tab_widget.addTab(self._wrap_scroll_tab(mask_tab), "マスク処理")
 
         # Tab 5: 出力設定
         output_tab = self._create_output_tab()
-        tab_widget.addTab(output_tab, "出力設定")
+        tab_widget.addTab(self._wrap_scroll_tab(output_tab), "出力設定")
 
         # Tab 6: 対象マスク
         target_mask_tab = self._create_target_mask_tab()
-        tab_widget.addTab(target_mask_tab, "対象マスク")
+        tab_widget.addTab(self._wrap_scroll_tab(target_mask_tab), "対象マスク")
 
         layout.addWidget(tab_widget)
 
@@ -115,6 +117,15 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(button_layout)
 
+    def _wrap_scroll_tab(self, content: QWidget) -> QWidget:
+        """タブ内容をスクロール可能にして、小さい画面でも切れないようにする。"""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+        return scroll
+
     def _create_keyframe_tab(self) -> QWidget:
         """
         キーフレーム選択タブを作成
@@ -125,8 +136,26 @@ class SettingsDialog(QDialog):
             タブウィジェット
         """
         widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setSpacing(10)
+        root_layout = QVBoxLayout(widget)
+        root_layout.setSpacing(6)
+
+        sub_tabs = QTabWidget()
+        root_layout.addWidget(sub_tabs)
+
+        basic_page = QWidget()
+        basic_layout = QVBoxLayout(basic_page)
+        basic_layout.setSpacing(10)
+        sub_tabs.addTab(basic_page, "基本")
+
+        threshold_page = QWidget()
+        threshold_layout = QVBoxLayout(threshold_page)
+        threshold_layout.setSpacing(10)
+        sub_tabs.addTab(threshold_page, "選択閾値")
+
+        advanced_page = QWidget()
+        advanced_layout = QVBoxLayout(advanced_page)
+        advanced_layout.setSpacing(10)
+        sub_tabs.addTab(advanced_page, "GRIC/ログ")
 
         # === 環境プリセット選択 ===
         preset_group = QGroupBox("環境プリセット")
@@ -151,7 +180,7 @@ class SettingsDialog(QDialog):
         preset_layout.addWidget(self.preset_description_label, 1, 0, 1, 2)
 
         preset_group.setLayout(preset_layout)
-        layout.addWidget(preset_group)
+        basic_layout.addWidget(preset_group)
 
         # === 品質スコア重み ===
         quality_group = QGroupBox("品質スコア重み")
@@ -226,7 +255,7 @@ class SettingsDialog(QDialog):
         quality_layout.addWidget(self.content_weight_label, 3, 2)
 
         quality_group.setLayout(quality_layout)
-        layout.addWidget(quality_group)
+        basic_layout.addWidget(quality_group)
 
         # === 適応的選択閾値 ===
         adaptive_group = QGroupBox("適応的選択パラメータ")
@@ -267,7 +296,7 @@ class SettingsDialog(QDialog):
         adaptive_layout.addWidget(self.softmax_beta, 3, 1)
 
         adaptive_group.setLayout(adaptive_layout)
-        layout.addWidget(adaptive_group)
+        threshold_layout.addWidget(adaptive_group)
 
         # === 品質フィルタ（A案） ===
         quality_filter_group = QGroupBox("品質フィルタ（ROI + 正規化）")
@@ -287,7 +316,7 @@ class SettingsDialog(QDialog):
         quality_filter_layout.addWidget(self.quality_threshold, 1, 1)
 
         quality_filter_group.setLayout(quality_filter_layout)
-        layout.addWidget(quality_filter_group)
+        threshold_layout.addWidget(quality_filter_group)
 
         # === GRIC パラメータ ===
         gric_group = QGroupBox("GRIC (幾何学的評価)")
@@ -332,7 +361,7 @@ class SettingsDialog(QDialog):
         gric_layout.addWidget(self.gric_degeneracy_threshold, 3, 1)
 
         gric_group.setLayout(gric_layout)
-        layout.addWidget(gric_group)
+        advanced_layout.addWidget(gric_group)
 
         # === Rerunログ ===
         rerun_group = QGroupBox("Rerunログ")
@@ -341,16 +370,36 @@ class SettingsDialog(QDialog):
         self.enable_rerun_logging.setChecked(self.settings.get('enable_rerun_logging', False))
         rerun_layout.addWidget(self.enable_rerun_logging, 0, 0, 1, 2)
         rerun_group.setLayout(rerun_layout)
-        layout.addWidget(rerun_group)
+        advanced_layout.addWidget(rerun_group)
 
-        layout.addStretch()
+        basic_layout.addStretch()
+        threshold_layout.addStretch()
+        advanced_layout.addStretch()
         return widget
 
     def _create_stage03_tab(self) -> QWidget:
         """Stage0/Stage3 設定タブを作成する。"""
         widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setSpacing(10)
+        root_layout = QVBoxLayout(widget)
+        root_layout.setSpacing(6)
+
+        sub_tabs = QTabWidget()
+        root_layout.addWidget(sub_tabs)
+
+        stage_page = QWidget()
+        stage_page_layout = QVBoxLayout(stage_page)
+        stage_page_layout.setSpacing(10)
+        sub_tabs.addTab(stage_page, "Stage0/Stage3")
+
+        vo_page = QWidget()
+        vo_page_layout = QVBoxLayout(vo_page)
+        vo_page_layout.setSpacing(10)
+        sub_tabs.addTab(vo_page, "VO/Calibration")
+
+        perf_page = QWidget()
+        perf_page_layout = QVBoxLayout(perf_page)
+        perf_page_layout.setSpacing(10)
+        sub_tabs.addTab(perf_page, "性能")
 
         stage03_group = QGroupBox("Stage0/Stage3 軌跡再評価")
         stage03_layout = QGridLayout()
@@ -399,69 +448,168 @@ class SettingsDialog(QDialog):
         stage03_layout.addWidget(self.stage3_weight_stage0_risk, 5, 1)
 
         stage03_group.setLayout(stage03_layout)
-        layout.addWidget(stage03_group)
+        stage_page_layout.addWidget(stage03_group)
 
         vo_group = QGroupBox("VO / Calibration")
         vo_layout = QGridLayout()
 
+        vo_layout.addWidget(QLabel("VOプリセット:"), 0, 0)
+        self.vo_preset_combo = QComboBox()
+        self.vo_preset_combo.addItems(["Custom", "Quick", "Balanced", "Precise"])
+        self.vo_preset_combo.setCurrentText("Custom")
+        self.vo_preset_combo.currentTextChanged.connect(self._on_vo_preset_changed)
+        vo_layout.addWidget(self.vo_preset_combo, 0, 1, 1, 2)
+
         self.vo_enabled = QCheckBox("VOを有効化")
         self.vo_enabled.setChecked(bool(self.settings.get("vo_enabled", True)))
-        vo_layout.addWidget(self.vo_enabled, 0, 0, 1, 3)
+        vo_layout.addWidget(self.vo_enabled, 1, 0, 1, 3)
 
-        vo_layout.addWidget(QLabel("Calib XML:"), 1, 0)
+        vo_layout.addWidget(QLabel("Calib XML:"), 2, 0)
         self.calib_xml = QLineEdit(str(self.settings.get("calib_xml", "")))
-        vo_layout.addWidget(self.calib_xml, 1, 1)
+        vo_layout.addWidget(self.calib_xml, 2, 1)
         btn_calib = QPushButton("参照")
         btn_calib.clicked.connect(lambda: self._pick_file_for_line_edit(self.calib_xml))
-        vo_layout.addWidget(btn_calib, 1, 2)
+        vo_layout.addWidget(btn_calib, 2, 2)
 
-        vo_layout.addWidget(QLabel("Front Calib XML:"), 2, 0)
+        vo_layout.addWidget(QLabel("Front Calib XML:"), 3, 0)
         self.front_calib_xml = QLineEdit(str(self.settings.get("front_calib_xml", "")))
-        vo_layout.addWidget(self.front_calib_xml, 2, 1)
+        vo_layout.addWidget(self.front_calib_xml, 3, 1)
         btn_front_calib = QPushButton("参照")
         btn_front_calib.clicked.connect(lambda: self._pick_file_for_line_edit(self.front_calib_xml))
-        vo_layout.addWidget(btn_front_calib, 2, 2)
+        vo_layout.addWidget(btn_front_calib, 3, 2)
 
-        vo_layout.addWidget(QLabel("Rear Calib XML:"), 3, 0)
+        vo_layout.addWidget(QLabel("Rear Calib XML:"), 4, 0)
         self.rear_calib_xml = QLineEdit(str(self.settings.get("rear_calib_xml", "")))
-        vo_layout.addWidget(self.rear_calib_xml, 3, 1)
+        vo_layout.addWidget(self.rear_calib_xml, 4, 1)
         btn_rear_calib = QPushButton("参照")
         btn_rear_calib.clicked.connect(lambda: self._pick_file_for_line_edit(self.rear_calib_xml))
-        vo_layout.addWidget(btn_rear_calib, 3, 2)
+        vo_layout.addWidget(btn_rear_calib, 4, 2)
 
-        vo_layout.addWidget(QLabel("Calib model:"), 4, 0)
+        vo_layout.addWidget(QLabel("Calib model:"), 5, 0)
         self.calib_model = QComboBox()
         self.calib_model.addItems(["auto", "opencv", "fisheye"])
         self.calib_model.setCurrentText(str(self.settings.get("calib_model", "auto")))
-        vo_layout.addWidget(self.calib_model, 4, 1)
+        vo_layout.addWidget(self.calib_model, 5, 1)
 
-        vo_layout.addWidget(QLabel("VO中心ROI比率:"), 5, 0)
+        vo_layout.addWidget(QLabel("VO中心ROI比率:"), 6, 0)
         self.vo_center_roi_ratio = QDoubleSpinBox()
         self.vo_center_roi_ratio.setRange(0.2, 1.0)
         self.vo_center_roi_ratio.setSingleStep(0.05)
         self.vo_center_roi_ratio.setDecimals(2)
         self.vo_center_roi_ratio.setValue(float(self.settings.get("vo_center_roi_ratio", 0.6)))
-        vo_layout.addWidget(self.vo_center_roi_ratio, 5, 1)
+        vo_layout.addWidget(self.vo_center_roi_ratio, 6, 1)
 
-        vo_layout.addWidget(QLabel("VO縮小長辺(px):"), 6, 0)
+        vo_layout.addWidget(QLabel("VO縮小長辺(px):"), 7, 0)
         self.vo_downscale_long_edge = QSpinBox()
         self.vo_downscale_long_edge.setRange(320, 2000)
         self.vo_downscale_long_edge.setValue(int(self.settings.get("vo_downscale_long_edge", 1000)))
-        vo_layout.addWidget(self.vo_downscale_long_edge, 6, 1)
+        vo_layout.addWidget(self.vo_downscale_long_edge, 7, 1)
 
-        vo_layout.addWidget(QLabel("VO最大特徴点数:"), 7, 0)
+        vo_layout.addWidget(QLabel("VO最大特徴点数:"), 8, 0)
         self.vo_max_features = QSpinBox()
         self.vo_max_features.setRange(100, 2000)
         self.vo_max_features.setValue(int(self.settings.get("vo_max_features", 600)))
-        vo_layout.addWidget(self.vo_max_features, 7, 1)
+        vo_layout.addWidget(self.vo_max_features, 8, 1)
+
+        vo_layout.addWidget(QLabel("VOサブサンプル間隔:"), 9, 0)
+        self.vo_frame_subsample = QSpinBox()
+        self.vo_frame_subsample.setRange(1, 12)
+        self.vo_frame_subsample.setValue(int(self.settings.get("vo_frame_subsample", 1)))
+        vo_layout.addWidget(self.vo_frame_subsample, 9, 1)
+
+        vo_layout.addWidget(QLabel("Essential推定法:"), 10, 0)
+        self.vo_essential_method = QComboBox()
+        self.vo_essential_method.addItems(["auto", "ransac", "magsac"])
+        self.vo_essential_method.setCurrentText(str(self.settings.get("vo_essential_method", "auto")))
+        vo_layout.addWidget(self.vo_essential_method, 10, 1)
+
+        self.vo_subpixel_refine = QCheckBox("サブピクセル補正を有効化")
+        self.vo_subpixel_refine.setChecked(bool(self.settings.get("vo_subpixel_refine", True)))
+        vo_layout.addWidget(self.vo_subpixel_refine, 11, 0, 1, 3)
+
+        self.vo_adaptive_subsample = QCheckBox("動的サブサンプリングを有効化")
+        self.vo_adaptive_subsample.setChecked(bool(self.settings.get("vo_adaptive_subsample", False)))
+        vo_layout.addWidget(self.vo_adaptive_subsample, 12, 0, 1, 3)
+
+        vo_layout.addWidget(QLabel("VO最小サブサンプル:"), 13, 0)
+        self.vo_subsample_min = QSpinBox()
+        self.vo_subsample_min.setRange(1, 10)
+        self.vo_subsample_min.setValue(int(self.settings.get("vo_subsample_min", 1)))
+        vo_layout.addWidget(self.vo_subsample_min, 13, 1)
+
+        vo_layout.addWidget(QLabel("VO信頼度 low/mid:"), 14, 0)
+        conf_row = QHBoxLayout()
+        self.vo_confidence_low_threshold = QDoubleSpinBox()
+        self.vo_confidence_low_threshold.setRange(0.0, 1.0)
+        self.vo_confidence_low_threshold.setSingleStep(0.01)
+        self.vo_confidence_low_threshold.setDecimals(2)
+        self.vo_confidence_low_threshold.setValue(float(self.settings.get("vo_confidence_low_threshold", 0.35)))
+        conf_row.addWidget(self.vo_confidence_low_threshold)
+        self.vo_confidence_mid_threshold = QDoubleSpinBox()
+        self.vo_confidence_mid_threshold.setRange(0.0, 1.0)
+        self.vo_confidence_mid_threshold.setSingleStep(0.01)
+        self.vo_confidence_mid_threshold.setDecimals(2)
+        self.vo_confidence_mid_threshold.setValue(float(self.settings.get("vo_confidence_mid_threshold", 0.55)))
+        conf_row.addWidget(self.vo_confidence_mid_threshold)
+        vo_layout.addLayout(conf_row, 14, 1, 1, 2)
 
         self.calib_check_button = QPushButton("Calibration Check を実行")
         self.calib_check_button.clicked.connect(self._run_calibration_check_from_gui)
-        vo_layout.addWidget(self.calib_check_button, 8, 0, 1, 3)
+        vo_layout.addWidget(self.calib_check_button, 15, 0, 1, 3)
 
         vo_group.setLayout(vo_layout)
-        layout.addWidget(vo_group)
-        layout.addStretch()
+        vo_page_layout.addWidget(vo_group)
+
+        perf_group = QGroupBox("性能設定")
+        perf_layout = QGridLayout()
+
+        perf_layout.addWidget(QLabel("OpenCVスレッド数 (0=auto):"), 0, 0)
+        self.opencv_thread_count = QSpinBox()
+        self.opencv_thread_count.setRange(0, 128)
+        self.opencv_thread_count.setValue(int(self.settings.get("opencv_thread_count", 0)))
+        perf_layout.addWidget(self.opencv_thread_count, 0, 1)
+
+        perf_layout.addWidget(QLabel("Stage1プロセス数 (0=auto):"), 1, 0)
+        self.stage1_process_workers = QSpinBox()
+        self.stage1_process_workers.setRange(0, 128)
+        self.stage1_process_workers.setValue(int(self.settings.get("stage1_process_workers", 0)))
+        perf_layout.addWidget(self.stage1_process_workers, 1, 1)
+
+        perf_layout.addWidget(QLabel("Stage1プリフェッチサイズ:"), 2, 0)
+        self.stage1_prefetch_size = QSpinBox()
+        self.stage1_prefetch_size.setRange(1, 256)
+        self.stage1_prefetch_size.setValue(int(self.settings.get("stage1_prefetch_size", 32)))
+        perf_layout.addWidget(self.stage1_prefetch_size, 2, 1)
+
+        perf_layout.addWidget(QLabel("Stage1品質バッチサイズ:"), 3, 0)
+        self.stage1_metrics_batch_size = QSpinBox()
+        self.stage1_metrics_batch_size.setRange(1, 512)
+        self.stage1_metrics_batch_size.setValue(int(self.settings.get("stage1_metrics_batch_size", 64)))
+        perf_layout.addWidget(self.stage1_metrics_batch_size, 3, 1)
+
+        self.stage1_gpu_batch_enabled = QCheckBox("Stage1でGPUバッチ品質計算を有効化")
+        self.stage1_gpu_batch_enabled.setChecked(bool(self.settings.get("stage1_gpu_batch_enabled", True)))
+        perf_layout.addWidget(self.stage1_gpu_batch_enabled, 4, 0, 1, 3)
+
+        perf_layout.addWidget(QLabel("macOS Capture Backend:"), 5, 0)
+        self.darwin_capture_backend = QComboBox()
+        self.darwin_capture_backend.addItems(["auto", "avfoundation", "ffmpeg"])
+        self.darwin_capture_backend.setCurrentText(str(self.settings.get("darwin_capture_backend", "auto")))
+        perf_layout.addWidget(self.darwin_capture_backend, 5, 1)
+
+        perf_layout.addWidget(QLabel("MPS最小画素数:"), 6, 0)
+        self.mps_min_pixels = QSpinBox()
+        self.mps_min_pixels.setRange(1, 100000000)
+        self.mps_min_pixels.setSingleStep(1024)
+        self.mps_min_pixels.setValue(int(self.settings.get("mps_min_pixels", 256 * 256)))
+        perf_layout.addWidget(self.mps_min_pixels, 6, 1)
+
+        perf_group.setLayout(perf_layout)
+        perf_page_layout.addWidget(perf_group)
+
+        stage_page_layout.addStretch()
+        vo_page_layout.addStretch()
+        perf_page_layout.addStretch()
         return widget
 
     def _create_processing_tab(self) -> QWidget:
@@ -1067,6 +1215,13 @@ class SettingsDialog(QDialog):
             'dynamic_mask_inpaint_module': '',
             'stage1_grab_threshold': 30,
             'stage1_eval_scale': 0.5,
+            'opencv_thread_count': 0,
+            'stage1_process_workers': 0,
+            'stage1_prefetch_size': 32,
+            'stage1_metrics_batch_size': 64,
+            'stage1_gpu_batch_enabled': True,
+            'darwin_capture_backend': 'auto',
+            'mps_min_pixels': 256 * 256,
             'quality_filter_enabled': True,
             'quality_threshold': 0.50,
             'quality_roi_mode': 'circle',
@@ -1090,6 +1245,13 @@ class SettingsDialog(QDialog):
             'vo_center_roi_ratio': 0.6,
             'vo_downscale_long_edge': 1000,
             'vo_max_features': 600,
+            'vo_frame_subsample': 1,
+            'vo_essential_method': 'auto',
+            'vo_subpixel_refine': True,
+            'vo_adaptive_subsample': False,
+            'vo_subsample_min': 1,
+            'vo_confidence_low_threshold': 0.35,
+            'vo_confidence_mid_threshold': 0.55,
             'calib_xml': '',
             'front_calib_xml': '',
             'rear_calib_xml': '',
@@ -1187,6 +1349,13 @@ class SettingsDialog(QDialog):
             'dynamic_mask_inpaint_module': self.dynamic_mask_inpaint_module.currentText().strip(),
             'stage1_grab_threshold': int(self.settings.get('stage1_grab_threshold', 30)),
             'stage1_eval_scale': float(self.settings.get('stage1_eval_scale', 0.5)),
+            'opencv_thread_count': self.opencv_thread_count.value(),
+            'stage1_process_workers': self.stage1_process_workers.value(),
+            'stage1_prefetch_size': self.stage1_prefetch_size.value(),
+            'stage1_metrics_batch_size': self.stage1_metrics_batch_size.value(),
+            'stage1_gpu_batch_enabled': self.stage1_gpu_batch_enabled.isChecked(),
+            'darwin_capture_backend': self.darwin_capture_backend.currentText(),
+            'mps_min_pixels': self.mps_min_pixels.value(),
             'enable_stage0_scan': self.enable_stage0_scan.isChecked(),
             'stage0_stride': self.stage0_stride.value(),
             'enable_stage3_refinement': self.enable_stage3_refinement.isChecked(),
@@ -1197,6 +1366,13 @@ class SettingsDialog(QDialog):
             'vo_center_roi_ratio': self.vo_center_roi_ratio.value(),
             'vo_downscale_long_edge': self.vo_downscale_long_edge.value(),
             'vo_max_features': self.vo_max_features.value(),
+            'vo_frame_subsample': self.vo_frame_subsample.value(),
+            'vo_essential_method': self.vo_essential_method.currentText(),
+            'vo_subpixel_refine': self.vo_subpixel_refine.isChecked(),
+            'vo_adaptive_subsample': self.vo_adaptive_subsample.isChecked(),
+            'vo_subsample_min': self.vo_subsample_min.value(),
+            'vo_confidence_low_threshold': self.vo_confidence_low_threshold.value(),
+            'vo_confidence_mid_threshold': self.vo_confidence_mid_threshold.value(),
             'calib_xml': self.calib_xml.text().strip(),
             'front_calib_xml': self.front_calib_xml.text().strip(),
             'rear_calib_xml': self.rear_calib_xml.text().strip(),
@@ -1365,6 +1541,13 @@ class SettingsDialog(QDialog):
             self.vo_center_roi_ratio.setValue(float(params.get('vo_center_roi_ratio', 0.6)))
             self.vo_downscale_long_edge.setValue(int(params.get('vo_downscale_long_edge', 1000)))
             self.vo_max_features.setValue(int(params.get('vo_max_features', 600)))
+            self.vo_frame_subsample.setValue(int(params.get('vo_frame_subsample', 1)))
+            self.vo_essential_method.setCurrentText(str(params.get('vo_essential_method', 'auto')))
+            self.vo_subpixel_refine.setChecked(bool(params.get('vo_subpixel_refine', True)))
+            self.vo_adaptive_subsample.setChecked(bool(params.get('vo_adaptive_subsample', False)))
+            self.vo_subsample_min.setValue(int(params.get('vo_subsample_min', 1)))
+            self.vo_confidence_low_threshold.setValue(float(params.get('vo_confidence_low_threshold', 0.35)))
+            self.vo_confidence_mid_threshold.setValue(float(params.get('vo_confidence_mid_threshold', 0.55)))
             self.calib_xml.setText(str(params.get('calib_xml', '')))
             self.front_calib_xml.setText(str(params.get('front_calib_xml', '')))
             self.rear_calib_xml.setText(str(params.get('rear_calib_xml', '')))
@@ -1379,6 +1562,33 @@ class SettingsDialog(QDialog):
                 "エラー",
                 f"プリセットの適用に失敗しました:\n{e}"
             )
+
+    def _on_vo_preset_changed(self, preset_name: str):
+        preset = str(preset_name or "Custom").strip().lower()
+        if preset == "quick":
+            self.vo_frame_subsample.setValue(3) if hasattr(self, "vo_frame_subsample") else None
+            self.vo_subsample_min.setValue(1)
+            self.vo_max_features.setValue(300)
+            self.vo_downscale_long_edge.setValue(640)
+            self.vo_essential_method.setCurrentText("ransac")
+            self.vo_subpixel_refine.setChecked(False)
+            self.vo_adaptive_subsample.setChecked(True)
+        elif preset == "balanced":
+            self.vo_frame_subsample.setValue(1) if hasattr(self, "vo_frame_subsample") else None
+            self.vo_subsample_min.setValue(1)
+            self.vo_max_features.setValue(600)
+            self.vo_downscale_long_edge.setValue(1000)
+            self.vo_essential_method.setCurrentText("auto")
+            self.vo_subpixel_refine.setChecked(True)
+            self.vo_adaptive_subsample.setChecked(False)
+        elif preset == "precise":
+            self.vo_frame_subsample.setValue(1) if hasattr(self, "vo_frame_subsample") else None
+            self.vo_subsample_min.setValue(1)
+            self.vo_max_features.setValue(1000)
+            self.vo_downscale_long_edge.setValue(1280)
+            self.vo_essential_method.setCurrentText("magsac")
+            self.vo_subpixel_refine.setChecked(True)
+            self.vo_adaptive_subsample.setChecked(False)
 
     def _on_reset(self):
         """
@@ -1463,6 +1673,20 @@ class SettingsDialog(QDialog):
             self.vo_center_roi_ratio.setValue(0.6)
             self.vo_downscale_long_edge.setValue(1000)
             self.vo_max_features.setValue(600)
+            self.vo_frame_subsample.setValue(1)
+            self.vo_essential_method.setCurrentText("auto")
+            self.vo_subpixel_refine.setChecked(True)
+            self.vo_adaptive_subsample.setChecked(False)
+            self.vo_subsample_min.setValue(1)
+            self.vo_confidence_low_threshold.setValue(0.35)
+            self.vo_confidence_mid_threshold.setValue(0.55)
+            self.opencv_thread_count.setValue(0)
+            self.stage1_process_workers.setValue(0)
+            self.stage1_prefetch_size.setValue(32)
+            self.stage1_metrics_batch_size.setValue(64)
+            self.stage1_gpu_batch_enabled.setChecked(True)
+            self.darwin_capture_backend.setCurrentText("auto")
+            self.mps_min_pixels.setValue(256 * 256)
             self.calib_xml.setText("")
             self.front_calib_xml.setText("")
             self.rear_calib_xml.setText("")

@@ -22,6 +22,19 @@ def test_apply_cli_overrides_performance_knobs():
         stage1_gpu_batch=False,
         darwin_capture_backend="ffmpeg",
         mps_min_pixels=131072,
+        pose_backend="colmap",
+        colmap_path="/opt/homebrew/bin/colmap",
+        colmap_keyframe_policy="stage2_relaxed",
+        colmap_keyframe_target_mode="auto",
+        colmap_keyframe_target_min=120,
+        colmap_keyframe_target_max=240,
+        colmap_nms_window_sec=0.35,
+        colmap_rig_policy="lr_opk",
+        colmap_rig_seed_opk=[0.0, 0.0, 180.0],
+        colmap_workspace_scope="run_scoped",
+        colmap_reuse_db=False,
+        colmap_analysis_mask_profile="colmap_safe",
+        pose_export_format="metashape",
     )
 
     apply_cli_overrides(config, args)
@@ -37,3 +50,16 @@ def test_apply_cli_overrides_performance_knobs():
     assert config["stage1_gpu_batch_enabled"] is False
     assert config["darwin_capture_backend"] == "ffmpeg"
     assert config["mps_min_pixels"] == 131072
+    assert config["pose_backend"] == "colmap"
+    assert config["colmap_path"] == "/opt/homebrew/bin/colmap"
+    assert config["colmap_keyframe_policy"] == "stage2_relaxed"
+    assert config["colmap_keyframe_target_mode"] == "auto"
+    assert config["colmap_keyframe_target_min"] == 120
+    assert config["colmap_keyframe_target_max"] == 240
+    assert config["colmap_nms_window_sec"] == 0.35
+    assert config["colmap_rig_policy"] == "lr_opk"
+    assert config["colmap_rig_seed_opk_deg"] == [0.0, 0.0, 180.0]
+    assert config["colmap_workspace_scope"] == "run_scoped"
+    assert config["colmap_reuse_db"] is False
+    assert config["colmap_analysis_mask_profile"] == "colmap_safe"
+    assert config["pose_export_format"] == "metashape"

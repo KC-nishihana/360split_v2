@@ -560,6 +560,145 @@ class SettingsDialog(QDialog):
         vo_group.setLayout(vo_layout)
         vo_page_layout.addWidget(vo_group)
 
+        pose_group = QGroupBox("Pose Backend")
+        pose_layout = QGridLayout()
+
+        pose_layout.addWidget(QLabel("Pose backend:"), 0, 0)
+        self.pose_backend = QComboBox()
+        self.pose_backend.addItems(["vo", "colmap"])
+        self.pose_backend.setCurrentText(str(self.settings.get("pose_backend", "vo")))
+        pose_layout.addWidget(self.pose_backend, 0, 1)
+
+        pose_layout.addWidget(QLabel("Pose export format:"), 1, 0)
+        self.pose_export_format = QComboBox()
+        self.pose_export_format.addItems(["internal", "metashape"])
+        self.pose_export_format.setCurrentText(str(self.settings.get("pose_export_format", "internal")))
+        pose_layout.addWidget(self.pose_export_format, 1, 1)
+
+        pose_layout.addWidget(QLabel("COLMAP path:"), 2, 0)
+        self.colmap_path = QLineEdit(str(self.settings.get("colmap_path", "colmap")))
+        pose_layout.addWidget(self.colmap_path, 2, 1)
+        btn_colmap = QPushButton("参照")
+        btn_colmap.clicked.connect(lambda: self._pick_file_for_line_edit(self.colmap_path))
+        pose_layout.addWidget(btn_colmap, 2, 2)
+
+        pose_layout.addWidget(QLabel("COLMAP workspace:"), 3, 0)
+        self.colmap_workspace = QLineEdit(str(self.settings.get("colmap_workspace", "")))
+        pose_layout.addWidget(self.colmap_workspace, 3, 1)
+        btn_colmap_ws = QPushButton("参照")
+        btn_colmap_ws.clicked.connect(lambda: self._pick_dir_for_line_edit(self.colmap_workspace))
+        pose_layout.addWidget(btn_colmap_ws, 3, 2)
+
+        pose_layout.addWidget(QLabel("COLMAP database.db:"), 4, 0)
+        self.colmap_db_path = QLineEdit(str(self.settings.get("colmap_db_path", "")))
+        pose_layout.addWidget(self.colmap_db_path, 4, 1)
+        btn_colmap_db = QPushButton("参照")
+        btn_colmap_db.clicked.connect(lambda: self._pick_file_for_line_edit(self.colmap_db_path))
+        pose_layout.addWidget(btn_colmap_db, 4, 2)
+
+        pose_layout.addWidget(QLabel("COLMAP keyframe policy:"), 5, 0)
+        self.colmap_keyframe_policy = QComboBox()
+        self.colmap_keyframe_policy.addItems(["legacy", "stage2_relaxed", "stage1_only"])
+        self.colmap_keyframe_policy.setCurrentText(str(self.settings.get("colmap_keyframe_policy", "stage2_relaxed")))
+        pose_layout.addWidget(self.colmap_keyframe_policy, 5, 1)
+
+        pose_layout.addWidget(QLabel("COLMAP target mode:"), 6, 0)
+        self.colmap_keyframe_target_mode = QComboBox()
+        self.colmap_keyframe_target_mode.addItems(["auto", "fixed"])
+        self.colmap_keyframe_target_mode.setCurrentText(str(self.settings.get("colmap_keyframe_target_mode", "auto")))
+        pose_layout.addWidget(self.colmap_keyframe_target_mode, 6, 1)
+
+        pose_layout.addWidget(QLabel("COLMAP target min/max:"), 7, 0)
+        target_row = QHBoxLayout()
+        self.colmap_keyframe_target_min = QSpinBox()
+        self.colmap_keyframe_target_min.setRange(1, 100000)
+        self.colmap_keyframe_target_min.setValue(int(self.settings.get("colmap_keyframe_target_min", 120)))
+        target_row.addWidget(self.colmap_keyframe_target_min)
+        self.colmap_keyframe_target_max = QSpinBox()
+        self.colmap_keyframe_target_max.setRange(1, 100000)
+        self.colmap_keyframe_target_max.setValue(int(self.settings.get("colmap_keyframe_target_max", 240)))
+        target_row.addWidget(self.colmap_keyframe_target_max)
+        pose_layout.addLayout(target_row, 7, 1, 1, 2)
+
+        pose_layout.addWidget(QLabel("COLMAP NMS窓(sec):"), 8, 0)
+        self.colmap_nms_window_sec = QDoubleSpinBox()
+        self.colmap_nms_window_sec.setRange(0.01, 30.0)
+        self.colmap_nms_window_sec.setSingleStep(0.05)
+        self.colmap_nms_window_sec.setDecimals(2)
+        self.colmap_nms_window_sec.setValue(float(self.settings.get("colmap_nms_window_sec", 0.35)))
+        pose_layout.addWidget(self.colmap_nms_window_sec, 8, 1)
+
+        pose_layout.addWidget(QLabel("COLMAP rig policy:"), 9, 0)
+        self.colmap_rig_policy = QComboBox()
+        self.colmap_rig_policy.addItems(["lr_opk", "off"])
+        self.colmap_rig_policy.setCurrentText(str(self.settings.get("colmap_rig_policy", "lr_opk")))
+        pose_layout.addWidget(self.colmap_rig_policy, 9, 1)
+
+        pose_layout.addWidget(QLabel("COLMAP rig seed OPK:"), 10, 0)
+        seed = self.settings.get("colmap_rig_seed_opk_deg", [0.0, 0.0, 180.0])
+        if isinstance(seed, (list, tuple)) and len(seed) == 3:
+            seed_text = f"{float(seed[0]):.6g},{float(seed[1]):.6g},{float(seed[2]):.6g}"
+        else:
+            seed_text = "0,0,180"
+        self.colmap_rig_seed_opk_deg = QLineEdit(seed_text)
+        pose_layout.addWidget(self.colmap_rig_seed_opk_deg, 10, 1)
+
+        pose_layout.addWidget(QLabel("COLMAP workspace scope:"), 11, 0)
+        self.colmap_workspace_scope = QComboBox()
+        self.colmap_workspace_scope.addItems(["run_scoped", "shared"])
+        self.colmap_workspace_scope.setCurrentText(str(self.settings.get("colmap_workspace_scope", "run_scoped")))
+        pose_layout.addWidget(self.colmap_workspace_scope, 11, 1)
+
+        self.colmap_reuse_db = QCheckBox("COLMAP DBを再利用する")
+        self.colmap_reuse_db.setChecked(bool(self.settings.get("colmap_reuse_db", False)))
+        pose_layout.addWidget(self.colmap_reuse_db, 12, 0, 1, 3)
+
+        pose_layout.addWidget(QLabel("COLMAP解析マスク:"), 13, 0)
+        self.colmap_analysis_mask_profile = QComboBox()
+        self.colmap_analysis_mask_profile.addItems(["colmap_safe", "legacy"])
+        self.colmap_analysis_mask_profile.setCurrentText(str(self.settings.get("colmap_analysis_mask_profile", "colmap_safe")))
+        pose_layout.addWidget(self.colmap_analysis_mask_profile, 13, 1)
+
+        pose_layout.addWidget(QLabel("並進しきい値:"), 14, 0)
+        self.pose_select_translation_threshold = QDoubleSpinBox()
+        self.pose_select_translation_threshold.setRange(0.0, 50.0)
+        self.pose_select_translation_threshold.setSingleStep(0.1)
+        self.pose_select_translation_threshold.setDecimals(2)
+        self.pose_select_translation_threshold.setValue(float(self.settings.get("pose_select_translation_threshold", 1.2)))
+        pose_layout.addWidget(self.pose_select_translation_threshold, 14, 1)
+
+        pose_layout.addWidget(QLabel("回転しきい値(deg):"), 15, 0)
+        self.pose_select_rotation_threshold_deg = QDoubleSpinBox()
+        self.pose_select_rotation_threshold_deg.setRange(0.0, 180.0)
+        self.pose_select_rotation_threshold_deg.setSingleStep(0.5)
+        self.pose_select_rotation_threshold_deg.setDecimals(2)
+        self.pose_select_rotation_threshold_deg.setValue(float(self.settings.get("pose_select_rotation_threshold_deg", 5.0)))
+        pose_layout.addWidget(self.pose_select_rotation_threshold_deg, 15, 1)
+
+        pose_layout.addWidget(QLabel("最小観測点数:"), 16, 0)
+        self.pose_select_min_observations = QSpinBox()
+        self.pose_select_min_observations.setRange(0, 100000)
+        self.pose_select_min_observations.setValue(int(self.settings.get("pose_select_min_observations", 30)))
+        pose_layout.addWidget(self.pose_select_min_observations, 16, 1)
+
+        self.pose_select_enable_translation = QCheckBox("並進条件を有効化")
+        self.pose_select_enable_translation.setChecked(bool(self.settings.get("pose_select_enable_translation", True)))
+        pose_layout.addWidget(self.pose_select_enable_translation, 17, 0, 1, 3)
+
+        self.pose_select_enable_rotation = QCheckBox("回転条件を有効化")
+        self.pose_select_enable_rotation.setChecked(bool(self.settings.get("pose_select_enable_rotation", True)))
+        pose_layout.addWidget(self.pose_select_enable_rotation, 18, 0, 1, 3)
+
+        self.pose_select_enable_observations = QCheckBox("観測点数条件を有効化")
+        self.pose_select_enable_observations.setChecked(bool(self.settings.get("pose_select_enable_observations", False)))
+        pose_layout.addWidget(self.pose_select_enable_observations, 19, 0, 1, 3)
+
+        self.pose_backend.currentTextChanged.connect(self._on_pose_backend_changed)
+        self._on_pose_backend_changed(self.pose_backend.currentText())
+
+        pose_group.setLayout(pose_layout)
+        vo_page_layout.addWidget(pose_group)
+
         perf_group = QGroupBox("性能設定")
         perf_layout = QGridLayout()
 
@@ -1256,6 +1395,27 @@ class SettingsDialog(QDialog):
             'front_calib_xml': '',
             'rear_calib_xml': '',
             'calib_model': 'auto',
+            'pose_backend': 'vo',
+            'colmap_path': 'colmap',
+            'colmap_workspace': '',
+            'colmap_db_path': '',
+            'colmap_keyframe_policy': 'stage2_relaxed',
+            'colmap_keyframe_target_mode': 'auto',
+            'colmap_keyframe_target_min': 120,
+            'colmap_keyframe_target_max': 240,
+            'colmap_nms_window_sec': 0.35,
+            'colmap_rig_policy': 'lr_opk',
+            'colmap_rig_seed_opk_deg': [0.0, 0.0, 180.0],
+            'colmap_workspace_scope': 'run_scoped',
+            'colmap_reuse_db': False,
+            'colmap_analysis_mask_profile': 'colmap_safe',
+            'pose_export_format': 'internal',
+            'pose_select_translation_threshold': 1.2,
+            'pose_select_rotation_threshold_deg': 5.0,
+            'pose_select_min_observations': 30,
+            'pose_select_enable_translation': True,
+            'pose_select_enable_rotation': True,
+            'pose_select_enable_observations': False,
         })
 
         try:
@@ -1276,6 +1436,16 @@ class SettingsDialog(QDialog):
         settings_dir.mkdir(exist_ok=True)
 
         settings_file = settings_dir / "settings.json"
+
+        seed_text = self.colmap_rig_seed_opk_deg.text().strip()
+        seed_parts = [p.strip() for p in seed_text.split(",") if p.strip()]
+        if len(seed_parts) == 3:
+            try:
+                rig_seed_opk = [float(seed_parts[0]), float(seed_parts[1]), float(seed_parts[2])]
+            except ValueError:
+                rig_seed_opk = [0.0, 0.0, 180.0]
+        else:
+            rig_seed_opk = [0.0, 0.0, 180.0]
 
         # UI から設定値を取得
         settings_to_save = {
@@ -1377,6 +1547,30 @@ class SettingsDialog(QDialog):
             'front_calib_xml': self.front_calib_xml.text().strip(),
             'rear_calib_xml': self.rear_calib_xml.text().strip(),
             'calib_model': self.calib_model.currentText(),
+            'pose_backend': self.pose_backend.currentText(),
+            'colmap_path': self.colmap_path.text().strip(),
+            'colmap_workspace': self.colmap_workspace.text().strip(),
+            'colmap_db_path': self.colmap_db_path.text().strip(),
+            'colmap_keyframe_policy': self.colmap_keyframe_policy.currentText(),
+            'colmap_keyframe_target_mode': self.colmap_keyframe_target_mode.currentText(),
+            'colmap_keyframe_target_min': self.colmap_keyframe_target_min.value(),
+            'colmap_keyframe_target_max': max(
+                self.colmap_keyframe_target_min.value(),
+                self.colmap_keyframe_target_max.value(),
+            ),
+            'colmap_nms_window_sec': self.colmap_nms_window_sec.value(),
+            'colmap_rig_policy': self.colmap_rig_policy.currentText(),
+            'colmap_rig_seed_opk_deg': rig_seed_opk,
+            'colmap_workspace_scope': self.colmap_workspace_scope.currentText(),
+            'colmap_reuse_db': self.colmap_reuse_db.isChecked(),
+            'colmap_analysis_mask_profile': self.colmap_analysis_mask_profile.currentText(),
+            'pose_export_format': self.pose_export_format.currentText(),
+            'pose_select_translation_threshold': self.pose_select_translation_threshold.value(),
+            'pose_select_rotation_threshold_deg': self.pose_select_rotation_threshold_deg.value(),
+            'pose_select_min_observations': self.pose_select_min_observations.value(),
+            'pose_select_enable_translation': self.pose_select_enable_translation.isChecked(),
+            'pose_select_enable_rotation': self.pose_select_enable_rotation.isChecked(),
+            'pose_select_enable_observations': self.pose_select_enable_observations.isChecked(),
         }
 
         try:
@@ -1552,6 +1746,32 @@ class SettingsDialog(QDialog):
             self.front_calib_xml.setText(str(params.get('front_calib_xml', '')))
             self.rear_calib_xml.setText(str(params.get('rear_calib_xml', '')))
             self.calib_model.setCurrentText(str(params.get('calib_model', 'auto')))
+            self.pose_backend.setCurrentText(str(params.get('pose_backend', 'vo')))
+            self.colmap_path.setText(str(params.get('colmap_path', 'colmap')))
+            self.colmap_workspace.setText(str(params.get('colmap_workspace', '')))
+            self.colmap_db_path.setText(str(params.get('colmap_db_path', '')))
+            self.colmap_keyframe_policy.setCurrentText(str(params.get('colmap_keyframe_policy', 'stage2_relaxed')))
+            self.colmap_keyframe_target_mode.setCurrentText(str(params.get('colmap_keyframe_target_mode', 'auto')))
+            self.colmap_keyframe_target_min.setValue(int(params.get('colmap_keyframe_target_min', 120)))
+            self.colmap_keyframe_target_max.setValue(int(params.get('colmap_keyframe_target_max', 240)))
+            self.colmap_nms_window_sec.setValue(float(params.get('colmap_nms_window_sec', 0.35)))
+            self.colmap_rig_policy.setCurrentText(str(params.get('colmap_rig_policy', 'lr_opk')))
+            seed = params.get('colmap_rig_seed_opk_deg', [0.0, 0.0, 180.0])
+            if isinstance(seed, (list, tuple)) and len(seed) == 3:
+                self.colmap_rig_seed_opk_deg.setText(f"{float(seed[0]):.6g},{float(seed[1]):.6g},{float(seed[2]):.6g}")
+            else:
+                self.colmap_rig_seed_opk_deg.setText("0,0,180")
+            self.colmap_workspace_scope.setCurrentText(str(params.get('colmap_workspace_scope', 'run_scoped')))
+            self.colmap_reuse_db.setChecked(bool(params.get('colmap_reuse_db', False)))
+            self.colmap_analysis_mask_profile.setCurrentText(str(params.get('colmap_analysis_mask_profile', 'colmap_safe')))
+            self.pose_export_format.setCurrentText(str(params.get('pose_export_format', 'internal')))
+            self.pose_select_translation_threshold.setValue(float(params.get('pose_select_translation_threshold', 1.2)))
+            self.pose_select_rotation_threshold_deg.setValue(float(params.get('pose_select_rotation_threshold_deg', 5.0)))
+            self.pose_select_min_observations.setValue(int(params.get('pose_select_min_observations', 30)))
+            self.pose_select_enable_translation.setChecked(bool(params.get('pose_select_enable_translation', True)))
+            self.pose_select_enable_rotation.setChecked(bool(params.get('pose_select_enable_rotation', True)))
+            self.pose_select_enable_observations.setChecked(bool(params.get('pose_select_enable_observations', False)))
+            self._on_pose_backend_changed(self.pose_backend.currentText())
 
             logger.info(f"プリセット '{preset_id}' ({preset_info.name}) を適用しました")
 
@@ -1589,6 +1809,23 @@ class SettingsDialog(QDialog):
             self.vo_essential_method.setCurrentText("magsac")
             self.vo_subpixel_refine.setChecked(True)
             self.vo_adaptive_subsample.setChecked(False)
+
+    def _on_pose_backend_changed(self, backend_name: str):
+        is_colmap = str(backend_name or "").strip().lower() == "colmap"
+        widgets = [
+            self.colmap_keyframe_policy,
+            self.colmap_keyframe_target_mode,
+            self.colmap_keyframe_target_min,
+            self.colmap_keyframe_target_max,
+            self.colmap_nms_window_sec,
+            self.colmap_rig_policy,
+            self.colmap_rig_seed_opk_deg,
+            self.colmap_workspace_scope,
+            self.colmap_reuse_db,
+            self.colmap_analysis_mask_profile,
+        ]
+        for w in widgets:
+            w.setEnabled(is_colmap)
 
     def _on_reset(self):
         """
@@ -1691,6 +1928,28 @@ class SettingsDialog(QDialog):
             self.front_calib_xml.setText("")
             self.rear_calib_xml.setText("")
             self.calib_model.setCurrentText("auto")
+            self.pose_backend.setCurrentText("vo")
+            self.colmap_path.setText("colmap")
+            self.colmap_workspace.setText("")
+            self.colmap_db_path.setText("")
+            self.colmap_keyframe_policy.setCurrentText("stage2_relaxed")
+            self.colmap_keyframe_target_mode.setCurrentText("auto")
+            self.colmap_keyframe_target_min.setValue(120)
+            self.colmap_keyframe_target_max.setValue(240)
+            self.colmap_nms_window_sec.setValue(0.35)
+            self.colmap_rig_policy.setCurrentText("lr_opk")
+            self.colmap_rig_seed_opk_deg.setText("0,0,180")
+            self.colmap_workspace_scope.setCurrentText("run_scoped")
+            self.colmap_reuse_db.setChecked(False)
+            self.colmap_analysis_mask_profile.setCurrentText("colmap_safe")
+            self.pose_export_format.setCurrentText("internal")
+            self.pose_select_translation_threshold.setValue(1.2)
+            self.pose_select_rotation_threshold_deg.setValue(5.0)
+            self.pose_select_min_observations.setValue(30)
+            self.pose_select_enable_translation.setChecked(True)
+            self.pose_select_enable_rotation.setChecked(True)
+            self.pose_select_enable_observations.setChecked(False)
+            self._on_pose_backend_changed(self.pose_backend.currentText())
 
             QMessageBox.information(self, "完了", "設定をデフォルト値にリセットしました")
 
@@ -1713,6 +1972,15 @@ class SettingsDialog(QDialog):
             "キャリブレーションXMLを選択",
             str(Path.home()),
             "XML Files (*.xml);;All Files (*)",
+        )
+        if path:
+            line_edit.setText(path)
+
+    def _pick_dir_for_line_edit(self, line_edit: QLineEdit):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "ディレクトリを選択",
+            str(Path.home()),
         )
         if path:
             line_edit.setText(path)

@@ -18,6 +18,7 @@ import json
 import csv
 import os
 import shutil
+import subprocess
 import uuid
 from collections import Counter, deque
 from pathlib import Path
@@ -31,6 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from utils.logger import setup_logger, get_logger, set_log_level
 from utils.image_io import write_image
+from core.pose import run_pose_pipeline
 from core.visual_odometry.calibration import (
     calibration_from_dict,
     calibration_to_dict,
@@ -43,6 +45,16 @@ from core.visual_odometry.calibration_check import run_calibration_check
 # アプリケーション起動時にルートロガーを初期化
 setup_logger()
 logger = get_logger(__name__)
+
+
+def _parse_opk_seed_text(value: Any) -> List[float]:
+    parts = [p.strip() for p in str(value or "").split(",") if p.strip()]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("OPK seed must be 'OMEGA,PHI,KAPPA' (3 values)")
+    try:
+        return [float(parts[0]), float(parts[1]), float(parts[2])]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"Invalid OPK seed: {e}") from e
 
 
 def parse_arguments():
@@ -496,6 +508,139 @@ def parse_arguments():
         default=None,
         help="VO動的サブサンプル時の最小間引き間隔"
     )
+    parser.add_argument(
+        "--pose-backend",
+        type=str,
+        choices=["vo", "colmap"],
+        default=None,
+        help="姿勢推定バックエンド（vo / colmap）"
+    )
+    parser.add_argument(
+        "--colmap-path",
+        type=str,
+        default=None,
+        help="COLMAP実行ファイルパス（デフォルト: colmap）"
+    )
+    parser.add_argument(
+        "--colmap-workspace",
+        type=str,
+        default=None,
+        help="COLMAP作業ディレクトリ"
+    )
+    parser.add_argument(
+        "--colmap-db-path",
+        type=str,
+        default=None,
+        help="COLMAP database.db パス"
+    )
+    parser.add_argument(
+        "--colmap-keyframe-policy",
+        type=str,
+        choices=["legacy", "stage2_relaxed", "stage1_only"],
+        default=None,
+        help="COLMAP向けキーフレームポリシー"
+    )
+    parser.add_argument(
+        "--colmap-keyframe-target-mode",
+        type=str,
+        choices=["fixed", "auto"],
+        default=None,
+        help="COLMAP投入枚数の決定方式（fixed / auto）"
+    )
+    parser.add_argument(
+        "--colmap-keyframe-target-min",
+        type=int,
+        default=None,
+        help="COLMAP投入キーフレーム下限（不足時は補完）"
+    )
+    parser.add_argument(
+        "--colmap-keyframe-target-max",
+        type=int,
+        default=None,
+        help="COLMAP投入キーフレーム上限（超過時は均等間引き）"
+    )
+    parser.add_argument(
+        "--colmap-nms-window-sec",
+        type=float,
+        default=None,
+        help="COLMAP向けNMS窓（秒）"
+    )
+    parser.add_argument(
+        "--colmap-rig-policy",
+        type=str,
+        choices=["off", "lr_opk"],
+        default=None,
+        help="COLMAP rig 方針（off / lr_opk）"
+    )
+    parser.add_argument(
+        "--colmap-rig-seed-opk",
+        type=_parse_opk_seed_text,
+        default=None,
+        help="COLMAP rig 初期姿勢 OPK seed（例: 0,0,180）"
+    )
+    parser.add_argument(
+        "--colmap-workspace-scope",
+        type=str,
+        choices=["shared", "run_scoped"],
+        default=None,
+        help="COLMAP workspace のスコープ"
+    )
+    parser.add_argument(
+        "--colmap-reuse-db",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="COLMAP database.db を再利用する"
+    )
+    parser.add_argument(
+        "--colmap-analysis-mask-profile",
+        type=str,
+        choices=["legacy", "colmap_safe"],
+        default=None,
+        help="COLMAP向け解析時マスクプロファイル"
+    )
+    parser.add_argument(
+        "--pose-export-format",
+        type=str,
+        choices=["internal", "metashape"],
+        default=None,
+        help="姿勢CSVエクスポート形式"
+    )
+    parser.add_argument(
+        "--pose-select-translation-threshold",
+        type=float,
+        default=None,
+        help="必要画像抽出の並進しきい値（正規化ステップ）"
+    )
+    parser.add_argument(
+        "--pose-select-rotation-threshold-deg",
+        type=float,
+        default=None,
+        help="必要画像抽出の回転しきい値（deg）"
+    )
+    parser.add_argument(
+        "--pose-select-min-observations",
+        type=int,
+        default=None,
+        help="必要画像抽出の最小観測点数"
+    )
+    parser.add_argument(
+        "--pose-select-enable-translation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="必要画像抽出で並進条件を有効化/無効化"
+    )
+    parser.add_argument(
+        "--pose-select-enable-rotation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="必要画像抽出で回転条件を有効化/無効化"
+    )
+    parser.add_argument(
+        "--pose-select-enable-observations",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="必要画像抽出で観測点数条件を有効化/無効化"
+    )
 
     parser.add_argument(
         "--verbose", "-v",
@@ -743,6 +888,48 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["vo_adaptive_subsample"] = bool(args.vo_adaptive_subsample)
     if args.vo_subsample_min is not None:
         config["vo_subsample_min"] = int(max(1, args.vo_subsample_min))
+    if args.pose_backend is not None:
+        config["pose_backend"] = str(args.pose_backend).strip().lower()
+    if args.colmap_path is not None:
+        config["colmap_path"] = str(args.colmap_path).strip()
+    if args.colmap_workspace is not None:
+        config["colmap_workspace"] = str(args.colmap_workspace).strip()
+    if args.colmap_db_path is not None:
+        config["colmap_db_path"] = str(args.colmap_db_path).strip()
+    if args.colmap_keyframe_policy is not None:
+        config["colmap_keyframe_policy"] = str(args.colmap_keyframe_policy).strip().lower()
+    if args.colmap_keyframe_target_mode is not None:
+        config["colmap_keyframe_target_mode"] = str(args.colmap_keyframe_target_mode).strip().lower()
+    if args.colmap_keyframe_target_min is not None:
+        config["colmap_keyframe_target_min"] = int(max(1, args.colmap_keyframe_target_min))
+    if args.colmap_keyframe_target_max is not None:
+        config["colmap_keyframe_target_max"] = int(max(1, args.colmap_keyframe_target_max))
+    if args.colmap_nms_window_sec is not None:
+        config["colmap_nms_window_sec"] = float(max(0.01, args.colmap_nms_window_sec))
+    if args.colmap_rig_policy is not None:
+        config["colmap_rig_policy"] = str(args.colmap_rig_policy).strip().lower()
+    if args.colmap_rig_seed_opk is not None:
+        config["colmap_rig_seed_opk_deg"] = [float(args.colmap_rig_seed_opk[0]), float(args.colmap_rig_seed_opk[1]), float(args.colmap_rig_seed_opk[2])]
+    if args.colmap_workspace_scope is not None:
+        config["colmap_workspace_scope"] = str(args.colmap_workspace_scope).strip().lower()
+    if args.colmap_reuse_db is not None:
+        config["colmap_reuse_db"] = bool(args.colmap_reuse_db)
+    if args.colmap_analysis_mask_profile is not None:
+        config["colmap_analysis_mask_profile"] = str(args.colmap_analysis_mask_profile).strip().lower()
+    if args.pose_export_format is not None:
+        config["pose_export_format"] = str(args.pose_export_format).strip().lower()
+    if args.pose_select_translation_threshold is not None:
+        config["pose_select_translation_threshold"] = float(max(0.0, args.pose_select_translation_threshold))
+    if args.pose_select_rotation_threshold_deg is not None:
+        config["pose_select_rotation_threshold_deg"] = float(max(0.0, args.pose_select_rotation_threshold_deg))
+    if args.pose_select_min_observations is not None:
+        config["pose_select_min_observations"] = int(max(0, args.pose_select_min_observations))
+    if args.pose_select_enable_translation is not None:
+        config["pose_select_enable_translation"] = bool(args.pose_select_enable_translation)
+    if args.pose_select_enable_rotation is not None:
+        config["pose_select_enable_rotation"] = bool(args.pose_select_enable_rotation)
+    if args.pose_select_enable_observations is not None:
+        config["pose_select_enable_observations"] = bool(args.pose_select_enable_observations)
     if args.profile:
         config["enable_profile"] = True
         config["stage2_perf_profile"] = True
@@ -1028,6 +1215,49 @@ def write_vo_diagnostics(output_dir: Path, frame_metrics_records: List[Dict[str,
     return diagnostics_path, trajectory_path, diagnostics
 
 
+def _parse_frame_index_from_filename(name: str) -> int:
+    stem = Path(str(name or "")).stem
+    for part in stem.split("_"):
+        if part.isdigit():
+            try:
+                return int(part)
+            except Exception:
+                return -1
+    return -1
+
+
+def _build_exported_entries(image_root: Path, exported_image_paths: List[Path]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for p in exported_image_paths:
+        try:
+            rel = p.resolve().relative_to(image_root.resolve())
+        except Exception:
+            rel = Path(p.name)
+        rel_name = str(rel).replace("\\", "/")
+        frame_idx = _parse_frame_index_from_filename(rel_name)
+        rows.append(
+            {
+                "filename": rel_name,
+                "frame_index": int(frame_idx),
+                "abs_path": str(p.resolve()),
+            }
+        )
+    return rows
+
+
+def _build_frame_metrics_map(frame_metrics_records: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    for rec in frame_metrics_records:
+        try:
+            idx = int(rec.get("frame_index", -1))
+        except Exception:
+            continue
+        if idx < 0:
+            continue
+        out[idx] = rec
+    return out
+
+
 def summarize_quality_records(quality_records: List[Dict[str, Any]]) -> Dict[str, Any]:
     total = int(len(quality_records))
     passed = 0
@@ -1133,6 +1363,170 @@ def _resolve_calibration_path(raw_path: object, search_roots: List[Path]) -> Opt
     return str(p)
 
 
+def _validate_colmap_executable(colmap_path: str) -> Tuple[bool, str]:
+    candidate = str(colmap_path or "colmap").strip() or "colmap"
+    path_obj = Path(candidate)
+
+    candidates: List[str] = []
+    if path_obj.is_absolute() or os.sep in candidate:
+        candidates.append(str(path_obj))
+    else:
+        found = shutil.which(candidate)
+        if found:
+            candidates.append(found)
+        # Prefer Homebrew path if PATH is shadowed by legacy /usr/local binary.
+        candidates.extend(
+            [
+                f"/opt/homebrew/bin/{candidate}",
+                f"/usr/local/bin/{candidate}",
+            ]
+        )
+
+    seen = set()
+    final_candidates: List[str] = []
+    for c in candidates:
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        final_candidates.append(c)
+
+    if not final_candidates:
+        return False, f"COLMAP not found in PATH: {candidate}"
+
+    errors: List[str] = []
+    for resolved in final_candidates:
+        p = Path(resolved)
+        if not p.exists():
+            errors.append(f"{resolved}: not found")
+            continue
+        try:
+            proc = subprocess.run(
+                [resolved, "-h"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+            if int(proc.returncode) == 0:
+                return True, resolved
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            tail = detail[-1] if detail else f"returncode={proc.returncode}"
+            errors.append(f"{resolved}: {tail}")
+        except Exception as e:
+            errors.append(f"{resolved}: {e}")
+            continue
+
+    return False, "COLMAP executable check failed: " + " | ".join(errors)
+
+
+def _resolve_colmap_keyframe_policy(config: Dict[str, Any]) -> str:
+    pose_backend = str(config.get("pose_backend", "vo") or "vo").strip().lower()
+    raw_policy = str(config.get("colmap_keyframe_policy", "") or "").strip().lower()
+    if raw_policy not in {"legacy", "stage2_relaxed", "stage1_only"}:
+        raw_policy = ""
+    if raw_policy:
+        return raw_policy
+    return "stage2_relaxed" if pose_backend == "colmap" else "legacy"
+
+
+def _normalize_colmap_rig_seed(seed_raw: Any) -> List[float]:
+    if isinstance(seed_raw, str):
+        try:
+            return _parse_opk_seed_text(seed_raw)
+        except argparse.ArgumentTypeError:
+            return [0.0, 0.0, 180.0]
+    if isinstance(seed_raw, (list, tuple)) and len(seed_raw) == 3:
+        try:
+            return [float(seed_raw[0]), float(seed_raw[1]), float(seed_raw[2])]
+        except (TypeError, ValueError):
+            return [0.0, 0.0, 180.0]
+    return [0.0, 0.0, 180.0]
+
+
+def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
+    pose_backend = str(config.get("pose_backend", "vo") or "vo").strip().lower()
+    policy = _resolve_colmap_keyframe_policy(config)
+    target_mode = str(config.get("colmap_keyframe_target_mode", "") or "").strip().lower()
+    if target_mode not in {"fixed", "auto"}:
+        target_mode = "auto" if pose_backend == "colmap" else "fixed"
+    target_min = int(max(1, config.get("colmap_keyframe_target_min", 120)))
+    target_max = int(max(target_min, config.get("colmap_keyframe_target_max", 240)))
+    nms_window = float(max(0.01, config.get("colmap_nms_window_sec", 0.35)))
+    rig_policy = str(config.get("colmap_rig_policy", "") or "").strip().lower()
+    if rig_policy not in {"off", "lr_opk"}:
+        rig_policy = "lr_opk" if pose_backend == "colmap" else "off"
+    rig_seed_opk = _normalize_colmap_rig_seed(config.get("colmap_rig_seed_opk_deg", [0.0, 0.0, 180.0]))
+    workspace_scope = str(config.get("colmap_workspace_scope", "") or "").strip().lower()
+    if workspace_scope not in {"shared", "run_scoped"}:
+        workspace_scope = "run_scoped"
+    reuse_db = bool(config.get("colmap_reuse_db", False))
+    analysis_mask_profile = str(config.get("colmap_analysis_mask_profile", "") or "").strip().lower()
+    if analysis_mask_profile not in {"legacy", "colmap_safe"}:
+        analysis_mask_profile = "colmap_safe" if pose_backend == "colmap" else "legacy"
+
+    config["colmap_keyframe_policy"] = policy
+    config["COLMAP_KEYFRAME_POLICY"] = policy
+    config["colmap_keyframe_target_mode"] = target_mode
+    config["COLMAP_KEYFRAME_TARGET_MODE"] = target_mode
+    config["colmap_keyframe_target_min"] = target_min
+    config["COLMAP_KEYFRAME_TARGET_MIN"] = target_min
+    config["colmap_keyframe_target_max"] = target_max
+    config["COLMAP_KEYFRAME_TARGET_MAX"] = target_max
+    config["colmap_nms_window_sec"] = nms_window
+    config["COLMAP_NMS_WINDOW_SEC"] = nms_window
+    config["colmap_rig_policy"] = rig_policy
+    config["COLMAP_RIG_POLICY"] = rig_policy
+    config["colmap_rig_seed_opk_deg"] = list(rig_seed_opk)
+    config["COLMAP_RIG_SEED_OPK_DEG"] = list(rig_seed_opk)
+    config["colmap_workspace_scope"] = workspace_scope
+    config["COLMAP_WORKSPACE_SCOPE"] = workspace_scope
+    config["colmap_reuse_db"] = reuse_db
+    config["COLMAP_REUSE_DB"] = reuse_db
+    config["colmap_analysis_mask_profile"] = analysis_mask_profile
+    config["COLMAP_ANALYSIS_MASK_PROFILE"] = analysis_mask_profile
+
+    if pose_backend == "colmap" and policy != "legacy":
+        config["enable_stage0_scan"] = False
+        config["ENABLE_STAGE0_SCAN"] = False
+        config["enable_stage3_refinement"] = False
+        config["ENABLE_STAGE3_REFINEMENT"] = False
+
+    if pose_backend == "colmap" and analysis_mask_profile == "colmap_safe":
+        dm_classes = config.get("dynamic_mask_target_classes", config.get("DYNAMIC_MASK_TARGET_CLASSES", []))
+        if not isinstance(dm_classes, list):
+            dm_classes = list(dm_classes) if dm_classes else []
+        config["colmap_analysis_target_classes"] = [c for c in dm_classes if str(c) != "空"]
+    else:
+        config["colmap_analysis_target_classes"] = list(
+            config.get("dynamic_mask_target_classes", config.get("DYNAMIC_MASK_TARGET_CLASSES", [])) or []
+        )
+    config["COLMAP_ANALYSIS_TARGET_CLASSES"] = list(config.get("colmap_analysis_target_classes", []))
+
+    stage0_on = bool(config.get("enable_stage0_scan", config.get("ENABLE_STAGE0_SCAN", True)))
+    stage3_on = bool(config.get("enable_stage3_refinement", config.get("ENABLE_STAGE3_REFINEMENT", True)))
+    if pose_backend == "colmap" and policy == "stage1_only":
+        stage_plan = "Stage1 only"
+    elif pose_backend == "colmap" and policy == "stage2_relaxed":
+        stage_plan = "Stage1->Stage2(relaxed)"
+    else:
+        stage_plan = "Stage1->" + ("0->" if stage0_on else "") + "2" + ("->3" if stage3_on else "")
+
+    return {
+        "pose_backend": pose_backend,
+        "policy": policy,
+        "target_mode": target_mode,
+        "target_min": target_min,
+        "target_max": target_max,
+        "nms_window_sec": nms_window,
+        "rig_policy": rig_policy,
+        "rig_seed_opk_deg": list(rig_seed_opk),
+        "workspace_scope": workspace_scope,
+        "reuse_db": reuse_db,
+        "analysis_mask_profile": analysis_mask_profile,
+        "effective_stage_plan": stage_plan,
+    }
+
+
 def _load_calibrations_for_runtime(
     config: dict,
     meta,
@@ -1220,6 +1614,21 @@ def run_cli(args):
     config["analysis_run_id"] = run_id
     config["ANALYSIS_RUN_ID"] = run_id
     output_dir = resolve_output_dir(video_path, args.output)
+    pose_backend = str(config.get("pose_backend", "vo") or "vo").strip().lower()
+    if pose_backend not in {"vo", "colmap"}:
+        pose_backend = "vo"
+    config["pose_backend"] = pose_backend
+    colmap_keyframe_runtime = _apply_colmap_keyframe_runtime(config)
+    colmap_path = str(config.get("colmap_path", "colmap") or "colmap").strip() or "colmap"
+    config["colmap_path"] = colmap_path
+    if pose_backend == "colmap":
+        ok, detail = _validate_colmap_executable(colmap_path)
+        if not ok:
+            logger.error(
+                f"{detail}. "
+                "COLMAPを再インストールするか、`--colmap-path`で有効な実行ファイルを指定してください。"
+            )
+            sys.exit(2)
 
     logger.info("=" * 60)
     logger.info("360Split - CLIモード")
@@ -1227,6 +1636,26 @@ def run_cli(args):
     logger.info(f"入力動画: {video_path}")
     logger.info(f"出力先:   {output_dir}")
     logger.info(f"analysis_run_id: {run_id}")
+    logger.info(
+        "Pose backend: "
+        f"{pose_backend} "
+        f"(export={str(config.get('pose_export_format', 'internal') or 'internal').lower()}, "
+        f"trans_th={float(config.get('pose_select_translation_threshold', 1.2)):.2f}, "
+        f"rot_th={float(config.get('pose_select_rotation_threshold_deg', 5.0)):.2f}, "
+        f"min_obs={int(config.get('pose_select_min_observations', 30))})"
+    )
+    logger.info(
+        "COLMAP keyframe policy: "
+        f"{colmap_keyframe_runtime['policy']} "
+        f"(mode={colmap_keyframe_runtime['target_mode']}, "
+        f"target={colmap_keyframe_runtime['target_min']}-{colmap_keyframe_runtime['target_max']}, "
+        f"nms={colmap_keyframe_runtime['nms_window_sec']:.2f}s, "
+        f"rig={colmap_keyframe_runtime['rig_policy']}@opk={colmap_keyframe_runtime['rig_seed_opk_deg']}, "
+        f"workspace_scope={colmap_keyframe_runtime['workspace_scope']}, "
+        f"reuse_db={colmap_keyframe_runtime['reuse_db']}, "
+        f"mask_profile={colmap_keyframe_runtime['analysis_mask_profile']}, "
+        f"plan={colmap_keyframe_runtime['effective_stage_plan']})"
+    )
     if bool(config.get("resume_enabled", False)):
         logger.info("resume: 有効")
     if bool(config.get("keep_temp_on_success", False)):
@@ -1620,6 +2049,79 @@ def run_cli(args):
         logger.info(f"  [{i+1}/{len(keyframes)}] Frame {kf.frame_index:6d}{suffix_str} | "
                     f"Time {kf.timestamp:7.2f}s | Score {kf.combined_score:.3f}")
 
+    pose_summary: Dict[str, Any] = {
+        "enabled": True,
+        "backend": pose_backend,
+        "trajectory_count": 0,
+        "selected_count": 0,
+        "selection_stats": {},
+        "pose_trajectory_csv": None,
+        "metashape_csv": None,
+        "selected_images_dir": None,
+        "selected_images_list": None,
+        "copied_count": 0,
+        "diagnostics": {},
+        "raw_log_paths": {},
+        "failure_reason": None,
+    }
+    pose_image_root = stereo_images_root if is_stereo_mode else output_dir
+    try:
+        exported_entries = _build_exported_entries(pose_image_root, exported_image_paths)
+        frame_metrics_map = _build_frame_metrics_map(frame_metrics_records)
+        if not str(config.get("colmap_workspace", "") or "").strip():
+            config["colmap_workspace"] = str((output_dir / "pose_colmap").resolve())
+
+        def _pose_log(msg: str):
+            logger.info(msg)
+
+        pose_payload = run_pose_pipeline(
+            image_dir=str(pose_image_root),
+            output_dir=str(output_dir),
+            config=config,
+            context={
+                "log_callback": _pose_log,
+                "calibration_runtime": dict(calibration_runtime or {}),
+                "exported_entries": exported_entries,
+                "frame_metrics_map": frame_metrics_map,
+                "vo_trajectory_csv": str(output_dir / "vo_trajectory.csv"),
+                "colmap_workspace": str(config.get("colmap_workspace", "") or "").strip() or str(output_dir / "pose_colmap"),
+                "colmap_db_path": str(config.get("colmap_db_path", "") or "").strip(),
+                "analysis_run_id": str(run_id),
+                "colmap_workspace_scope": str(config.get("colmap_workspace_scope", "run_scoped") or "run_scoped"),
+                "colmap_reuse_db": bool(config.get("colmap_reuse_db", False)),
+                "colmap_rig_policy": str(config.get("colmap_rig_policy", "lr_opk") or "lr_opk"),
+                "colmap_rig_seed_opk_deg": list(config.get("colmap_rig_seed_opk_deg", [0.0, 0.0, 180.0])),
+            },
+        )
+        pose_result = pose_payload.get("result")
+        pose_summary.update(
+            {
+                "trajectory_count": int(pose_payload.get("trajectory_count", 0)),
+                "selected_count": int(pose_payload.get("selected_count", 0)),
+                "selection_stats": dict(pose_payload.get("selection_stats", {})),
+                "pose_trajectory_csv": pose_payload.get("pose_trajectory_csv"),
+                "metashape_csv": pose_payload.get("metashape_csv"),
+                "selected_images_dir": pose_payload.get("selected_images_dir"),
+                "selected_images_list": pose_payload.get("selected_images_list"),
+                "copied_count": int(pose_payload.get("copied_count", 0)),
+                "diagnostics": dict(getattr(pose_result, "diagnostics", {}) or {}),
+                "raw_log_paths": dict(getattr(pose_result, "raw_log_paths", {}) or {}),
+            }
+        )
+        logger.info(
+            "Pose summary: "
+            f"backend={pose_summary['backend']}, "
+            f"trajectory={pose_summary['trajectory_count']}, "
+            f"selected={pose_summary['selected_count']}, "
+            f"copied={pose_summary['copied_count']}"
+        )
+    except Exception as e:
+        pose_summary["failure_reason"] = str(e)
+        logger.error(f"Pose推定に失敗しました: {e}")
+        if pose_backend == "colmap":
+            loader.close()
+            sys.exit(2)
+
     colmap_dir = None
     if bool(config.get("colmap_format", False)):
         try:
@@ -1690,6 +2192,63 @@ def run_cli(args):
             ),
             "stage3_vo_valid_ratio_threshold": float(config.get("stage3_vo_valid_ratio_threshold", 0.50)),
         },
+        "keyframe_policy": str(
+            getattr(selector, "last_selection_runtime", {}).get(
+                "policy",
+                colmap_keyframe_runtime.get("policy", "legacy"),
+            )
+        ),
+        "keyframe_target_mode": str(
+            getattr(selector, "last_selection_runtime", {}).get(
+                "target_mode",
+                colmap_keyframe_runtime.get("target_mode", "fixed"),
+            )
+        ),
+        "effective_stage_plan": str(
+            getattr(selector, "last_selection_runtime", {}).get(
+                "effective_stage_plan",
+                colmap_keyframe_runtime.get("effective_stage_plan", "unknown"),
+            )
+        ),
+        "pre_retarget_count": int(
+            getattr(selector, "last_selection_runtime", {}).get("pre_retarget_count", len(keyframes))
+        ),
+        "post_retarget_count": int(
+            getattr(selector, "last_selection_runtime", {}).get("post_retarget_count", len(keyframes))
+        ),
+        "retarget_reason": str(
+            getattr(selector, "last_selection_runtime", {}).get("retarget_reason", "n/a")
+        ),
+        "effective_target_min": int(
+            getattr(selector, "last_selection_runtime", {}).get(
+                "effective_target_min",
+                colmap_keyframe_runtime.get("target_min", 120),
+            )
+        ),
+        "effective_target_max": int(
+            getattr(selector, "last_selection_runtime", {}).get(
+                "effective_target_max",
+                colmap_keyframe_runtime.get("target_max", 240),
+            )
+        ),
+        "auto_target": round_json_friendly(
+            getattr(selector, "last_selection_runtime", {}).get("auto_target", {})
+        ),
+        "coverage_before": round_json_friendly(
+            getattr(selector, "last_selection_runtime", {}).get("coverage_before", {})
+        ),
+        "coverage_after": round_json_friendly(
+            getattr(selector, "last_selection_runtime", {}).get("coverage_after", {})
+        ),
+        "colmap_runtime": {
+            "target_mode": str(colmap_keyframe_runtime.get("target_mode", "fixed")),
+            "rig_policy": str(colmap_keyframe_runtime.get("rig_policy", "off")),
+            "rig_seed_opk_deg": list(colmap_keyframe_runtime.get("rig_seed_opk_deg", [0.0, 0.0, 180.0])),
+            "workspace_scope": str(colmap_keyframe_runtime.get("workspace_scope", "run_scoped")),
+            "reuse_db": bool(colmap_keyframe_runtime.get("reuse_db", False)),
+            "analysis_mask_profile": str(colmap_keyframe_runtime.get("analysis_mask_profile", "legacy")),
+        },
+        "pose": pose_summary,
         "colmap": {
             "enabled": bool(config.get("colmap_format", False)),
             "output_dir": str(colmap_dir) if colmap_dir is not None else None,

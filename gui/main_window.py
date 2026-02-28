@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         self._active_stage_mode_label: str = "解析"
         self._analysis_run_id: Optional[str] = None
         self._last_vo_summary: Dict[str, object] = {}
+        self._last_pose_summary: Dict[str, object] = {}
         self._trajectory_runtime_counter: int = 0
         self._trajectory_runtime_stride: int = 5
 
@@ -337,6 +338,7 @@ class MainWindow(QMainWindow):
             # 前回解析結果を先にクリア
             self._stage1_scores.clear()
             self._analysis_masks.clear()
+            self._last_pose_summary = {}
             self.keyframe_list.clear()
             self.timeline.set_keyframes([], [])
             self.timeline.set_stationary_ranges([])
@@ -433,21 +435,73 @@ class MainWindow(QMainWindow):
         self._stage1_scores.clear()
         self._analysis_masks.clear()
         self._trajectory_runtime_counter = 0
+        self._last_pose_summary = {}
         self.trajectory.reset_runtime_trajectory()
 
         config = self.settings_panel.get_selector_dict()
-        # GUI統合モードでは常に Stage1->0->2->3 を実行する
-        config["enable_stage0_scan"] = True
-        config["ENABLE_STAGE0_SCAN"] = True
-        config["enable_stage3_refinement"] = True
-        config["ENABLE_STAGE3_REFINEMENT"] = True
+        pose_backend = str(config.get("POSE_BACKEND", config.get("pose_backend", "vo")) or "vo").strip().lower()
+        if pose_backend not in {"vo", "colmap"}:
+            pose_backend = "vo"
+        raw_policy = str(
+            config.get("COLMAP_KEYFRAME_POLICY", config.get("colmap_keyframe_policy", "")) or ""
+        ).strip().lower()
+        if raw_policy not in {"", "legacy", "stage2_relaxed", "stage1_only"}:
+            raw_policy = ""
+        keyframe_policy = raw_policy if raw_policy else ("stage2_relaxed" if pose_backend == "colmap" else "legacy")
+        raw_target_mode = str(
+            config.get("COLMAP_KEYFRAME_TARGET_MODE", config.get("colmap_keyframe_target_mode", "")) or ""
+        ).strip().lower()
+        if raw_target_mode not in {"", "fixed", "auto"}:
+            raw_target_mode = ""
+        target_mode = raw_target_mode if raw_target_mode else ("auto" if pose_backend == "colmap" else "fixed")
+        mask_profile = str(
+            config.get("COLMAP_ANALYSIS_MASK_PROFILE", config.get("colmap_analysis_mask_profile", "")) or ""
+        ).strip().lower()
+        if mask_profile not in {"legacy", "colmap_safe"}:
+            mask_profile = "colmap_safe" if pose_backend == "colmap" else "legacy"
+        config["pose_backend"] = pose_backend
+        config["POSE_BACKEND"] = pose_backend
+        config["colmap_keyframe_policy"] = keyframe_policy
+        config["COLMAP_KEYFRAME_POLICY"] = keyframe_policy
+        config["colmap_keyframe_target_mode"] = target_mode
+        config["COLMAP_KEYFRAME_TARGET_MODE"] = target_mode
+        config["colmap_analysis_mask_profile"] = mask_profile
+        config["COLMAP_ANALYSIS_MASK_PROFILE"] = mask_profile
+
+        if pose_backend == "colmap" and keyframe_policy != "legacy":
+            config["enable_stage0_scan"] = False
+            config["ENABLE_STAGE0_SCAN"] = False
+            config["enable_stage3_refinement"] = False
+            config["ENABLE_STAGE3_REFINEMENT"] = False
+        if pose_backend == "colmap" and mask_profile == "colmap_safe":
+            classes = config.get("dynamic_mask_target_classes", config.get("DYNAMIC_MASK_TARGET_CLASSES", []))
+            if not isinstance(classes, list):
+                classes = list(classes) if classes else []
+            filtered = [c for c in classes if str(c) != "空"]
+            config["colmap_analysis_target_classes"] = filtered
+            config["COLMAP_ANALYSIS_TARGET_CLASSES"] = list(filtered)
+        else:
+            classes = config.get("dynamic_mask_target_classes", config.get("DYNAMIC_MASK_TARGET_CLASSES", []))
+            if not isinstance(classes, list):
+                classes = list(classes) if classes else []
+            config["colmap_analysis_target_classes"] = list(classes)
+            config["COLMAP_ANALYSIS_TARGET_CLASSES"] = list(classes)
+
+        stage0_on = bool(config.get("enable_stage0_scan", config.get("ENABLE_STAGE0_SCAN", True)))
+        stage3_on = bool(config.get("enable_stage3_refinement", config.get("ENABLE_STAGE3_REFINEMENT", True)))
+        if pose_backend == "colmap" and keyframe_policy == "stage1_only":
+            stage_mode_label = "Unified(Stage1 only)"
+        elif pose_backend == "colmap" and keyframe_policy == "stage2_relaxed":
+            stage_mode_label = f"Unified(Stage1->2 relaxed, target={target_mode})"
+        else:
+            stage_mode_label = f"Unified(Stage1->{'0->' if stage0_on else ''}2{'->3' if stage3_on else ''})"
         self._analysis_run_id = str(uuid.uuid4())
         config["analysis_mode"] = "full"
         config["analysis_run_id"] = self._analysis_run_id
         config["ANALYSIS_RUN_ID"] = self._analysis_run_id
         self._log_analysis_request(
             trigger_source=trigger_source,
-            stage_mode_label="Unified(Stage1->0->2->3)",
+            stage_mode_label=stage_mode_label,
             config=config,
             overrides={},
         )
@@ -459,12 +513,13 @@ class MainWindow(QMainWindow):
         self._analysis_worker.frame_scores_updated.connect(self._on_scores_updated)
         self._analysis_worker.trajectory_updated.connect(self._on_trajectory_updated)
         self._analysis_worker.keyframes_found.connect(self._on_keyframes_found)
+        self._analysis_worker.pose_finished.connect(self._on_pose_finished)
         self._analysis_worker.analysis_finished.connect(self._on_analysis_finished)
         self._analysis_worker.error.connect(self._on_error)
 
         self._progress_bar.setVisible(True)
         self._progress_bar.setValue(0)
-        self.statusBar().showMessage("解析実行中... (Stage1→0→2→3)")
+        self.statusBar().showMessage("解析実行中... (Analysis→Pose)")
         self._analysis_worker.start()
 
     def _on_stage1_batch(self, batch: list):
@@ -547,16 +602,37 @@ class MainWindow(QMainWindow):
         valid = int(self._last_vo_summary.get("valid", 0))
         pose_valid = int(self._last_vo_summary.get("pose_valid", 0))
         ratio = (valid / attempts) if attempts > 0 else 0.0
+        pose_backend = str(self._last_pose_summary.get("backend", "vo"))
+        pose_traj = int(self._last_pose_summary.get("trajectory_count", 0))
+        pose_sel = int(self._last_pose_summary.get("selected_count", 0))
+        pose_fail = str(self._last_pose_summary.get("failure_reason", "") or "")
         self.statusBar().showMessage(
-            f"解析完了: {n} キーフレーム検出 / VO有効率 {ratio:.1%} ({valid}/{attempts}), pose={pose_valid}"
+            f"解析完了: {n} キーフレーム / VO有効率 {ratio:.1%} ({valid}/{attempts}), "
+            f"VO pose={pose_valid}, backend={pose_backend}, pose={pose_traj}, selected={pose_sel}"
         )
+        pose_line = f"Pose backend: {pose_backend} / trajectory: {pose_traj} / selected: {pose_sel}"
+        if pose_fail:
+            pose_line += f"\\nPose失敗: {pose_fail}"
         QMessageBox.information(
             self,
             "完了",
             f"解析完了: {n} キーフレームを検出しました\n"
             f"VO有効率: {ratio:.1%} ({valid}/{attempts})\n"
-            f"VO pose有効点: {pose_valid}",
+            f"VO pose有効点: {pose_valid}\n"
+            f"{pose_line}",
         )
+
+    def _on_pose_finished(self, payload: dict):
+        self._last_pose_summary = dict(payload or {})
+        self.trajectory.set_pose_summary(self._last_pose_summary)
+        backend = str(self._last_pose_summary.get("backend", "vo"))
+        traj = int(self._last_pose_summary.get("trajectory_count", 0))
+        selected = int(self._last_pose_summary.get("selected_count", 0))
+        fail = str(self._last_pose_summary.get("failure_reason", "") or "")
+        if fail:
+            logger.warning(f"[COLMAP_LAST_ERROR] {fail}")
+        else:
+            logger.info(f"pose_finished, backend={backend}, trajectory={traj}, selected={selected}")
 
     # ==================================================================
     # 共通コールバック

@@ -10,4 +10,5 @@ def compute_combined_score(selector: Any, quality_scores: Dict[str, float],
 
 
 def apply_nms(selector: Any, candidates: List[Any], fps: float = 30.0) -> List[Any]:
-    return selector._apply_nms(candidates, fps=fps)
+    _ = fps
+    return selector._apply_nms(candidates)

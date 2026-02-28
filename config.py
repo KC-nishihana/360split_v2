@@ -193,6 +193,27 @@ class KeyframeConfig:
     front_calib_xml: str = ""
     rear_calib_xml: str = ""
     calib_model: str = "auto"
+    pose_backend: str = "vo"
+    colmap_path: str = "colmap"
+    colmap_workspace: str = ""
+    colmap_db_path: str = ""
+    colmap_keyframe_policy: str = ""
+    colmap_keyframe_target_mode: str = "auto"
+    colmap_keyframe_target_min: int = 120
+    colmap_keyframe_target_max: int = 240
+    colmap_nms_window_sec: float = 0.35
+    colmap_rig_policy: str = "lr_opk"
+    colmap_rig_seed_opk_deg: Tuple[float, float, float] = (0.0, 0.0, 180.0)
+    colmap_workspace_scope: str = "run_scoped"
+    colmap_reuse_db: bool = False
+    colmap_analysis_mask_profile: str = "colmap_safe"
+    pose_export_format: str = "internal"
+    pose_select_translation_threshold: float = 1.2
+    pose_select_rotation_threshold_deg: float = 5.0
+    pose_select_min_observations: int = 30
+    pose_select_enable_translation: bool = True
+    pose_select_enable_rotation: bool = True
+    pose_select_enable_observations: bool = False
     motion_blur_method: str = "legacy"
     enable_stage2_pipeline_parallel: bool = False
 
@@ -214,6 +235,7 @@ class KeyframeConfig:
             'MIN_KEYFRAME_INTERVAL': self.selection.min_keyframe_interval,
             'MAX_KEYFRAME_INTERVAL': self.selection.max_keyframe_interval,
             'SOFTMAX_BETA': self.selection.softmax_beta,
+            'NMS_TIME_WINDOW': self.selection.nms_time_window,
             # 互換性のため旧キーと新キーの両方を出力
             'GRIC_RATIO_THRESHOLD': self.gric.degeneracy_threshold,
             'GRIC_DEGENERACY_THRESHOLD': self.gric.degeneracy_threshold,
@@ -319,6 +341,27 @@ class KeyframeConfig:
             'FRONT_CALIB_XML': self.front_calib_xml,
             'REAR_CALIB_XML': self.rear_calib_xml,
             'CALIB_MODEL': self.calib_model,
+            'POSE_BACKEND': self.pose_backend,
+            'COLMAP_PATH': self.colmap_path,
+            'COLMAP_WORKSPACE': self.colmap_workspace,
+            'COLMAP_DB_PATH': self.colmap_db_path,
+            'COLMAP_KEYFRAME_POLICY': self.colmap_keyframe_policy,
+            'COLMAP_KEYFRAME_TARGET_MODE': self.colmap_keyframe_target_mode,
+            'COLMAP_KEYFRAME_TARGET_MIN': self.colmap_keyframe_target_min,
+            'COLMAP_KEYFRAME_TARGET_MAX': self.colmap_keyframe_target_max,
+            'COLMAP_NMS_WINDOW_SEC': self.colmap_nms_window_sec,
+            'COLMAP_RIG_POLICY': self.colmap_rig_policy,
+            'COLMAP_RIG_SEED_OPK_DEG': list(self.colmap_rig_seed_opk_deg),
+            'COLMAP_WORKSPACE_SCOPE': self.colmap_workspace_scope,
+            'COLMAP_REUSE_DB': self.colmap_reuse_db,
+            'COLMAP_ANALYSIS_MASK_PROFILE': self.colmap_analysis_mask_profile,
+            'POSE_EXPORT_FORMAT': self.pose_export_format,
+            'POSE_SELECT_TRANSLATION_THRESHOLD': self.pose_select_translation_threshold,
+            'POSE_SELECT_ROTATION_THRESHOLD_DEG': self.pose_select_rotation_threshold_deg,
+            'POSE_SELECT_MIN_OBSERVATIONS': self.pose_select_min_observations,
+            'POSE_SELECT_ENABLE_TRANSLATION': self.pose_select_enable_translation,
+            'POSE_SELECT_ENABLE_ROTATION': self.pose_select_enable_rotation,
+            'POSE_SELECT_ENABLE_OBSERVATIONS': self.pose_select_enable_observations,
             'MOTION_BLUR_METHOD': self.motion_blur_method,
             'ENABLE_STAGE2_PIPELINE_PARALLEL': self.enable_stage2_pipeline_parallel,
         }
@@ -364,6 +407,7 @@ class KeyframeConfig:
         config.selection.min_keyframe_interval = int(normalized.get('min_keyframe_interval', config.selection.min_keyframe_interval))
         config.selection.max_keyframe_interval = int(normalized.get('max_keyframe_interval', config.selection.max_keyframe_interval))
         config.selection.softmax_beta = float(normalized.get('softmax_beta', config.selection.softmax_beta))
+        config.selection.nms_time_window = float(max(0.01, normalized.get('nms_time_window', config.selection.nms_time_window)))
         config.selection.laplacian_threshold = float(normalized.get('laplacian_threshold', config.selection.laplacian_threshold))
         config.selection.motion_blur_threshold = float(normalized.get('motion_blur_threshold', config.selection.motion_blur_threshold))
         config.selection.exposure_threshold = float(normalized.get('exposure_threshold', config.selection.exposure_threshold))
@@ -559,6 +603,85 @@ class KeyframeConfig:
         config.front_calib_xml = str(normalized.get('front_calib_xml', config.front_calib_xml) or "")
         config.rear_calib_xml = str(normalized.get('rear_calib_xml', config.rear_calib_xml) or "")
         config.calib_model = str(normalized.get('calib_model', config.calib_model) or "auto")
+        config.pose_backend = str(normalized.get('pose_backend', config.pose_backend) or "vo").strip().lower()
+        if config.pose_backend not in {"vo", "colmap"}:
+            config.pose_backend = "vo"
+        config.colmap_path = str(normalized.get('colmap_path', config.colmap_path) or "colmap").strip() or "colmap"
+        config.colmap_workspace = str(normalized.get('colmap_workspace', config.colmap_workspace) or "").strip()
+        config.colmap_db_path = str(normalized.get('colmap_db_path', config.colmap_db_path) or "").strip()
+        config.colmap_keyframe_policy = str(
+            normalized.get('colmap_keyframe_policy', config.colmap_keyframe_policy) or ""
+        ).strip().lower()
+        if config.colmap_keyframe_policy not in {"", "legacy", "stage2_relaxed", "stage1_only"}:
+            config.colmap_keyframe_policy = ""
+        config.colmap_keyframe_target_mode = str(
+            normalized.get('colmap_keyframe_target_mode', config.colmap_keyframe_target_mode) or "auto"
+        ).strip().lower()
+        if config.colmap_keyframe_target_mode not in {"fixed", "auto"}:
+            config.colmap_keyframe_target_mode = "auto"
+        config.colmap_keyframe_target_min = int(
+            max(1, normalized.get('colmap_keyframe_target_min', config.colmap_keyframe_target_min))
+        )
+        config.colmap_keyframe_target_max = int(
+            max(
+                config.colmap_keyframe_target_min,
+                normalized.get('colmap_keyframe_target_max', config.colmap_keyframe_target_max),
+            )
+        )
+        config.colmap_nms_window_sec = float(
+            max(0.01, normalized.get('colmap_nms_window_sec', config.colmap_nms_window_sec))
+        )
+        config.colmap_rig_policy = str(
+            normalized.get('colmap_rig_policy', config.colmap_rig_policy) or "lr_opk"
+        ).strip().lower()
+        if config.colmap_rig_policy not in {"off", "lr_opk"}:
+            config.colmap_rig_policy = "off"
+        seed = normalized.get('colmap_rig_seed_opk_deg', config.colmap_rig_seed_opk_deg)
+        if isinstance(seed, str):
+            parts = [p.strip() for p in seed.split(",") if p.strip()]
+            if len(parts) == 3:
+                try:
+                    seed = [float(parts[0]), float(parts[1]), float(parts[2])]
+                except (TypeError, ValueError):
+                    seed = config.colmap_rig_seed_opk_deg
+        if not isinstance(seed, (list, tuple)) or len(seed) != 3:
+            seed = config.colmap_rig_seed_opk_deg
+        try:
+            config.colmap_rig_seed_opk_deg = (float(seed[0]), float(seed[1]), float(seed[2]))
+        except (TypeError, ValueError, IndexError):
+            config.colmap_rig_seed_opk_deg = (0.0, 0.0, 180.0)
+        config.colmap_workspace_scope = str(
+            normalized.get('colmap_workspace_scope', config.colmap_workspace_scope) or "run_scoped"
+        ).strip().lower()
+        if config.colmap_workspace_scope not in {"shared", "run_scoped"}:
+            config.colmap_workspace_scope = "run_scoped"
+        config.colmap_reuse_db = bool(normalized.get('colmap_reuse_db', config.colmap_reuse_db))
+        config.colmap_analysis_mask_profile = str(
+            normalized.get('colmap_analysis_mask_profile', config.colmap_analysis_mask_profile) or "colmap_safe"
+        ).strip().lower()
+        if config.colmap_analysis_mask_profile not in {"legacy", "colmap_safe"}:
+            config.colmap_analysis_mask_profile = "colmap_safe"
+        config.pose_export_format = str(normalized.get('pose_export_format', config.pose_export_format) or "internal").strip().lower()
+        if config.pose_export_format not in {"internal", "metashape"}:
+            config.pose_export_format = "internal"
+        config.pose_select_translation_threshold = float(
+            max(0.0, normalized.get('pose_select_translation_threshold', config.pose_select_translation_threshold))
+        )
+        config.pose_select_rotation_threshold_deg = float(
+            max(0.0, normalized.get('pose_select_rotation_threshold_deg', config.pose_select_rotation_threshold_deg))
+        )
+        config.pose_select_min_observations = int(
+            max(0, normalized.get('pose_select_min_observations', config.pose_select_min_observations))
+        )
+        config.pose_select_enable_translation = bool(
+            normalized.get('pose_select_enable_translation', config.pose_select_enable_translation)
+        )
+        config.pose_select_enable_rotation = bool(
+            normalized.get('pose_select_enable_rotation', config.pose_select_enable_rotation)
+        )
+        config.pose_select_enable_observations = bool(
+            normalized.get('pose_select_enable_observations', config.pose_select_enable_observations)
+        )
         config.motion_blur_method = str(normalized.get("motion_blur_method", config.motion_blur_method) or "legacy").strip().lower()
         if config.motion_blur_method not in {"legacy", "angle_hist", "fft_hybrid"}:
             config.motion_blur_method = "legacy"
@@ -595,6 +718,7 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'min_keyframe_interval': 'MIN_KEYFRAME_INTERVAL',
     'max_keyframe_interval': 'MAX_KEYFRAME_INTERVAL',
     'softmax_beta': 'SOFTMAX_BETA',
+    'nms_time_window': 'NMS_TIME_WINDOW',
     'ssim_change_threshold': 'SSIM_CHANGE_THRESHOLD',
     'ssim_threshold': 'SSIM_CHANGE_THRESHOLD',
     'weight_sharpness': 'WEIGHT_SHARPNESS',
@@ -696,6 +820,27 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'front_calib_xml': 'FRONT_CALIB_XML',
     'rear_calib_xml': 'REAR_CALIB_XML',
     'calib_model': 'CALIB_MODEL',
+    'pose_backend': 'POSE_BACKEND',
+    'colmap_path': 'COLMAP_PATH',
+    'colmap_workspace': 'COLMAP_WORKSPACE',
+    'colmap_db_path': 'COLMAP_DB_PATH',
+    'colmap_keyframe_policy': 'COLMAP_KEYFRAME_POLICY',
+    'colmap_keyframe_target_mode': 'COLMAP_KEYFRAME_TARGET_MODE',
+    'colmap_keyframe_target_min': 'COLMAP_KEYFRAME_TARGET_MIN',
+    'colmap_keyframe_target_max': 'COLMAP_KEYFRAME_TARGET_MAX',
+    'colmap_nms_window_sec': 'COLMAP_NMS_WINDOW_SEC',
+    'colmap_rig_policy': 'COLMAP_RIG_POLICY',
+    'colmap_rig_seed_opk_deg': 'COLMAP_RIG_SEED_OPK_DEG',
+    'colmap_workspace_scope': 'COLMAP_WORKSPACE_SCOPE',
+    'colmap_reuse_db': 'COLMAP_REUSE_DB',
+    'colmap_analysis_mask_profile': 'COLMAP_ANALYSIS_MASK_PROFILE',
+    'pose_export_format': 'POSE_EXPORT_FORMAT',
+    'pose_select_translation_threshold': 'POSE_SELECT_TRANSLATION_THRESHOLD',
+    'pose_select_rotation_threshold_deg': 'POSE_SELECT_ROTATION_THRESHOLD_DEG',
+    'pose_select_min_observations': 'POSE_SELECT_MIN_OBSERVATIONS',
+    'pose_select_enable_translation': 'POSE_SELECT_ENABLE_TRANSLATION',
+    'pose_select_enable_rotation': 'POSE_SELECT_ENABLE_ROTATION',
+    'pose_select_enable_observations': 'POSE_SELECT_ENABLE_OBSERVATIONS',
     'analysis_mode': 'ANALYSIS_MODE',
     'motion_blur_method': 'MOTION_BLUR_METHOD',
     'enable_stage2_pipeline_parallel': 'ENABLE_STAGE2_PIPELINE_PARALLEL',

@@ -14,6 +14,7 @@ ExportWorker:
 import cv2
 import numpy as np
 import os
+import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -30,6 +31,7 @@ from core.visual_odometry.calibration import (
     calibration_to_dict,
     load_calibration_xml,
 )
+from core.pose import run_pose_pipeline
 from processing.fisheye_splitter import Cross5FisheyeSplitter, Cross5SplitConfig
 logger = get_logger(__name__)
 
@@ -492,6 +494,7 @@ class UnifiedAnalysisWorker(QThread):
     frame_scores_updated = Signal(list)
     trajectory_updated = Signal(dict)
     keyframes_found = Signal(list)
+    pose_finished = Signal(dict)
     analysis_finished = Signal()
     error = Signal(str)
 
@@ -504,6 +507,121 @@ class UnifiedAnalysisWorker(QThread):
 
     def stop(self):
         self._is_running = False
+
+    @staticmethod
+    def _build_pose_metrics_map(
+        metrics_map: Dict[int, Dict[str, float]],
+        pose_map: Dict[int, Dict[str, Optional[List[float]]]],
+    ) -> Dict[int, Dict[str, object]]:
+        out: Dict[int, Dict[str, object]] = {}
+        for idx, m in metrics_map.items():
+            p = pose_map.get(int(idx), {})
+            out[int(idx)] = {
+                "frame_index": int(idx),
+                "metrics": dict(m or {}),
+                "t_xyz": p.get("t_xyz"),
+                "q_wxyz": p.get("q_wxyz"),
+            }
+        return out
+
+    def _export_keyframes_for_pose(self, loader, keyframes, image_dir: Path) -> List[Dict[str, object]]:
+        image_dir.mkdir(parents=True, exist_ok=True)
+        entries: List[Dict[str, object]] = []
+        is_paired = bool(getattr(loader, "is_paired", False))
+
+        for kf in keyframes:
+            idx = int(getattr(kf, "frame_index", -1))
+            if idx < 0:
+                continue
+            if is_paired:
+                frame_a, frame_b = loader.get_frame_pair(idx)
+                if frame_a is None or frame_b is None:
+                    continue
+                for frame, suffix in ((frame_a, "_L"), (frame_b, "_R")):
+                    subdir = image_dir / suffix.strip("_")
+                    subdir.mkdir(parents=True, exist_ok=True)
+                    name = f"keyframe_{idx:06d}{suffix}.png"
+                    abs_path = subdir / name
+                    if not cv2.imwrite(str(abs_path), frame):
+                        continue
+                    rel = f"{suffix.strip('_')}/{name}"
+                    entries.append({"filename": rel, "frame_index": idx, "abs_path": str(abs_path)})
+            else:
+                frame = loader.get_frame(idx)
+                if frame is None:
+                    continue
+                name = f"keyframe_{idx:06d}.png"
+                abs_path = image_dir / name
+                if not cv2.imwrite(str(abs_path), frame):
+                    continue
+                entries.append({"filename": name, "frame_index": idx, "abs_path": str(abs_path)})
+        return entries
+
+    def _run_pose_phase(
+        self,
+        loader,
+        keyframes,
+        metrics_map: Dict[int, Dict[str, float]],
+        pose_map: Dict[int, Dict[str, Optional[List[float]]]],
+        run_id: str,
+    ) -> Dict[str, object]:
+        pose_backend = str(
+            self.config.get("pose_backend", self.config.get("POSE_BACKEND", "vo")) or "vo"
+        ).strip().lower()
+        if pose_backend not in {"vo", "colmap"}:
+            pose_backend = "vo"
+
+        pose_root = Path.home() / ".360split" / "pose_runs" / str(run_id)
+        image_dir = pose_root / "images"
+        if image_dir.exists():
+            shutil.rmtree(image_dir, ignore_errors=True)
+        image_dir.mkdir(parents=True, exist_ok=True)
+
+        exported_entries = self._export_keyframes_for_pose(loader, keyframes, image_dir)
+        frame_metrics_map = self._build_pose_metrics_map(metrics_map, pose_map)
+
+        def _pose_log(msg: str) -> None:
+            logger.info(str(msg))
+
+        if not str(self.config.get("colmap_workspace", self.config.get("COLMAP_WORKSPACE", "")) or "").strip():
+            self.config["colmap_workspace"] = str((pose_root / "colmap_workspace").resolve())
+
+        payload = run_pose_pipeline(
+            image_dir=str(image_dir),
+            output_dir=str(pose_root),
+            config=self.config,
+            context={
+                "log_callback": _pose_log,
+                "calibration_runtime": dict(self.config.get("calibration_runtime", {}) or {}),
+                "exported_entries": exported_entries,
+                "frame_metrics_map": frame_metrics_map,
+                "colmap_workspace": str(self.config.get("colmap_workspace", "") or "").strip() or str((pose_root / "colmap_workspace").resolve()),
+                "colmap_db_path": str(self.config.get("colmap_db_path", self.config.get("COLMAP_DB_PATH", "")) or "").strip(),
+                "analysis_run_id": str(run_id),
+                "colmap_workspace_scope": str(self.config.get("colmap_workspace_scope", self.config.get("COLMAP_WORKSPACE_SCOPE", "run_scoped")) or "run_scoped"),
+                "colmap_reuse_db": bool(self.config.get("colmap_reuse_db", self.config.get("COLMAP_REUSE_DB", False))),
+                "colmap_rig_policy": str(self.config.get("colmap_rig_policy", self.config.get("COLMAP_RIG_POLICY", "lr_opk")) or "lr_opk"),
+                "colmap_rig_seed_opk_deg": list(self.config.get("colmap_rig_seed_opk_deg", self.config.get("COLMAP_RIG_SEED_OPK_DEG", [0.0, 0.0, 180.0]))),
+            },
+        )
+        result = payload.get("result")
+        summary = {
+            "enabled": True,
+            "backend": pose_backend,
+            "trajectory_count": int(payload.get("trajectory_count", 0)),
+            "selected_count": int(payload.get("selected_count", 0)),
+            "selection_stats": dict(payload.get("selection_stats", {})),
+            "pose_trajectory_csv": payload.get("pose_trajectory_csv"),
+            "metashape_csv": payload.get("metashape_csv"),
+            "selected_images_dir": payload.get("selected_images_dir"),
+            "selected_images_list": payload.get("selected_images_list"),
+            "copied_count": int(payload.get("copied_count", 0)),
+            "diagnostics": dict(getattr(result, "diagnostics", {}) or {}),
+            "raw_log_paths": dict(getattr(result, "raw_log_paths", {}) or {}),
+            "failure_reason": None,
+            "output_root": str(pose_root),
+        }
+        return summary
 
     def run(self):
         try:
@@ -522,6 +640,21 @@ class UnifiedAnalysisWorker(QThread):
                 f" enable_stage0_scan={bool(self.config.get('enable_stage0_scan', self.config.get('ENABLE_STAGE0_SCAN', True)))},"
                 f" enable_stage3_refinement={bool(self.config.get('enable_stage3_refinement', self.config.get('ENABLE_STAGE3_REFINEMENT', True)))}"
             )
+            pose_summary = {
+                "enabled": True,
+                "backend": str(self.config.get("pose_backend", self.config.get("POSE_BACKEND", "vo")) or "vo"),
+                "trajectory_count": 0,
+                "selected_count": 0,
+                "selection_stats": {},
+                "pose_trajectory_csv": None,
+                "metashape_csv": None,
+                "selected_images_dir": None,
+                "selected_images_list": None,
+                "copied_count": 0,
+                "diagnostics": {},
+                "raw_log_paths": {},
+                "failure_reason": None,
+            }
 
             self.progress.emit(0, 100, "Stage 1: 品質スキャン開始...")
 
@@ -608,7 +741,10 @@ class UnifiedAnalysisWorker(QThread):
                     return
 
                 self.stage1_finished.emit(all_scores)
-                self.progress.emit(stage1_weight_pct, 100, "Stage 1 完了。Stage 0/2/3 開始...")
+                stage0_on = bool(self.config.get("enable_stage0_scan", self.config.get("ENABLE_STAGE0_SCAN", True)))
+                stage3_on = bool(self.config.get("enable_stage3_refinement", self.config.get("ENABLE_STAGE3_REFINEMENT", True)))
+                stage_tail = ("0->" if stage0_on else "") + "2" + ("->3" if stage3_on else "")
+                self.progress.emit(stage1_weight_pct, 100, f"Stage 1 完了。Stage {stage_tail} 開始...")
 
                 # ----- Stage 0/2/3 via selector -----
                 rerun_logger = None
@@ -625,8 +761,8 @@ class UnifiedAnalysisWorker(QThread):
                 def progress_cb(current, total, message=""):
                     if not self._is_running:
                         return
-                    pct = stage1_weight_pct + int(current / max(total, 1) * (100 - stage1_weight_pct))
-                    pct = max(stage1_weight_pct, min(100, pct))
+                    pct = stage1_weight_pct + int(current / max(total, 1) * (90 - stage1_weight_pct))
+                    pct = max(stage1_weight_pct, min(90, pct))
                     self.progress.emit(pct, 100,
                                        f"解析: {current}/{total} {message}")
 
@@ -671,6 +807,37 @@ class UnifiedAnalysisWorker(QThread):
                     frame_log_callback=frame_log_cb,
                     stage_temp_store=stage_store,
                 )
+                pose_summary = {
+                    "enabled": True,
+                    "backend": str(self.config.get("pose_backend", self.config.get("POSE_BACKEND", "vo")) or "vo"),
+                    "trajectory_count": 0,
+                    "selected_count": 0,
+                    "selection_stats": {},
+                    "pose_trajectory_csv": None,
+                    "metashape_csv": None,
+                    "selected_images_dir": None,
+                    "selected_images_list": None,
+                    "copied_count": 0,
+                    "diagnostics": {},
+                    "raw_log_paths": {},
+                    "failure_reason": None,
+                }
+                if self._is_running:
+                    self.progress.emit(90, 100, "Pose推定開始...")
+                    try:
+                        pose_summary = self._run_pose_phase(
+                            loader=loader,
+                            keyframes=keyframes,
+                            metrics_map=metrics_map,
+                            pose_map=pose_map,
+                            run_id=run_id,
+                        )
+                        self.progress.emit(100, 100, "Pose推定完了")
+                    except Exception as pose_error:
+                        logger.exception("Pose phase error")
+                        pose_summary["failure_reason"] = str(pose_error)
+                        if str(pose_summary.get("backend", "vo")).lower() == "colmap":
+                            raise
             finally:
                 loader.close()
 
@@ -721,6 +888,7 @@ class UnifiedAnalysisWorker(QThread):
 
             self.frame_scores_updated.emit(updated_scores)
             self.keyframes_found.emit(keyframes)
+            self.pose_finished.emit(dict(pose_summary))
             self.progress.emit(100, 100, "解析完了")
             self.analysis_finished.emit()
             logger.info(

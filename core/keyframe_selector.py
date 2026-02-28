@@ -177,6 +177,7 @@ class KeyframeSelector:
             'MIN_KEYFRAME_INTERVAL': 5,
             'MAX_KEYFRAME_INTERVAL': 60,
             'SOFTMAX_BETA': 5.0,
+            'NMS_TIME_WINDOW': 1.0,
             'GRIC_RATIO_THRESHOLD': 0.8,
             'SSIM_CHANGE_THRESHOLD': 0.85,
             'MOTION_BLUR_THRESHOLD': 0.3,
@@ -292,6 +293,18 @@ class KeyframeSelector:
             'FRONT_CALIB_XML': '',
             'REAR_CALIB_XML': '',
             'CALIB_MODEL': 'auto',
+            'POSE_BACKEND': 'vo',
+            'COLMAP_KEYFRAME_POLICY': '',
+            'COLMAP_KEYFRAME_TARGET_MODE': 'auto',
+            'COLMAP_KEYFRAME_TARGET_MIN': 120,
+            'COLMAP_KEYFRAME_TARGET_MAX': 240,
+            'COLMAP_NMS_WINDOW_SEC': 0.35,
+            'COLMAP_RIG_POLICY': 'lr_opk',
+            'COLMAP_RIG_SEED_OPK_DEG': [0.0, 0.0, 180.0],
+            'COLMAP_WORKSPACE_SCOPE': 'run_scoped',
+            'COLMAP_REUSE_DB': False,
+            'COLMAP_ANALYSIS_MASK_PROFILE': 'colmap_safe',
+            'COLMAP_ANALYSIS_TARGET_CLASSES': list(DYNAMIC_MASK_DEFAULT_CLASSES),
             'MOTION_BLUR_METHOD': 'legacy',
             'ENABLE_STAGE2_PIPELINE_PARALLEL': False,
             'FLOW_DOWNSCALE': 1.0,
@@ -392,6 +405,7 @@ class KeyframeSelector:
             subpixel_refine=bool(self.config.get('VO_SUBPIXEL_REFINE', True)),
         )
         self.stage1_quality_records: List[Dict[str, Any]] = []
+        self.last_selection_runtime: Dict[str, Any] = {}
 
     def _load_inpaint_hook(self):
         module_name = str(self.config.get('DYNAMIC_MASK_INPAINT_MODULE', '') or '').strip()
@@ -449,7 +463,10 @@ class KeyframeSelector:
         if self.target_mask_generator is None:
             return None, None
 
-        target_classes = self.config.get('DYNAMIC_MASK_TARGET_CLASSES', DYNAMIC_MASK_DEFAULT_CLASSES)
+        target_classes = self.config.get(
+            'COLMAP_ANALYSIS_TARGET_CLASSES',
+            self.config.get('DYNAMIC_MASK_TARGET_CLASSES', DYNAMIC_MASK_DEFAULT_CLASSES),
+        )
         if not isinstance(target_classes, list):
             target_classes = list(target_classes) if target_classes else list(DYNAMIC_MASK_DEFAULT_CLASSES)
 
@@ -506,7 +523,10 @@ class KeyframeSelector:
     ) -> Optional[np.ndarray]:
         if self.target_mask_generator is None:
             return None
-        target_classes = self.config.get('DYNAMIC_MASK_TARGET_CLASSES', DYNAMIC_MASK_DEFAULT_CLASSES)
+        target_classes = self.config.get(
+            'COLMAP_ANALYSIS_TARGET_CLASSES',
+            self.config.get('DYNAMIC_MASK_TARGET_CLASSES', DYNAMIC_MASK_DEFAULT_CLASSES),
+        )
         if not isinstance(target_classes, list):
             target_classes = list(target_classes) if target_classes else list(DYNAMIC_MASK_DEFAULT_CLASSES)
         classes_for_detection = target_classes if bool(self.config.get('DYNAMIC_MASK_USE_YOLO_SAM', True)) else []
@@ -1698,6 +1718,460 @@ class KeyframeSelector:
             points_world=None,
         )
 
+    def _resolve_colmap_keyframe_runtime(self) -> Dict[str, Any]:
+        pose_backend = str(
+            self.config.get("POSE_BACKEND", self.config.get("pose_backend", "vo")) or "vo"
+        ).strip().lower()
+        if pose_backend not in {"vo", "colmap"}:
+            pose_backend = "vo"
+
+        raw_policy = str(
+            self.config.get("COLMAP_KEYFRAME_POLICY", self.config.get("colmap_keyframe_policy", "")) or ""
+        ).strip().lower()
+        if raw_policy not in {"", "legacy", "stage2_relaxed", "stage1_only"}:
+            raw_policy = ""
+        policy = raw_policy if raw_policy else ("stage2_relaxed" if pose_backend == "colmap" else "legacy")
+
+        raw_target_mode = str(
+            self.config.get("COLMAP_KEYFRAME_TARGET_MODE", self.config.get("colmap_keyframe_target_mode", "")) or ""
+        ).strip().lower()
+        if raw_target_mode not in {"", "fixed", "auto"}:
+            raw_target_mode = ""
+        target_mode = raw_target_mode if raw_target_mode else ("auto" if pose_backend == "colmap" else "fixed")
+
+        target_min = int(max(1, self.config.get("COLMAP_KEYFRAME_TARGET_MIN", self.config.get("colmap_keyframe_target_min", 120))))
+        target_max = int(
+            max(
+                target_min,
+                self.config.get("COLMAP_KEYFRAME_TARGET_MAX", self.config.get("colmap_keyframe_target_max", 240)),
+            )
+        )
+        colmap_nms_window = float(
+            max(0.01, self.config.get("COLMAP_NMS_WINDOW_SEC", self.config.get("colmap_nms_window_sec", 0.35)))
+        )
+        rig_policy = str(
+            self.config.get("COLMAP_RIG_POLICY", self.config.get("colmap_rig_policy", ""))
+            or ""
+        ).strip().lower()
+        if rig_policy not in {"off", "lr_opk"}:
+            rig_policy = "lr_opk" if pose_backend == "colmap" else "off"
+        rig_seed_raw = self.config.get(
+            "COLMAP_RIG_SEED_OPK_DEG",
+            self.config.get("colmap_rig_seed_opk_deg", [0.0, 0.0, 180.0]),
+        )
+        if isinstance(rig_seed_raw, str):
+            rig_seed_raw = [v.strip() for v in rig_seed_raw.split(",") if v.strip()]
+        if not isinstance(rig_seed_raw, (list, tuple)) or len(rig_seed_raw) != 3:
+            rig_seed_raw = [0.0, 0.0, 180.0]
+        try:
+            rig_seed_opk = [float(rig_seed_raw[0]), float(rig_seed_raw[1]), float(rig_seed_raw[2])]
+        except (TypeError, ValueError):
+            rig_seed_opk = [0.0, 0.0, 180.0]
+        workspace_scope = str(
+            self.config.get("COLMAP_WORKSPACE_SCOPE", self.config.get("colmap_workspace_scope", ""))
+            or ""
+        ).strip().lower()
+        if workspace_scope not in {"shared", "run_scoped"}:
+            workspace_scope = "run_scoped"
+        reuse_db = bool(self.config.get("COLMAP_REUSE_DB", self.config.get("colmap_reuse_db", False)))
+        analysis_mask_profile = str(
+            self.config.get("COLMAP_ANALYSIS_MASK_PROFILE", self.config.get("colmap_analysis_mask_profile", ""))
+            or ""
+        ).strip().lower()
+        if analysis_mask_profile not in {"legacy", "colmap_safe"}:
+            analysis_mask_profile = "colmap_safe" if pose_backend == "colmap" else "legacy"
+        default_nms_window = float(
+            max(0.01, self.config.get("NMS_TIME_WINDOW", self.config.get("nms_time_window", 1.0)))
+        )
+
+        colmap_shortcut = bool(pose_backend == "colmap" and policy != "legacy")
+        stage1_only = bool(pose_backend == "colmap" and policy == "stage1_only")
+        relax_stage2 = bool(pose_backend == "colmap" and policy == "stage2_relaxed")
+        effective_nms = colmap_nms_window if colmap_shortcut else default_nms_window
+        stage0_on = bool(self.config.get("ENABLE_STAGE0_SCAN", True))
+        stage3_on = bool(self.config.get("ENABLE_STAGE3_REFINEMENT", True))
+        effective_stage_plan = (
+            "Stage1 only"
+            if stage1_only
+            else (
+                "Stage1->Stage2(relaxed)"
+                if relax_stage2
+                else f"Stage1->{'0->' if stage0_on else ''}2{'->3' if stage3_on else ''}"
+            )
+        )
+
+        # Persist normalized runtime config for downstream consumers.
+        self.config["POSE_BACKEND"] = pose_backend
+        self.config["COLMAP_KEYFRAME_POLICY"] = policy
+        self.config["COLMAP_KEYFRAME_TARGET_MODE"] = target_mode
+        self.config["COLMAP_KEYFRAME_TARGET_MIN"] = target_min
+        self.config["COLMAP_KEYFRAME_TARGET_MAX"] = target_max
+        self.config["COLMAP_NMS_WINDOW_SEC"] = colmap_nms_window
+        self.config["COLMAP_RIG_POLICY"] = rig_policy
+        self.config["COLMAP_RIG_SEED_OPK_DEG"] = list(rig_seed_opk)
+        self.config["COLMAP_WORKSPACE_SCOPE"] = workspace_scope
+        self.config["COLMAP_REUSE_DB"] = reuse_db
+        self.config["COLMAP_ANALYSIS_MASK_PROFILE"] = analysis_mask_profile
+        if pose_backend == "colmap" and analysis_mask_profile == "colmap_safe":
+            classes = self.config.get("DYNAMIC_MASK_TARGET_CLASSES", DYNAMIC_MASK_DEFAULT_CLASSES)
+            if not isinstance(classes, list):
+                classes = list(classes) if classes else list(DYNAMIC_MASK_DEFAULT_CLASSES)
+            self.config["COLMAP_ANALYSIS_TARGET_CLASSES"] = [c for c in classes if str(c) != "空"]
+        else:
+            classes = self.config.get("DYNAMIC_MASK_TARGET_CLASSES", DYNAMIC_MASK_DEFAULT_CLASSES)
+            if not isinstance(classes, list):
+                classes = list(classes) if classes else list(DYNAMIC_MASK_DEFAULT_CLASSES)
+            self.config["COLMAP_ANALYSIS_TARGET_CLASSES"] = list(classes)
+
+        return {
+            "pose_backend": pose_backend,
+            "policy": policy,
+            "target_mode": target_mode,
+            "target_min": target_min,
+            "target_max": target_max,
+            "colmap_shortcut": colmap_shortcut,
+            "stage1_only": stage1_only,
+            "relax_stage2": relax_stage2,
+            "effective_nms_window": effective_nms,
+            "force_stage0_off": colmap_shortcut,
+            "force_stage3_off": colmap_shortcut,
+            "rig_policy": rig_policy,
+            "rig_seed_opk_deg": list(rig_seed_opk),
+            "workspace_scope": workspace_scope,
+            "reuse_db": reuse_db,
+            "analysis_mask_profile": analysis_mask_profile,
+            "effective_stage_plan": effective_stage_plan,
+        }
+
+    @staticmethod
+    def _score_from_stage1_candidate(candidate: Dict[str, Any]) -> float:
+        qs = candidate.get("quality_scores", {}) if isinstance(candidate, dict) else {}
+        q = float(qs.get("quality", 0.0)) if isinstance(qs, dict) else 0.0
+        return float(np.clip(q, 0.0, 1.0))
+
+    def _build_stage1_keyframes(
+        self,
+        stage1_candidates: List[Dict[str, Any]],
+        *,
+        fps: float,
+    ) -> List[KeyframeInfo]:
+        fps_safe = max(float(fps), 1e-6)
+        keyframes: List[KeyframeInfo] = []
+        for cand in sorted(stage1_candidates, key=lambda x: int(x.get("frame_idx", 0))):
+            frame_idx = int(cand.get("frame_idx", 0))
+            quality_scores = dict(cand.get("quality_scores", {}) or {})
+            keyframes.append(
+                KeyframeInfo(
+                    frame_index=frame_idx,
+                    timestamp=frame_idx / fps_safe,
+                    quality_scores=quality_scores,
+                    geometric_scores={},
+                    adaptive_scores={},
+                    combined_score=self._score_from_stage1_candidate(cand),
+                )
+            )
+        return keyframes
+
+    @staticmethod
+    def _stage1_candidate_from_quality_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(record, dict):
+            return None
+        try:
+            frame_idx = int(record.get("frame_index", -1))
+        except (TypeError, ValueError):
+            return None
+        if frame_idx < 0:
+            return None
+        quality = float(record.get("quality", 0.0) or 0.0)
+        raw = dict(record.get("raw_metrics", {}) or {})
+        legacy = dict(record.get("legacy_quality_scores", {}) or {})
+        sharpness = float(raw.get("laplacian_var", legacy.get("sharpness", 0.0)) or 0.0)
+        exposure = float(raw.get("exposure", legacy.get("exposure", 0.0)) or 0.0)
+        return {
+            "frame_idx": frame_idx,
+            "quality_scores": {
+                "quality": float(np.clip(quality, 0.0, 1.0)),
+                "sharpness": sharpness,
+                "exposure": exposure,
+                "passes_threshold": bool(record.get("is_pass", False)),
+            },
+        }
+
+    def _coverage_backfill_stage1_candidates(
+        self,
+        stage1_candidates: List[Dict[str, Any]],
+        *,
+        total_frames: int,
+        target_hint: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        if total_frames <= 0:
+            return list(stage1_candidates), {"added": 0, "bins": 0}
+
+        selected_map: Dict[int, Dict[str, Any]] = {}
+        for cand in stage1_candidates:
+            if not isinstance(cand, dict):
+                continue
+            idx = int(cand.get("frame_idx", -1))
+            if idx < 0:
+                continue
+            selected_map[idx] = dict(cand)
+
+        bins = int(np.clip(max(6, target_hint // 12), 6, 48))
+        bin_width = float(max(1, total_frames)) / float(max(1, bins))
+
+        pool_rows = []
+        for rec in list(self.stage1_quality_records or []):
+            cand = self._stage1_candidate_from_quality_record(rec)
+            if cand is None:
+                continue
+            pool_rows.append(cand)
+        if not pool_rows:
+            return list(stage1_candidates), {"added": 0, "bins": bins}
+
+        added = 0
+        for b in range(bins):
+            start = int(np.floor(b * bin_width))
+            end = int(np.floor((b + 1) * bin_width)) if b < bins - 1 else total_frames
+            in_bin_selected = [idx for idx in selected_map.keys() if start <= idx < end]
+            if in_bin_selected:
+                continue
+            pool = [c for c in pool_rows if start <= int(c["frame_idx"]) < end]
+            if not pool:
+                continue
+            best = max(
+                pool,
+                key=lambda c: (
+                    self._score_from_stage1_candidate(c),
+                    -abs(int(c["frame_idx"]) - int((start + end) * 0.5)),
+                ),
+            )
+            idx = int(best["frame_idx"])
+            if idx in selected_map:
+                continue
+            selected_map[idx] = dict(best)
+            added += 1
+
+        out = sorted(selected_map.values(), key=lambda x: int(x.get("frame_idx", 0)))
+        return out, {"added": int(added), "bins": int(bins), "after": len(out)}
+
+    @staticmethod
+    def _compute_temporal_coverage(
+        keyframes: List[KeyframeInfo],
+        *,
+        total_frames: int,
+    ) -> Dict[str, Any]:
+        if total_frames <= 0:
+            return {"count": len(keyframes), "coverage_ratio": 0.0, "max_gap_frames": 0, "max_gap_ratio": 0.0}
+        if not keyframes:
+            return {"count": 0, "coverage_ratio": 0.0, "max_gap_frames": total_frames, "max_gap_ratio": 1.0}
+        idxs = sorted(int(k.frame_index) for k in keyframes)
+        unique_idxs = sorted(set(idxs))
+        if len(unique_idxs) == 1:
+            max_gap = total_frames - 1
+        else:
+            gaps = [unique_idxs[i] - unique_idxs[i - 1] for i in range(1, len(unique_idxs))]
+            max_gap = int(max(gaps) if gaps else 0)
+        span = int(unique_idxs[-1] - unique_idxs[0]) if len(unique_idxs) > 1 else 0
+        coverage_ratio = float(np.clip((span + 1) / max(1, total_frames), 0.0, 1.0))
+        return {
+            "count": int(len(unique_idxs)),
+            "coverage_ratio": coverage_ratio,
+            "max_gap_frames": int(max_gap),
+            "max_gap_ratio": float(max_gap / max(1, total_frames)),
+            "first_frame": int(unique_idxs[0]),
+            "last_frame": int(unique_idxs[-1]),
+        }
+
+    def _estimate_auto_target_bounds(
+        self,
+        *,
+        total_frames: int,
+        fps: float,
+        stage1_candidates: List[Dict[str, Any]],
+        stage2_records: Optional[List[Stage2FrameRecord]],
+        min_bound: int,
+        max_bound: int,
+    ) -> Tuple[int, int, Dict[str, Any]]:
+        fps_safe = max(float(fps), 1e-6)
+        duration_sec = float(total_frames / fps_safe)
+        base_count = float(duration_sec / 1.0)
+
+        motion_values: List[float] = []
+        feature_match_values: List[float] = []
+        if stage2_records:
+            for rec in stage2_records:
+                if not isinstance(rec, Stage2FrameRecord):
+                    continue
+                motion_values.append(float((rec.adaptive_scores or {}).get("optical_flow", 0.0) or 0.0))
+                feature_match_values.append(float((rec.geometric_scores or {}).get("feature_match_count", 0.0) or 0.0))
+
+        if motion_values:
+            motion_med = float(np.median(np.asarray(motion_values, dtype=np.float64)))
+            motion_factor = float(np.clip(0.70 + motion_med / 20.0, 0.70, 1.80))
+        else:
+            motion_med = 0.0
+            motion_factor = 1.0
+
+        if feature_match_values:
+            feats = np.asarray(feature_match_values, dtype=np.float64)
+            effective_feature_ratio = float(np.mean(feats >= 30.0))
+            feature_factor = float(np.clip(0.80 + effective_feature_ratio, 0.70, 1.40))
+        else:
+            effective_feature_ratio = float(
+                np.clip(len(stage1_candidates) / max(1, total_frames), 0.0, 1.0)
+            )
+            feature_factor = float(np.clip(0.80 + effective_feature_ratio, 0.70, 1.40))
+
+        target_center = int(round(base_count * motion_factor * feature_factor))
+        target_center = int(np.clip(target_center, min_bound, max_bound))
+        half_span = int(max(8, round(target_center * 0.15)))
+        auto_min = int(max(min_bound, target_center - half_span))
+        auto_max = int(min(max_bound, target_center + half_span))
+        auto_max = max(auto_max, auto_min)
+        return auto_min, auto_max, {
+            "base_count": float(base_count),
+            "motion_median": float(motion_med),
+            "motion_factor": float(motion_factor),
+            "effective_feature_ratio": float(effective_feature_ratio),
+            "feature_factor": float(feature_factor),
+            "target_center": int(target_center),
+            "auto_min": int(auto_min),
+            "auto_max": int(auto_max),
+        }
+
+    @staticmethod
+    def _time_distributed_downsample(
+        keyframes: List[KeyframeInfo],
+        target_count: int,
+    ) -> List[KeyframeInfo]:
+        if target_count <= 0:
+            return []
+        if len(keyframes) <= target_count:
+            return list(keyframes)
+        if target_count == 1:
+            return [keyframes[0]]
+
+        positions = np.linspace(0, len(keyframes) - 1, num=target_count, dtype=np.float64)
+        sampled_indices = [int(round(p)) for p in positions.tolist()]
+        # Keep order and de-duplicate.
+        dedup: List[int] = []
+        seen = set()
+        for idx in sampled_indices:
+            idx = int(np.clip(idx, 0, len(keyframes) - 1))
+            if idx in seen:
+                continue
+            seen.add(idx)
+            dedup.append(idx)
+        if 0 not in seen:
+            dedup.insert(0, 0)
+            seen.add(0)
+        last = len(keyframes) - 1
+        if last not in seen:
+            dedup.append(last)
+            seen.add(last)
+        dedup = sorted(dedup)
+        if len(dedup) > target_count:
+            pick_pos = np.linspace(0, len(dedup) - 1, num=target_count, dtype=np.float64)
+            dedup = [dedup[int(round(p))] for p in pick_pos.tolist()]
+            dedup = sorted(set(dedup))
+            if 0 not in dedup:
+                dedup.insert(0, 0)
+            if last not in dedup:
+                dedup.append(last)
+            dedup = sorted(dedup)[:target_count]
+        return [keyframes[i] for i in dedup]
+
+    def _retarget_keyframes_for_colmap(
+        self,
+        keyframes: List[KeyframeInfo],
+        stage1_candidates: List[Dict[str, Any]],
+        *,
+        total_frames: int,
+        fps: float,
+        target_mode: str,
+        target_min: int,
+        target_max: int,
+        stage2_records: Optional[List[Stage2FrameRecord]] = None,
+    ) -> Tuple[List[KeyframeInfo], Dict[str, Any]]:
+        mode = str(target_mode or "fixed").strip().lower()
+        if mode not in {"fixed", "auto"}:
+            mode = "fixed"
+        effective_min = int(max(1, target_min))
+        effective_max = int(max(effective_min, target_max))
+        auto_details: Dict[str, Any] = {}
+        if mode == "auto":
+            effective_min, effective_max, auto_details = self._estimate_auto_target_bounds(
+                total_frames=int(max(1, total_frames)),
+                fps=float(fps),
+                stage1_candidates=stage1_candidates,
+                stage2_records=stage2_records,
+                min_bound=effective_min,
+                max_bound=effective_max,
+            )
+
+        selected = sorted(keyframes, key=lambda k: int(k.frame_index))
+        pre_count = len(selected)
+        reason_parts: List[str] = []
+        if pre_count > effective_max:
+            selected = self._time_distributed_downsample(selected, effective_max)
+            reason_parts.append("downsample_to_max")
+
+        selected_by_idx: Dict[int, KeyframeInfo] = {int(k.frame_index): k for k in selected}
+        selected_idxs = sorted(selected_by_idx.keys())
+
+        if len(selected_idxs) < effective_min:
+            fps_safe = max(float(fps), 1e-6)
+            stage1_map: Dict[int, Dict[str, Any]] = {}
+            for cand in stage1_candidates:
+                if not isinstance(cand, dict):
+                    continue
+                idx = int(cand.get("frame_idx", -1))
+                if idx < 0:
+                    continue
+                stage1_map[idx] = cand
+
+            pool = [idx for idx in sorted(stage1_map.keys()) if idx not in selected_by_idx]
+            while len(selected_by_idx) < effective_min and pool:
+                if selected_idxs:
+                    best_idx = max(
+                        pool,
+                        key=lambda idx: (
+                            min(abs(idx - sidx) for sidx in selected_idxs),
+                            self._score_from_stage1_candidate(stage1_map[idx]),
+                            -idx,
+                        ),
+                    )
+                else:
+                    best_idx = pool[len(pool) // 2]
+                cand = stage1_map[best_idx]
+                quality_scores = dict(cand.get("quality_scores", {}) or {})
+                selected_by_idx[best_idx] = KeyframeInfo(
+                    frame_index=best_idx,
+                    timestamp=best_idx / fps_safe,
+                    quality_scores=quality_scores,
+                    geometric_scores={},
+                    adaptive_scores={},
+                    combined_score=self._score_from_stage1_candidate(cand),
+                )
+                pool.remove(best_idx)
+                selected_idxs = sorted(selected_by_idx.keys())
+            reason_parts.append("supplement_to_min")
+            if len(selected_by_idx) < effective_min:
+                reason_parts.append("insufficient_stage1_candidates")
+
+        out = [selected_by_idx[idx] for idx in sorted(selected_by_idx.keys())]
+        post_count = len(out)
+        reason = "+".join(reason_parts) if reason_parts else "within_target"
+        return out, {
+            "target_mode": mode,
+            "effective_target_min": int(effective_min),
+            "effective_target_max": int(effective_max),
+            "auto_target": dict(auto_details),
+            "pre_retarget_count": int(pre_count),
+            "post_retarget_count": int(post_count),
+            "retarget_reason": reason,
+        }
+
     def run_stage1_scan(
         self,
         video_loader,
@@ -1774,6 +2248,34 @@ class KeyframeSelector:
             self.config.get("ANALYSIS_MODE", self.config.get("analysis_mode", "full"))
         ).strip().lower()
         logger.info(f"解析モード: {analysis_mode}")
+        colmap_runtime = self._resolve_colmap_keyframe_runtime()
+        logger.info(
+            "keyframe_policy, "
+            f"pose_backend={colmap_runtime['pose_backend']}, "
+            f"policy={colmap_runtime['policy']}, "
+            f"target_mode={colmap_runtime['target_mode']}, "
+            f"target={colmap_runtime['target_min']}-{colmap_runtime['target_max']}, "
+            f"nms={colmap_runtime['effective_nms_window']:.2f}, "
+            f"rig={colmap_runtime['rig_policy']}@{colmap_runtime['rig_seed_opk_deg']}, "
+            f"workspace_scope={colmap_runtime['workspace_scope']}, "
+            f"reuse_db={colmap_runtime['reuse_db']}, "
+            f"mask_profile={colmap_runtime['analysis_mask_profile']}, "
+            f"plan={colmap_runtime['effective_stage_plan']}"
+        )
+        self.last_selection_runtime = {
+            "pose_backend": colmap_runtime["pose_backend"],
+            "policy": colmap_runtime["policy"],
+            "target_mode": colmap_runtime["target_mode"],
+            "effective_stage_plan": colmap_runtime["effective_stage_plan"],
+            "pre_retarget_count": 0,
+            "post_retarget_count": 0,
+            "retarget_reason": "n/a",
+            "effective_target_min": int(colmap_runtime["target_min"]),
+            "effective_target_max": int(colmap_runtime["target_max"]),
+            "auto_target": {},
+            "coverage_before": {},
+            "coverage_after": {},
+        }
 
         def _stage_start(stage: str, **kwargs):
             extra = ",".join([f" {k}={v}" for k, v in kwargs.items()])
@@ -1785,6 +2287,10 @@ class KeyframeSelector:
 
         mode_enable_stage0 = bool(self.config.get('ENABLE_STAGE0_SCAN', True))
         mode_enable_stage3 = bool(self.config.get('ENABLE_STAGE3_REFINEMENT', True))
+        if colmap_runtime["force_stage0_off"]:
+            mode_enable_stage0 = False
+        if colmap_runtime["force_stage3_off"]:
+            mode_enable_stage3 = False
         profile_enabled = bool(self.config.get('ENABLE_PROFILE', False))
         resume_enabled = bool(self.config.get('RESUME_ENABLED', self.config.get('resume_enabled', False)))
         keep_temp_on_success = bool(
@@ -1857,6 +2363,13 @@ class KeyframeSelector:
                     f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
                     " keyframes=0, note=stage0_only"
                 )
+                self.last_selection_runtime.update(
+                    {
+                        "pre_retarget_count": 0,
+                        "post_retarget_count": 0,
+                        "retarget_reason": "stage0_only",
+                    }
+                )
                 success = True
                 return []
 
@@ -1885,6 +2398,20 @@ class KeyframeSelector:
                 [dict(c) for c in stage1_candidates if isinstance(c, dict)],
                 key=lambda x: int(x.get("frame_idx", 0)),
             )
+            if colmap_runtime["colmap_shortcut"]:
+                before_stage1_cov = len(stage1_candidates)
+                stage1_candidates, backfill_info = self._coverage_backfill_stage1_candidates(
+                    stage1_candidates,
+                    total_frames=int(total_frames),
+                    target_hint=int(colmap_runtime["target_min"]),
+                )
+                if int(backfill_info.get("added", 0)) > 0:
+                    logger.info(
+                        "stage1_coverage_backfill, "
+                        f"before={before_stage1_cov}, after={len(stage1_candidates)}, "
+                        f"added={int(backfill_info.get('added', 0))}, "
+                        f"bins={int(backfill_info.get('bins', 0))}"
+                    )
             logger.info(
                 f"Stage 1完了: {len(stage1_candidates)}/{total_frames} "
                 f"({100*len(stage1_candidates)/max(total_frames, 1):.1f}%)"
@@ -1907,6 +2434,13 @@ class KeyframeSelector:
                 logger.info(
                     f"analysis_result, analysis_run_id={run_id}, mode={analysis_mode},"
                     " keyframes=0, note=stage1_empty"
+                )
+                self.last_selection_runtime.update(
+                    {
+                        "pre_retarget_count": 0,
+                        "post_retarget_count": 0,
+                        "retarget_reason": "stage1_empty",
+                    }
                 )
                 success = True
                 return []
@@ -1940,38 +2474,56 @@ class KeyframeSelector:
             # ===== Stage 2: 精密評価 =====
             current_stage = "2"
             t_stage2 = perf_counter() if profile_enabled else 0.0
-            _stage_start("2", candidates=len(stage1_candidates))
-            logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
-            if resume_enabled and store.has_stage2():
-                logger.info("Stage 2: テンポラリ結果を再利用")
-                stage2_candidate_rows, stage2_record_rows = store.load_stage2()
-                stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
-                stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+            stage2_records: List[Stage2FrameRecord] = []
+            if colmap_runtime["stage1_only"]:
+                _stage_start("2", candidates=len(stage1_candidates), mode="stage1_only")
+                logger.info("Stage 2: stage1_only policy により Stage1候補を直接利用します")
+                stage2_candidates = self._build_stage1_keyframes(stage1_candidates, fps=metadata.fps)
             else:
-                stage2_candidates, stage2_records = run_stage2_evaluator(
-                    self,
-                    video_loader,
-                    metadata,
-                    stage1_candidates,
-                    progress_callback,
-                    frame_log_callback,
-                    stage0_metrics,
-                )
+                _stage_start("2", candidates=len(stage1_candidates))
+                logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
+                ssim_original = float(self.config.get("SSIM_CHANGE_THRESHOLD", 0.85))
+                ssim_effective = ssim_original
+                if colmap_runtime["relax_stage2"]:
+                    ssim_effective = float(max(ssim_original, 0.95))
+                    self.config["SSIM_CHANGE_THRESHOLD"] = ssim_effective
+                    logger.info(
+                        f"Stage 2緩和: SSIM skip閾値を引き上げます "
+                        f"({ssim_original:.3f} -> {ssim_effective:.3f})"
+                    )
+                try:
+                    if resume_enabled and store.has_stage2():
+                        logger.info("Stage 2: テンポラリ結果を再利用")
+                        stage2_candidate_rows, stage2_record_rows = store.load_stage2()
+                        stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
+                        stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+                    else:
+                        stage2_candidates, stage2_records = run_stage2_evaluator(
+                            self,
+                            video_loader,
+                            metadata,
+                            stage1_candidates,
+                            progress_callback,
+                            frame_log_callback,
+                            stage0_metrics,
+                        )
 
-                self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
-                stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
+                        self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
+                        stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
 
-                stage2_candidate_rows = [self._serialize_keyframe_info(c) for c in stage2_candidates]
-                stage2_record_rows = [self._serialize_stage2_record(r) for r in stage2_records]
-                stage2_files = store.save_stage2(stage2_candidate_rows, stage2_record_rows)
-                store.mark_stage_done(
-                    "2",
-                    files=stage2_files,
-                    counts={"candidates": len(stage2_candidate_rows), "records": len(stage2_record_rows)},
-                )
-                stage2_candidate_rows, stage2_record_rows = store.load_stage2()
-                stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
-                stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+                        stage2_candidate_rows = [self._serialize_keyframe_info(c) for c in stage2_candidates]
+                        stage2_record_rows = [self._serialize_stage2_record(r) for r in stage2_records]
+                        stage2_files = store.save_stage2(stage2_candidate_rows, stage2_record_rows)
+                        store.mark_stage_done(
+                            "2",
+                            files=stage2_files,
+                            counts={"candidates": len(stage2_candidate_rows), "records": len(stage2_record_rows)},
+                        )
+                        stage2_candidate_rows, stage2_record_rows = store.load_stage2()
+                        stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
+                        stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+                finally:
+                    self.config["SSIM_CHANGE_THRESHOLD"] = ssim_original
 
             logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
             _stage_summary(
@@ -1984,7 +2536,7 @@ class KeyframeSelector:
                 _profile_log("2", perf_counter() - t_stage2, len(stage1_candidates))
 
             stage2_keyframes_pre_stage3 = self._enforce_max_interval(
-                self._apply_nms(stage2_candidates),
+                self._apply_nms(stage2_candidates, time_window=colmap_runtime["effective_nms_window"]),
                 metadata.fps,
                 source_candidates=stage2_candidates,
             )
@@ -2010,7 +2562,7 @@ class KeyframeSelector:
                         video_loader=video_loader,
                     )
                     keyframes = self._enforce_max_interval(
-                        self._apply_nms(stage2_candidates),
+                        self._apply_nms(stage2_candidates, time_window=colmap_runtime["effective_nms_window"]),
                         metadata.fps,
                         source_candidates=stage2_candidates,
                     )
@@ -2023,6 +2575,54 @@ class KeyframeSelector:
 
             logger.info(f"Stage 3完了: {len(keyframes)}個")
             _stage_summary("3", keyframes=len(keyframes), temp_file=str(store.run_dir / store.STAGE3_KEYFRAMES_FILE))
+
+            pre_retarget_count = len(keyframes)
+            post_retarget_count = pre_retarget_count
+            retarget_reason = "within_target"
+            retarget: Dict[str, Any] = {}
+            coverage_before = self._compute_temporal_coverage(keyframes, total_frames=int(total_frames))
+            coverage_after = dict(coverage_before)
+            if colmap_runtime["colmap_shortcut"]:
+                keyframes, retarget = self._retarget_keyframes_for_colmap(
+                    keyframes,
+                    stage1_candidates,
+                    total_frames=int(total_frames),
+                    fps=metadata.fps,
+                    target_mode=colmap_runtime["target_mode"],
+                    target_min=colmap_runtime["target_min"],
+                    target_max=colmap_runtime["target_max"],
+                    stage2_records=stage2_records,
+                )
+                post_retarget_count = int(retarget.get("post_retarget_count", len(keyframes)))
+                retarget_reason = str(retarget.get("retarget_reason", "n/a"))
+                coverage_after = self._compute_temporal_coverage(keyframes, total_frames=int(total_frames))
+                logger.info(
+                    "keyframe_retarget, "
+                    f"policy={colmap_runtime['policy']}, "
+                    f"target_mode={str(retarget.get('target_mode', colmap_runtime['target_mode']))}, "
+                    f"target={int(retarget.get('effective_target_min', colmap_runtime['target_min']))}"
+                    f"-{int(retarget.get('effective_target_max', colmap_runtime['target_max']))}, "
+                    f"before={pre_retarget_count}, after={post_retarget_count}, "
+                    f"coverage={coverage_before.get('coverage_ratio', 0.0):.3f}->{coverage_after.get('coverage_ratio', 0.0):.3f}, "
+                    f"max_gap={coverage_before.get('max_gap_frames', 0)}->{coverage_after.get('max_gap_frames', 0)}, "
+                    f"reason={retarget_reason}, auto={retarget.get('auto_target', {})}"
+                )
+            self.last_selection_runtime.update(
+                {
+                    "pre_retarget_count": int(pre_retarget_count),
+                    "post_retarget_count": int(post_retarget_count),
+                    "retarget_reason": retarget_reason,
+                    "effective_target_min": int(
+                        retarget.get("effective_target_min", colmap_runtime["target_min"])
+                    ) if colmap_runtime["colmap_shortcut"] else int(colmap_runtime["target_min"]),
+                    "effective_target_max": int(
+                        retarget.get("effective_target_max", colmap_runtime["target_max"])
+                    ) if colmap_runtime["colmap_shortcut"] else int(colmap_runtime["target_max"]),
+                    "auto_target": dict(retarget.get("auto_target", {})) if colmap_runtime["colmap_shortcut"] else {},
+                    "coverage_before": dict(coverage_before),
+                    "coverage_after": dict(coverage_after),
+                }
+            )
 
             if frame_log_callback:
                 selected_idx = {kf.frame_index for kf in keyframes}
@@ -2413,7 +3013,7 @@ class KeyframeSelector:
             stage0_motion_risk: float = 0.0,
             vo_status_reason: str = "not_evaluated",
         ) -> Dict[str, Any]:
-            ssim = float(a_scores.get("ssim", 1.0))
+            ssim = float(a_scores.get("ssim_pair", a_scores.get("ssim", 1.0)))
             flow_mag = float(a_scores.get("optical_flow", 0.0))
             return {
                 "translation_delta": flow_mag,
@@ -2668,6 +3268,11 @@ class KeyframeSelector:
                     if is_paired and last_pair is not None and current_pair is not None:
                         flow_a = self.adaptive_selector.compute_optical_flow_magnitude(last_pair[0], current_pair[0])
                         flow_b = self.adaptive_selector.compute_optical_flow_magnitude(last_pair[1], current_pair[1])
+                        ssim_a = float(adaptive_scores.get('ssim', 1.0))
+                        ssim_b = float(self.adaptive_selector.compute_ssim(last_pair[1], current_pair[1]))
+                        adaptive_scores['ssim_lens_a'] = ssim_a
+                        adaptive_scores['ssim_lens_b'] = ssim_b
+                        adaptive_scores['ssim_pair'] = float(min(ssim_a, ssim_b))
                         if self.config.get('PAIR_MOTION_AGGREGATION', 'max') == 'max':
                             adaptive_scores['optical_flow'] = max(flow_a, flow_b)
                         else:
@@ -2677,7 +3282,7 @@ class KeyframeSelector:
                     if perf_stats.enabled:
                         perf_stats.adaptive_eval_s += max(0.0, perf_counter() - adaptive_started)
 
-                    ssim = adaptive_scores.get('ssim', 1.0)
+                    ssim = adaptive_scores.get('ssim_pair', adaptive_scores.get('ssim', 1.0))
                     if ssim > self.config['SSIM_CHANGE_THRESHOLD'] and not force_insert and not exposure_changed:
                         combined = float(self._compute_combined_score(quality_scores, geometric_scores, adaptive_scores))
                         metrics = _build_metrics(
@@ -2897,8 +3502,12 @@ class KeyframeSelector:
 
         return float(np.clip(combined, 0.0, 1.0))
 
-    def _apply_nms(self, candidates: List[KeyframeInfo],
-                  time_window: float = 1.0) -> List[KeyframeInfo]:
+    def _apply_nms(
+        self,
+        candidates: List[KeyframeInfo],
+        time_window: Optional[float] = None,
+        **_kwargs,
+    ) -> List[KeyframeInfo]:
         """
         非最大値抑制（NMS）を適用（最適化版）
 
@@ -2920,6 +3529,11 @@ class KeyframeSelector:
         """
         if len(candidates) == 0:
             return []
+        if time_window is None:
+            time_window = float(
+                self.config.get("NMS_TIME_WINDOW", self.config.get("nms_time_window", 1.0))
+            )
+        time_window = float(max(0.01, time_window))
 
         # スコアでソート（降順）
         sorted_candidates = sorted(candidates, key=lambda x: x.combined_score, reverse=True)

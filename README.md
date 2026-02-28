@@ -51,6 +51,8 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+COLMAPバックエンドを使う場合は [COLMAP_SETUP.md](md/COLMAP_SETUP.md) を参照してください。
+
 オプション:
 
 ```bash
@@ -249,6 +251,22 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 | `--vo-adaptive-subsample / --no-vo-adaptive-subsample` | VO動的サブサンプリングON/OFF |
 | `--vo-subsample-min N` | 動的サブサンプル時の最小間引き |
 
+### Pose Backend / COLMAP
+
+| オプション | 説明 |
+|---|---|
+| `--pose-backend {vo,colmap}` | 姿勢推定バックエンド切替 |
+| `--colmap-path PATH` | COLMAP実行パス |
+| `--colmap-workspace PATH` | COLMAP作業ディレクトリ |
+| `--colmap-db-path PATH` | COLMAP `database.db` |
+| `--pose-export-format {internal,metashape}` | 姿勢CSV出力形式 |
+| `--pose-select-translation-threshold F` | 必要画像抽出: 並進しきい値（正規化） |
+| `--pose-select-rotation-threshold-deg F` | 必要画像抽出: 回転しきい値（deg） |
+| `--pose-select-min-observations N` | 必要画像抽出: 最小観測点数 |
+| `--pose-select-enable-translation / --no-pose-select-enable-translation` | 抽出で並進条件を有効化/無効化 |
+| `--pose-select-enable-rotation / --no-pose-select-enable-rotation` | 抽出で回転条件を有効化/無効化 |
+| `--pose-select-enable-observations / --no-pose-select-enable-observations` | 抽出で観測点条件を有効化/無効化 |
+
 ### Rerun
 
 | オプション | 説明 |
@@ -284,6 +302,10 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 - `frame_metrics.json`（Stage0/2/3の指標）
 - `vo_diagnostics.json`
 - `vo_trajectory.csv`
+- `pose_trajectory.csv`（統一Pose形式）
+- `metashape_import.csv`（`--pose-export-format metashape` 時）
+- `selected_images/`
+- `selected_images.txt`
 - `quality_metrics.json`（全Stage1サンプル）
 - `quality_metrics.csv`（全Stage1サンプル）
 

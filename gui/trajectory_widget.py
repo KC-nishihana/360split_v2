@@ -45,6 +45,8 @@ class TrajectoryWidget(QWidget):
         self._runtime_points: List[np.ndarray] = []
         self._runtime_origin: Optional[np.ndarray] = None
         self._runtime_update_stride = 5
+        self._status_base_text = ""
+        self._pose_summary_text = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -263,7 +265,9 @@ class TrajectoryWidget(QWidget):
             self._is_stationary = []
             self._keyframe_set = set()
             self._title_label.setText("擬似軌跡（VO未使用）")
-            self._status_label.setText("")
+            self._status_base_text = ""
+            self._pose_summary_text = ""
+            self._refresh_status_text()
             self._redraw()
             return
 
@@ -288,7 +292,8 @@ class TrajectoryWidget(QWidget):
             attempts = int(summary.get("attempted", 0))
             valid = int(summary.get("valid", 0))
             ratio = (valid / attempts) if attempts > 0 else 0.0
-            self._status_label.setText(f"VO有効率: {ratio:.1%} ({valid}/{attempts})")
+            self._status_base_text = f"VO有効率: {ratio:.1%} ({valid}/{attempts})"
+            self._refresh_status_text()
             if np.any(np.isfinite(coords[0])):
                 first = coords[0].copy()
             else:
@@ -306,10 +311,12 @@ class TrajectoryWidget(QWidget):
             runtime_reason = str(summary.get("runtime_reason", "not_evaluated"))
             if not runtime_enabled and runtime_reason in {"calibration_unavailable", "projection_mode_unsupported", "vo_disabled_by_config"}:
                 self._title_label.setText(f"VO無効（理由: {self._format_reason(runtime_reason)}）")
-                self._status_label.setText("擬似軌跡を表示中")
+                self._status_base_text = "擬似軌跡を表示中"
+                self._refresh_status_text()
             else:
                 self._title_label.setText("擬似軌跡（VO未使用）")
-                self._status_label.setText(f"状態: {self._format_reason(runtime_reason)}")
+                self._status_base_text = f"状態: {self._format_reason(runtime_reason)}"
+                self._refresh_status_text()
             flow_mag = np.asarray([float(getattr(s, 'flow_mag', 0.0)) for s in frame_scores], dtype=np.float32)
             rotation = np.asarray([float(getattr(s, 'rotation_delta', 0.0)) for s in frame_scores], dtype=np.float32)
             dist = np.clip(flow_mag, 0.0, np.percentile(flow_mag, 95) if flow_mag.size > 0 else 0.0)
@@ -327,6 +334,34 @@ class TrajectoryWidget(QWidget):
                 y[i] = y[i - 1] + step * np.sin(theta * 0.25) * 0.5
             self._coords = np.column_stack([x, y, z]).astype(np.float32)
         self._redraw()
+
+    def _refresh_status_text(self):
+        if self._status_base_text and self._pose_summary_text:
+            self._status_label.setText(f"{self._status_base_text} | {self._pose_summary_text}")
+        elif self._pose_summary_text:
+            self._status_label.setText(self._pose_summary_text)
+        else:
+            self._status_label.setText(self._status_base_text)
+
+    def set_pose_summary(self, pose_summary: Optional[Dict[str, object]] = None):
+        info = dict(pose_summary or {})
+        backend = str(info.get("backend", "") or "").strip()
+        trajectory_count = int(info.get("trajectory_count", 0) or 0)
+        selected_count = int(info.get("selected_count", 0) or 0)
+        sel_stats = dict(info.get("selection_stats", {}) or {})
+        mean_dt = float(sel_stats.get("mean_translation_norm", 0.0) or 0.0)
+        mean_rot = float(sel_stats.get("mean_rotation_deg", 0.0) or 0.0)
+        failure = str(info.get("failure_reason", "") or "").strip()
+        if failure:
+            self._pose_summary_text = f"Pose失敗: {failure}"
+        elif backend:
+            self._pose_summary_text = (
+                f"Pose={backend}, N={trajectory_count}, selected={selected_count}, "
+                f"meanΔt={mean_dt:.2f}, meanΔθ={mean_rot:.2f}"
+            )
+        else:
+            self._pose_summary_text = ""
+        self._refresh_status_text()
 
     def _selected_plane(self) -> tuple[np.ndarray, np.ndarray]:
         if self._coords.size == 0:

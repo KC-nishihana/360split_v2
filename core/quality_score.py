@@ -85,12 +85,58 @@ def _masked_values(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return arr.reshape(-1)
 
 
+def _safe_scale(scale: float) -> float:
+    try:
+        value = float(scale)
+    except (TypeError, ValueError):
+        return 1.0
+    return float(np.clip(value, 0.1, 1.0))
+
+
+def _compute_tenengrad(gray: np.ndarray, mask: np.ndarray, tenengrad_scale: float) -> float:
+    scale = _safe_scale(tenengrad_scale)
+    work_gray = gray
+    work_mask = mask
+    if scale < 0.999:
+        h, w = gray.shape[:2]
+        nw = max(1, int(round(w * scale)))
+        nh = max(1, int(round(h * scale)))
+        work_gray = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
+        work_mask = cv2.resize(mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
+    sobel_x = cv2.Sobel(work_gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(work_gray, cv2.CV_64F, 0, 1, ksize=3)
+    tenengrad_map = (sobel_x * sobel_x) + (sobel_y * sobel_y)
+    tenengrad_vals = _masked_values(tenengrad_map, work_mask)
+    return float(np.mean(tenengrad_vals)) if tenengrad_vals.size > 0 else 0.0
+
+
+def compose_legacy_quality_proxy(
+    legacy_scores: Dict[str, float],
+    *,
+    laplacian_threshold: float,
+    motion_blur_threshold: float,
+    exposure_threshold: float,
+) -> float:
+    """
+    Compose a legacy Stage1 quality proxy into [0, 1] for unified reporting.
+    """
+    sharpness = float(legacy_scores.get("sharpness", 0.0))
+    exposure = float(legacy_scores.get("exposure", 0.0))
+    motion_blur = float(legacy_scores.get("motion_blur", 1.0))
+
+    sharpness_term = float(np.clip(sharpness / max(float(laplacian_threshold), 1e-6), 0.0, 1.0))
+    exposure_term = float(np.clip(exposure / max(float(exposure_threshold), 1e-6), 0.0, 1.0))
+    motion_term = float(np.clip(1.0 - motion_blur / max(float(motion_blur_threshold), 1e-6), 0.0, 1.0))
+    return float(np.clip((sharpness_term + exposure_term + motion_term) / 3.0, 0.0, 1.0))
+
+
 def compute_raw_metrics(
     frame: np.ndarray,
     roi_spec: str | QualityROISpec | None = None,
     *,
     use_orb: bool = True,
     orb: Optional[cv2.ORB] = None,
+    tenengrad_scale: float = 1.0,
 ) -> Dict[str, float]:
     """Compute raw quality metrics on ROI."""
     gray = _to_gray(frame)
@@ -102,11 +148,7 @@ def compute_raw_metrics(
     lap_vals = _masked_values(lap, mask)
     lap_var = float(np.var(lap_vals)) if lap_vals.size > 0 else 0.0
 
-    sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    tenengrad_map = (sobel_x * sobel_x) + (sobel_y * sobel_y)
-    tenengrad_vals = _masked_values(tenengrad_map, mask)
-    tenengrad = float(np.mean(tenengrad_vals)) if tenengrad_vals.size > 0 else 0.0
+    tenengrad = _compute_tenengrad(gray, mask, tenengrad_scale)
 
     black_clip = float(np.mean(vals <= 16.0)) if vals.size > 0 else 1.0
     white_clip = float(np.mean(vals >= 245.0)) if vals.size > 0 else 1.0
@@ -140,6 +182,7 @@ def compute_raw_metrics_batch(
     use_orb: bool = True,
     orb: Optional[cv2.ORB] = None,
     gpu_batch_enabled: bool = True,
+    tenengrad_scale: float = 1.0,
 ) -> List[Dict[str, float]]:
     """Compute raw quality metrics for a batch of frames."""
     if not frames:
@@ -169,11 +212,7 @@ def compute_raw_metrics_batch(
             lap = cv2.Laplacian(gray, cv2.CV_64F)
             lap_vals = _masked_values(lap, mask)
             lap_var = float(np.var(lap_vals)) if lap_vals.size > 0 else 0.0
-        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        tenengrad_map = (sobel_x * sobel_x) + (sobel_y * sobel_y)
-        tenengrad_vals = _masked_values(tenengrad_map, mask)
-        tenengrad = float(np.mean(tenengrad_vals)) if tenengrad_vals.size > 0 else 0.0
+        tenengrad = _compute_tenengrad(gray, mask, tenengrad_scale)
 
         black_clip = float(np.mean(vals <= 16.0)) if vals.size > 0 else 1.0
         white_clip = float(np.mean(vals >= 245.0)) if vals.size > 0 else 1.0
@@ -273,6 +312,7 @@ def apply_abs_guard(laplacian_var: float, abs_min: float) -> bool:
 
 
 __all__ = [
+    "compose_legacy_quality_proxy",
     "QualityROISpec",
     "parse_roi_spec",
     "compute_raw_metrics",

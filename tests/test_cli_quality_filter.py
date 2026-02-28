@@ -69,7 +69,8 @@ def test_no_quality_filter_falls_back_to_legacy_thresholding(tmp_path):
     )
     candidates = selector._stage1_fast_filter(loader, meta, progress_callback=None)
     assert len(candidates) > 0
-    assert all(rec.get("quality") is None for rec in selector.stage1_quality_records)
+    assert all(isinstance(rec.get("quality"), float) for rec in selector.stage1_quality_records)
+    assert all("legacy_quality_scores" in rec for rec in selector.stage1_quality_records)
 
 
 def test_quality_threshold_is_monotonic(tmp_path):

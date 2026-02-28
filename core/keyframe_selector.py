@@ -18,6 +18,7 @@ from .quality_evaluator import QualityEvaluator
 from .quality_score import (
     apply_abs_guard,
     compose_quality,
+    compose_legacy_quality_proxy,
     compute_raw_metrics,
     normalize_batch_p10_p90,
     parse_roi_spec,
@@ -193,6 +194,7 @@ class KeyframeSelector:
             'QUALITY_NORM_P_LOW': 10.0,
             'QUALITY_NORM_P_HIGH': 90.0,
             'QUALITY_DEBUG': False,
+            'QUALITY_TENENGRAD_SCALE': 1.0,
             'PAIR_MOTION_AGGREGATION': 'max',
             'MIN_FEATURE_MATCHES': 30,
             'THUMBNAIL_SIZE': (192, 108),
@@ -262,6 +264,8 @@ class KeyframeSelector:
             'STAGE3_WEIGHT_BASE': 0.70,
             'STAGE3_WEIGHT_TRAJECTORY': 0.25,
             'STAGE3_WEIGHT_STAGE0_RISK': 0.05,
+            'STAGE3_DISABLE_TRAJ_WHEN_VO_UNRELIABLE': True,
+            'STAGE3_VO_VALID_RATIO_THRESHOLD': 0.50,
             'VO_ENABLED': True,
             'VO_CENTER_ROI_RATIO': 0.6,
             'VO_MAX_FEATURES': 600,
@@ -290,6 +294,9 @@ class KeyframeSelector:
             'CALIB_MODEL': 'auto',
             'MOTION_BLUR_METHOD': 'legacy',
             'ENABLE_STAGE2_PIPELINE_PARALLEL': False,
+            'FLOW_DOWNSCALE': 1.0,
+            'RESUME_ENABLED': False,
+            'KEEP_TEMP_ON_SUCCESS': False,
         }
 
         # 外部設定でオーバーライド
@@ -351,7 +358,9 @@ class KeyframeSelector:
             gric_config=gric_config,
             equirect_config=equirect_config
         )
-        self.adaptive_selector = AdaptiveSelector()
+        self.adaptive_selector = AdaptiveSelector(
+            flow_downscale=float(np.clip(self.config.get('FLOW_DOWNSCALE', 1.0), 0.1, 1.0))
+        )
         self.rig_processor = FisheyeRigProcessor(equirect_config=equirect_config)
 
         # アクセレータから情報を取得
@@ -1514,6 +1523,18 @@ class KeyframeSelector:
         w_base = float(self.config.get('STAGE3_WEIGHT_BASE', 0.70))
         w_traj = float(self.config.get('STAGE3_WEIGHT_TRAJECTORY', 0.25))
         w_risk = float(self.config.get('STAGE3_WEIGHT_STAGE0_RISK', 0.05))
+        disable_when_unreliable = bool(self.config.get("STAGE3_DISABLE_TRAJ_WHEN_VO_UNRELIABLE", True))
+        min_vo_valid_ratio = float(np.clip(self.config.get("STAGE3_VO_VALID_RATIO_THRESHOLD", 0.50), 0.0, 1.0))
+        vo_attempted = int(sum(1 for v in per_frame_vo.values() if float(v.get("vo_attempted", 0.0)) > 0.5))
+        vo_valid = int(sum(1 for v in per_frame_vo.values() if float(v.get("vo_valid", 0.0)) > 0.5))
+        vo_valid_ratio = float(vo_valid / max(vo_attempted, 1)) if vo_attempted > 0 else 0.0
+        if disable_when_unreliable and vo_attempted > 0 and vo_valid_ratio < min_vo_valid_ratio and w_traj > 0.0:
+            logger.warning(
+                "Stage3: VO有効率が低いため trajectory 重みを無効化 "
+                f"(valid_ratio={vo_valid_ratio:.3f}, threshold={min_vo_valid_ratio:.3f})"
+            )
+            w_base += w_traj
+            w_traj = 0.0
 
         record_map = {int(r.frame_index): r for r in stage2_records}
         for kf in stage2_candidates:
@@ -1543,6 +1564,9 @@ class KeyframeSelector:
                 "stage0_motion_risk": risk,
                 "combined_stage2": base_score,
                 "combined_stage3": combined_stage3,
+                "stage3_vo_valid_ratio": vo_valid_ratio,
+                "stage3_w_base": w_base,
+                "stage3_w_traj": w_traj,
             }
             kf.combined_score = combined_stage3
 
@@ -1554,6 +1578,9 @@ class KeyframeSelector:
                 record.metrics["combined_stage2"] = base_score
                 record.metrics["combined_stage3"] = combined_stage3
                 record.metrics["stage0_motion_risk"] = risk
+                record.metrics["stage3_vo_valid_ratio"] = vo_valid_ratio
+                record.metrics["stage3_w_base"] = w_base
+                record.metrics["stage3_w_traj"] = w_traj
 
         pose_keys = sorted(int(k) for k in trajectory_map.keys())
         for idx, record in record_map.items():
@@ -1759,6 +1786,10 @@ class KeyframeSelector:
         mode_enable_stage0 = bool(self.config.get('ENABLE_STAGE0_SCAN', True))
         mode_enable_stage3 = bool(self.config.get('ENABLE_STAGE3_REFINEMENT', True))
         profile_enabled = bool(self.config.get('ENABLE_PROFILE', False))
+        resume_enabled = bool(self.config.get('RESUME_ENABLED', self.config.get('resume_enabled', False)))
+        keep_temp_on_success = bool(
+            self.config.get('KEEP_TEMP_ON_SUCCESS', self.config.get('keep_temp_on_success', False))
+        )
         current_stage = "init"
         success = False
 
@@ -1768,6 +1799,7 @@ class KeyframeSelector:
             self.config["ANALYSIS_RUN_ID"] = run_id
 
         store = stage_temp_store if stage_temp_store is not None else StageTempStore(run_id)
+        store.record_resume_state(enabled=resume_enabled)
 
         def _profile_log(stage: str, elapsed_s: float, frames: int) -> None:
             if not profile_enabled:
@@ -1801,19 +1833,23 @@ class KeyframeSelector:
                 if mode_enable_stage0:
                     t_stage0 = perf_counter() if profile_enabled else 0.0
                     _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
-                    logger.info("Stage 0: 軽量運動量走査開始")
-                    stage0_metrics = self._stage0_lightweight_motion_scan(
-                        video_loader, metadata, progress_callback, frame_log_callback
-                    )
-                    stage0_path = store.save_stage0(stage0_metrics)
-                    stage0_metrics = store.load_stage0()
-                    store.mark_stage_done(
-                        "0",
-                        files={"metrics": stage0_path},
-                        counts={"samples": len(stage0_metrics)},
-                    )
+                    if resume_enabled and store.has_stage0():
+                        logger.info("Stage 0: テンポラリ結果を再利用")
+                        stage0_metrics = store.load_stage0()
+                    else:
+                        logger.info("Stage 0: 軽量運動量走査開始")
+                        stage0_metrics = self._stage0_lightweight_motion_scan(
+                            video_loader, metadata, progress_callback, frame_log_callback
+                        )
+                        stage0_path = store.save_stage0(stage0_metrics)
+                        stage0_metrics = store.load_stage0()
+                        store.mark_stage_done(
+                            "0",
+                            files={"metrics": stage0_path},
+                            counts={"samples": len(stage0_metrics)},
+                        )
                     logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
-                    _stage_summary("0", samples=len(stage0_metrics), temp_file=stage0_path)
+                    _stage_summary("0", samples=len(stage0_metrics), temp_file=str(store.run_dir / store.STAGE0_METRICS_FILE))
                     if profile_enabled:
                         _profile_log("0", perf_counter() - t_stage0, len(stage0_metrics))
                 logger.info("Stage 0モードのため Stage1/2/3 をスキップ")
@@ -1828,7 +1864,7 @@ class KeyframeSelector:
             current_stage = "1"
             t_stage1 = perf_counter() if profile_enabled else 0.0
             _stage_start("1", total_frames=total_frames)
-            if store.has_stage1():
+            if resume_enabled and store.has_stage1():
                 logger.info("Stage 1: テンポラリ結果を再利用")
             else:
                 logger.info("Stage 1: 高速品質フィルタリング開始")
@@ -1881,19 +1917,23 @@ class KeyframeSelector:
             if mode_enable_stage0:
                 t_stage0 = perf_counter() if profile_enabled else 0.0
                 _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
-                logger.info("Stage 0: 軽量運動量走査開始")
-                stage0_metrics = self._stage0_lightweight_motion_scan(
-                    video_loader, metadata, progress_callback, frame_log_callback
-                )
-                stage0_path = store.save_stage0(stage0_metrics)
-                stage0_metrics = store.load_stage0()
-                store.mark_stage_done(
-                    "0",
-                    files={"metrics": stage0_path},
-                    counts={"samples": len(stage0_metrics)},
-                )
+                if resume_enabled and store.has_stage0():
+                    logger.info("Stage 0: テンポラリ結果を再利用")
+                    stage0_metrics = store.load_stage0()
+                else:
+                    logger.info("Stage 0: 軽量運動量走査開始")
+                    stage0_metrics = self._stage0_lightweight_motion_scan(
+                        video_loader, metadata, progress_callback, frame_log_callback
+                    )
+                    stage0_path = store.save_stage0(stage0_metrics)
+                    stage0_metrics = store.load_stage0()
+                    store.mark_stage_done(
+                        "0",
+                        files={"metrics": stage0_path},
+                        counts={"samples": len(stage0_metrics)},
+                    )
                 logger.info(f"Stage 0完了: {len(stage0_metrics)}サンプル")
-                _stage_summary("0", samples=len(stage0_metrics), temp_file=stage0_path)
+                _stage_summary("0", samples=len(stage0_metrics), temp_file=str(store.run_dir / store.STAGE0_METRICS_FILE))
                 if profile_enabled:
                     _profile_log("0", perf_counter() - t_stage0, len(stage0_metrics))
 
@@ -1901,35 +1941,37 @@ class KeyframeSelector:
             current_stage = "2"
             t_stage2 = perf_counter() if profile_enabled else 0.0
             _stage_start("2", candidates=len(stage1_candidates))
-            stage2_parallel = bool(self.config.get("ENABLE_STAGE2_PIPELINE_PARALLEL", False))
-            logger.info(
-                f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム, "
-                f"parallel={'on' if stage2_parallel else 'off'}）"
-            )
-            stage2_candidates, stage2_records = run_stage2_evaluator(
-                self,
-                video_loader,
-                metadata,
-                stage1_candidates,
-                progress_callback,
-                frame_log_callback,
-                stage0_metrics,
-            )
+            logger.info(f"Stage 2: 精密評価開始（{len(stage1_candidates)}フレーム）")
+            if resume_enabled and store.has_stage2():
+                logger.info("Stage 2: テンポラリ結果を再利用")
+                stage2_candidate_rows, stage2_record_rows = store.load_stage2()
+                stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
+                stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+            else:
+                stage2_candidates, stage2_records = run_stage2_evaluator(
+                    self,
+                    video_loader,
+                    metadata,
+                    stage1_candidates,
+                    progress_callback,
+                    frame_log_callback,
+                    stage0_metrics,
+                )
 
-            self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
-            stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
+                self._inject_stage0_vo_metrics_into_stage2_records(stage2_records, stage0_metrics)
+                stage2_candidates = self._apply_stationary_penalty(stage2_candidates, stage2_records, fps=metadata.fps)
 
-            stage2_candidate_rows = [self._serialize_keyframe_info(c) for c in stage2_candidates]
-            stage2_record_rows = [self._serialize_stage2_record(r) for r in stage2_records]
-            stage2_files = store.save_stage2(stage2_candidate_rows, stage2_record_rows)
-            store.mark_stage_done(
-                "2",
-                files=stage2_files,
-                counts={"candidates": len(stage2_candidate_rows), "records": len(stage2_record_rows)},
-            )
-            stage2_candidate_rows, stage2_record_rows = store.load_stage2()
-            stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
-            stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+                stage2_candidate_rows = [self._serialize_keyframe_info(c) for c in stage2_candidates]
+                stage2_record_rows = [self._serialize_stage2_record(r) for r in stage2_records]
+                stage2_files = store.save_stage2(stage2_candidate_rows, stage2_record_rows)
+                store.mark_stage_done(
+                    "2",
+                    files=stage2_files,
+                    counts={"candidates": len(stage2_candidate_rows), "records": len(stage2_record_rows)},
+                )
+                stage2_candidate_rows, stage2_record_rows = store.load_stage2()
+                stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
+                stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
 
             logger.info(f"Stage 2キーフレーム候補: {len(stage2_candidates)}個")
             _stage_summary(
@@ -1950,33 +1992,37 @@ class KeyframeSelector:
             # ===== Stage 3: 軌跡再評価 =====
             current_stage = "3"
             keyframes = stage2_keyframes_pre_stage3
-            if mode_enable_stage3:
-                t_stage3 = perf_counter() if profile_enabled else 0.0
-                _stage_start("3", input_candidates=len(stage2_candidates))
-                logger.info("Stage 3: 軌跡再評価開始")
-                stage2_candidates = run_stage3_refiner(
-                    self,
-                    metadata=metadata,
-                    stage2_candidates=stage2_candidates,
-                    stage2_final=stage2_keyframes_pre_stage3,
-                    stage2_records=stage2_records,
-                    stage0_metrics=stage0_metrics,
-                    video_loader=video_loader,
-                )
-                keyframes = self._enforce_max_interval(
-                    self._apply_nms(stage2_candidates),
-                    metadata.fps,
-                    source_candidates=stage2_candidates,
-                )
-                if profile_enabled:
-                    _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
-            stage3_rows = [self._serialize_keyframe_info(kf) for kf in keyframes]
-            stage3_path = store.save_stage3(stage3_rows)
-            store.mark_stage_done("3", files={"keyframes": stage3_path}, counts={"keyframes": len(stage3_rows)})
-            keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
+            if mode_enable_stage3 and resume_enabled and store.has_stage3():
+                logger.info("Stage 3: テンポラリ結果を再利用")
+                keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
+            else:
+                if mode_enable_stage3:
+                    t_stage3 = perf_counter() if profile_enabled else 0.0
+                    _stage_start("3", input_candidates=len(stage2_candidates))
+                    logger.info("Stage 3: 軌跡再評価開始")
+                    stage2_candidates = run_stage3_refiner(
+                        self,
+                        metadata=metadata,
+                        stage2_candidates=stage2_candidates,
+                        stage2_final=stage2_keyframes_pre_stage3,
+                        stage2_records=stage2_records,
+                        stage0_metrics=stage0_metrics,
+                        video_loader=video_loader,
+                    )
+                    keyframes = self._enforce_max_interval(
+                        self._apply_nms(stage2_candidates),
+                        metadata.fps,
+                        source_candidates=stage2_candidates,
+                    )
+                    if profile_enabled:
+                        _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
+                stage3_rows = [self._serialize_keyframe_info(kf) for kf in keyframes]
+                stage3_path = store.save_stage3(stage3_rows)
+                store.mark_stage_done("3", files={"keyframes": stage3_path}, counts={"keyframes": len(stage3_rows)})
+                keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
 
             logger.info(f"Stage 3完了: {len(keyframes)}個")
-            _stage_summary("3", keyframes=len(keyframes), temp_file=stage3_path)
+            _stage_summary("3", keyframes=len(keyframes), temp_file=str(store.run_dir / store.STAGE3_KEYFRAMES_FILE))
 
             if frame_log_callback:
                 selected_idx = {kf.frame_index for kf in keyframes}
@@ -2016,10 +2062,13 @@ class KeyframeSelector:
             raise
         finally:
             if success:
-                try:
-                    store.cleanup_on_success()
-                except Exception:
-                    logger.debug("stage temp cleanup failed")
+                if keep_temp_on_success:
+                    logger.info("stage tempを保持します（KEEP_TEMP_ON_SUCCESS=true）")
+                else:
+                    try:
+                        store.cleanup_on_success()
+                    except Exception:
+                        logger.debug("stage temp cleanup failed")
 
     def _stage1_fast_filter(self, video_loader, metadata: VideoMetadata,
                            progress_callback: Optional[Callable[[int, int], None]]) -> List[Dict]:
@@ -2066,6 +2115,7 @@ class KeyframeSelector:
             np.clip(self.config.get('QUALITY_NORM_P_HIGH', 90.0), quality_norm_p_low, 100.0)
         )
         quality_debug = bool(self.config.get('QUALITY_DEBUG', False))
+        quality_tenengrad_scale = float(np.clip(self.config.get('QUALITY_TENENGRAD_SCALE', 1.0), 0.1, 1.0))
         roi_mode = str(self.config.get('QUALITY_ROI_MODE', 'circle')).strip().lower()
         roi_ratio = float(np.clip(self.config.get('QUALITY_ROI_RATIO', 0.40), 0.05, 1.0))
         roi_spec = parse_roi_spec(f"{roi_mode}:{roi_ratio}")
@@ -2141,8 +2191,18 @@ class KeyframeSelector:
 
                     timestamp = float(frame_idx / max(fps, 1e-6))
                     if quality_filter_enabled:
-                        raw_a = compute_raw_metrics(frame_a, roi_spec=roi_spec, use_orb=quality_use_orb)
-                        raw_b = compute_raw_metrics(frame_b, roi_spec=roi_spec, use_orb=quality_use_orb)
+                        raw_a = compute_raw_metrics(
+                            frame_a,
+                            roi_spec=roi_spec,
+                            use_orb=quality_use_orb,
+                            tenengrad_scale=quality_tenengrad_scale,
+                        )
+                        raw_b = compute_raw_metrics(
+                            frame_b,
+                            roi_spec=roi_spec,
+                            use_orb=quality_use_orb,
+                            tenengrad_scale=quality_tenengrad_scale,
+                        )
                         pair_entries.append(
                             {
                                 "frame_idx": int(frame_idx),
@@ -2159,10 +2219,12 @@ class KeyframeSelector:
                             {
                                 "frame_index": int(frame_idx),
                                 "timestamp": timestamp,
-                                "quality": None,
+                                "quality": float(quality_scores.get("quality", 0.0)),
                                 "is_pass": bool(quality_scores.get('passes_threshold', False)),
                                 "drop_reason": "pass" if bool(quality_scores.get('passes_threshold', False)) else "legacy_threshold",
                                 "legacy_quality_scores": dict(quality_scores),
+                                "raw_metrics": {},
+                                "norm_metrics": {},
                             }
                         )
 
@@ -2726,6 +2788,18 @@ class KeyframeSelector:
         """
         score_a = self.quality_evaluator.evaluate_stage1_fast(frame_a)
         score_b = self.quality_evaluator.evaluate_stage1_fast(frame_b)
+        quality_a = compose_legacy_quality_proxy(
+            score_a,
+            laplacian_threshold=float(self.config['LAPLACIAN_THRESHOLD']),
+            motion_blur_threshold=float(self.config['MOTION_BLUR_THRESHOLD']),
+            exposure_threshold=float(self.config['EXPOSURE_THRESHOLD']),
+        )
+        quality_b = compose_legacy_quality_proxy(
+            score_b,
+            laplacian_threshold=float(self.config['LAPLACIAN_THRESHOLD']),
+            motion_blur_threshold=float(self.config['MOTION_BLUR_THRESHOLD']),
+            exposure_threshold=float(self.config['EXPOSURE_THRESHOLD']),
+        )
 
         sharpness_ok = (
             score_a.get('sharpness', 0.0) >= self.config['LAPLACIAN_THRESHOLD'] and
@@ -2745,6 +2819,9 @@ class KeyframeSelector:
             'exposure': min(score_a.get('exposure', 0.0), score_b.get('exposure', 0.0)),
             'motion_blur': max(score_a.get('motion_blur', 1.0), score_b.get('motion_blur', 1.0)),
             'softmax_depth': min(score_a.get('softmax_depth', 0.0), score_b.get('softmax_depth', 0.0)),
+            'quality': float(min(quality_a, quality_b)),
+            'quality_lens_a': float(quality_a),
+            'quality_lens_b': float(quality_b),
             'lens_a': score_a,
             'lens_b': score_b,
             'passes_threshold': bool(sharpness_ok and motion_ok and exposure_ok),

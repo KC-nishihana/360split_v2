@@ -154,6 +154,10 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 | `--rear-video PATH` | 前後魚眼入力（rear） |
 | `-o, --output DIR` | 出力先ディレクトリ |
 | `--config FILE` | 設定JSON |
+| `--analysis-run-id ID` | 解析実行ID |
+| `--resume` | 既存runの中間成果で再開 |
+| `--keep-temp` | 正常終了時も中間成果を保持 |
+| `--colmap-format` | `colmap/` 互換出力を生成 |
 | `--preset {outdoor,indoor,mixed}` | 環境プリセット |
 | `--format {png,jpg,tiff}` | 出力画像形式 |
 | `--max-keyframes N` | 出力上限数 |
@@ -268,6 +272,13 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
   - `quality_filter` セクション
   - `quality_summary` セクション
 
+### COLMAP互換（任意）
+
+- `--colmap-format` 有効時:
+  - `colmap/images/`
+  - `colmap/cameras.txt`
+  - `colmap/image_list.txt`
+
 ### 診断
 
 - `frame_metrics.json`（Stage0/2/3の指標）
@@ -289,6 +300,7 @@ python main.py --cli input.mp4 --calib-xml calib/cam1.xml --calib-model auto
 
 解析中間結果は `~/.360split/tmp_runs/<analysis_run_id>/` に `*.jsonl` で段階保存されます。
 正常終了時は自動削除、失敗時は保持されます。
+`--keep-temp` 指定時は正常終了時も保持し、`--resume --analysis-run-id <id>` で再利用できます。
 
 ## パイプライン概要
 
@@ -321,6 +333,12 @@ Stage1: 品質フィルタ（A案）
   "quality_norm_p_low": 10.0,
   "quality_norm_p_high": 90.0,
   "quality_debug": false,
+  "quality_tenengrad_scale": 1.0,
+  "flow_downscale": 1.0,
+  "resume_enabled": false,
+  "keep_temp_on_success": false,
+  "stage3_disable_traj_when_vo_unreliable": true,
+  "stage3_vo_valid_ratio_threshold": 0.5,
   "vo_essential_method": "auto",
   "vo_subpixel_refine": true,
   "vo_adaptive_subsample": false,

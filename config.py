@@ -88,6 +88,7 @@ class SelectionConfig:
     quality_norm_p_low: float = 10.0
     quality_norm_p_high: float = 90.0
     quality_debug: bool = False
+    quality_tenengrad_scale: float = 1.0
     ssim_change_threshold: float = 0.85  # SSIM変化検知閾値
     softmax_beta: float = 5.0           # Softmax温度パラメータ
     nms_time_window: float = 1.0        # NMS時間ウィンドウ（秒）
@@ -166,6 +167,11 @@ class KeyframeConfig:
     stage3_weight_base: float = 0.70
     stage3_weight_trajectory: float = 0.25
     stage3_weight_stage0_risk: float = 0.05
+    stage3_disable_traj_when_vo_unreliable: bool = True
+    stage3_vo_valid_ratio_threshold: float = 0.50
+    flow_downscale: float = 1.0
+    resume_enabled: bool = False
+    keep_temp_on_success: bool = False
     vo_enabled: bool = True
     vo_center_roi_ratio: float = 0.6
     vo_downscale_long_edge: int = 1000
@@ -231,6 +237,7 @@ class KeyframeConfig:
             'QUALITY_NORM_P_LOW': self.selection.quality_norm_p_low,
             'QUALITY_NORM_P_HIGH': self.selection.quality_norm_p_high,
             'QUALITY_DEBUG': self.selection.quality_debug,
+            'QUALITY_TENENGRAD_SCALE': self.selection.quality_tenengrad_scale,
             'MIN_FEATURE_MATCHES': self.gric.min_matches,
             'STATIONARY_ENABLE': self.selection.stationary_enable,
             'STATIONARY_MIN_DURATION_SEC': self.selection.stationary_min_duration_sec,
@@ -286,6 +293,11 @@ class KeyframeConfig:
             'STAGE3_WEIGHT_BASE': self.stage3_weight_base,
             'STAGE3_WEIGHT_TRAJECTORY': self.stage3_weight_trajectory,
             'STAGE3_WEIGHT_STAGE0_RISK': self.stage3_weight_stage0_risk,
+            'STAGE3_DISABLE_TRAJ_WHEN_VO_UNRELIABLE': self.stage3_disable_traj_when_vo_unreliable,
+            'STAGE3_VO_VALID_RATIO_THRESHOLD': self.stage3_vo_valid_ratio_threshold,
+            'FLOW_DOWNSCALE': self.flow_downscale,
+            'RESUME_ENABLED': self.resume_enabled,
+            'KEEP_TEMP_ON_SUCCESS': self.keep_temp_on_success,
             'VO_ENABLED': self.vo_enabled,
             'VO_CENTER_ROI_RATIO': self.vo_center_roi_ratio,
             'VO_DOWNSCALE_LONG_EDGE': self.vo_downscale_long_edge,
@@ -370,6 +382,13 @@ class KeyframeConfig:
         config.selection.quality_norm_p_low = float(np.clip(normalized.get('quality_norm_p_low', config.selection.quality_norm_p_low), 0.0, 100.0))
         config.selection.quality_norm_p_high = float(np.clip(normalized.get('quality_norm_p_high', config.selection.quality_norm_p_high), config.selection.quality_norm_p_low, 100.0))
         config.selection.quality_debug = bool(normalized.get('quality_debug', config.selection.quality_debug))
+        config.selection.quality_tenengrad_scale = float(
+            np.clip(
+                normalized.get('quality_tenengrad_scale', config.selection.quality_tenengrad_scale),
+                0.1,
+                1.0,
+            )
+        )
         config.selection.stationary_enable = bool(normalized.get('stationary_enable', config.selection.stationary_enable))
         config.selection.stationary_min_duration_sec = float(normalized.get(
             'stationary_min_duration_sec', config.selection.stationary_min_duration_sec
@@ -490,6 +509,25 @@ class KeyframeConfig:
         config.stage3_weight_base = float(normalized.get('stage3_weight_base', config.stage3_weight_base))
         config.stage3_weight_trajectory = float(normalized.get('stage3_weight_trajectory', config.stage3_weight_trajectory))
         config.stage3_weight_stage0_risk = float(normalized.get('stage3_weight_stage0_risk', config.stage3_weight_stage0_risk))
+        config.stage3_disable_traj_when_vo_unreliable = bool(
+            normalized.get(
+                'stage3_disable_traj_when_vo_unreliable',
+                config.stage3_disable_traj_when_vo_unreliable,
+            )
+        )
+        config.stage3_vo_valid_ratio_threshold = float(
+            np.clip(
+                normalized.get(
+                    'stage3_vo_valid_ratio_threshold',
+                    config.stage3_vo_valid_ratio_threshold,
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        config.flow_downscale = float(np.clip(normalized.get('flow_downscale', config.flow_downscale), 0.1, 1.0))
+        config.resume_enabled = bool(normalized.get('resume_enabled', config.resume_enabled))
+        config.keep_temp_on_success = bool(normalized.get('keep_temp_on_success', config.keep_temp_on_success))
         config.vo_enabled = bool(normalized.get('vo_enabled', config.vo_enabled))
         config.vo_center_roi_ratio = float(np.clip(normalized.get('vo_center_roi_ratio', config.vo_center_roi_ratio), 0.2, 1.0))
         config.vo_downscale_long_edge = int(max(256, normalized.get('vo_downscale_long_edge', config.vo_downscale_long_edge)))
@@ -553,6 +591,7 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'quality_norm_p_low': 'QUALITY_NORM_P_LOW',
     'quality_norm_p_high': 'QUALITY_NORM_P_HIGH',
     'quality_debug': 'QUALITY_DEBUG',
+    'quality_tenengrad_scale': 'QUALITY_TENENGRAD_SCALE',
     'min_keyframe_interval': 'MIN_KEYFRAME_INTERVAL',
     'max_keyframe_interval': 'MAX_KEYFRAME_INTERVAL',
     'softmax_beta': 'SOFTMAX_BETA',
@@ -625,6 +664,11 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'stage3_weight_base': 'STAGE3_WEIGHT_BASE',
     'stage3_weight_trajectory': 'STAGE3_WEIGHT_TRAJECTORY',
     'stage3_weight_stage0_risk': 'STAGE3_WEIGHT_STAGE0_RISK',
+    'stage3_disable_traj_when_vo_unreliable': 'STAGE3_DISABLE_TRAJ_WHEN_VO_UNRELIABLE',
+    'stage3_vo_valid_ratio_threshold': 'STAGE3_VO_VALID_RATIO_THRESHOLD',
+    'flow_downscale': 'FLOW_DOWNSCALE',
+    'resume_enabled': 'RESUME_ENABLED',
+    'keep_temp_on_success': 'KEEP_TEMP_ON_SUCCESS',
     'projection_mode': 'PROJECTION_MODE',
     'vo_enabled': 'VO_ENABLED',
     'vo_center_roi_ratio': 'VO_CENTER_ROI_RATIO',

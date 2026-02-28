@@ -12,6 +12,7 @@ from core.quality_evaluator import QualityEvaluator
 from core.quality_score import (
     apply_abs_guard,
     compose_quality,
+    compose_legacy_quality_proxy,
     compute_raw_metrics,
     compute_raw_metrics_batch,
     normalize_batch_p10_p90,
@@ -21,9 +22,14 @@ from core.accelerator import get_accelerator
 from core.video_loader import FramePrefetcher, create_video_capture
 
 
-def _raw_metrics_worker(payload: Tuple[np.ndarray, str, bool]) -> Dict[str, float]:
-    frame, roi_text, use_orb = payload
-    return compute_raw_metrics(frame, roi_spec=roi_text, use_orb=use_orb)
+def _raw_metrics_worker(payload: Tuple[np.ndarray, str, bool, float]) -> Dict[str, float]:
+    frame, roi_text, use_orb, tenengrad_scale = payload
+    return compute_raw_metrics(
+        frame,
+        roi_spec=roi_text,
+        use_orb=use_orb,
+        tenengrad_scale=tenengrad_scale,
+    )
 
 
 def _compute_raw_batch(
@@ -33,12 +39,13 @@ def _compute_raw_batch(
     use_orb: bool,
     process_workers: int,
     gpu_batch_enabled: bool,
+    tenengrad_scale: float,
 ) -> List[Dict[str, float]]:
     if not frames:
         return []
 
     if process_workers > 1:
-        payloads = [(f, roi_text, use_orb) for f in frames]
+        payloads = [(f, roi_text, use_orb, tenengrad_scale) for f in frames]
         with ProcessPoolExecutor(max_workers=process_workers) as ex:
             return list(ex.map(_raw_metrics_worker, payloads))
 
@@ -48,6 +55,7 @@ def _compute_raw_batch(
         use_orb=use_orb,
         orb=None,
         gpu_batch_enabled=gpu_batch_enabled,
+        tenengrad_scale=tenengrad_scale,
     )
 
 
@@ -122,6 +130,13 @@ def run_stage1_mono_scan(
             "quality_weight_keypoints": float(config.get("QUALITY_WEIGHT_KEYPOINTS", config.get("quality_weight_keypoints", 0.15))),
         }
         quality_fields = ("laplacian_var", "tenengrad", "exposure", "orb_keypoints")
+        quality_tenengrad_scale = float(
+            np.clip(
+                config.get("QUALITY_TENENGRAD_SCALE", config.get("quality_tenengrad_scale", 1.0)),
+                0.1,
+                1.0,
+            )
+        )
 
         stage1_metrics_batch_size = int(
             max(1, config.get("STAGE1_METRICS_BATCH_SIZE", config.get("stage1_metrics_batch_size", 64)))
@@ -195,6 +210,7 @@ def run_stage1_mono_scan(
                         use_orb=quality_use_orb,
                         process_workers=stage1_process_workers,
                         gpu_batch_enabled=stage1_gpu_batch_enabled,
+                        tenengrad_scale=quality_tenengrad_scale,
                     )
                     for (fidx, ts), raw in zip(pending_meta, raws):
                         raw_entries.append({"frame_idx": fidx, "timestamp": ts, "raw": raw})
@@ -202,11 +218,18 @@ def run_stage1_mono_scan(
                     pending_meta.clear()
             else:
                 quality_scores = evaluator.evaluate_stage1_fast(frame)
+                quality_proxy = compose_legacy_quality_proxy(
+                    quality_scores,
+                    laplacian_threshold=float(config.get("LAPLACIAN_THRESHOLD", config.get("laplacian_threshold", 100.0))),
+                    motion_blur_threshold=float(config.get("MOTION_BLUR_THRESHOLD", config.get("motion_blur_threshold", 0.3))),
+                    exposure_threshold=float(config.get("EXPOSURE_THRESHOLD", config.get("exposure_threshold", 0.35))),
+                )
                 passes = bool(
                     quality_scores["sharpness"] >= float(config.get("LAPLACIAN_THRESHOLD", config.get("laplacian_threshold", 100.0)))
                     and quality_scores["motion_blur"] <= float(config.get("MOTION_BLUR_THRESHOLD", config.get("motion_blur_threshold", 0.3)))
                     and quality_scores["exposure"] >= float(config.get("EXPOSURE_THRESHOLD", config.get("exposure_threshold", 0.35)))
                 )
+                quality_scores["quality"] = float(quality_proxy)
                 quality_scores["passes_threshold"] = passes
                 if passes:
                     candidates.append({"frame_idx": int(frame_idx), "quality_scores": dict(quality_scores)})
@@ -214,10 +237,12 @@ def run_stage1_mono_scan(
                     {
                         "frame_index": int(frame_idx),
                         "timestamp": timestamp,
-                        "quality": None,
+                        "quality": float(quality_proxy),
                         "is_pass": passes,
                         "drop_reason": "pass" if passes else "legacy_threshold",
                         "legacy_quality_scores": dict(quality_scores),
+                        "raw_metrics": {},
+                        "norm_metrics": {},
                     }
                 )
 
@@ -232,6 +257,7 @@ def run_stage1_mono_scan(
                     use_orb=quality_use_orb,
                     process_workers=stage1_process_workers,
                     gpu_batch_enabled=stage1_gpu_batch_enabled,
+                    tenengrad_scale=quality_tenengrad_scale,
                 )
                 for (fidx, ts), raw in zip(pending_meta, raws):
                     raw_entries.append({"frame_idx": fidx, "timestamp": ts, "raw": raw})

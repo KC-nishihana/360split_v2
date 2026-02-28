@@ -17,6 +17,7 @@ import argparse
 import json
 import csv
 import os
+import shutil
 import uuid
 from collections import Counter, deque
 from pathlib import Path
@@ -98,6 +99,30 @@ def parse_arguments():
         type=str,
         default=None,
         help="設定ファイルパス（JSON形式）"
+    )
+    parser.add_argument(
+        "--analysis-run-id",
+        type=str,
+        default=None,
+        help="解析実行ID（resumeや再現実行用）"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="既存 analysis-run-id の中間成果を再利用して再開する"
+    )
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        default=False,
+        help="正常終了時も stage temp artifacts を保持する"
+    )
+    parser.add_argument(
+        "--colmap-format",
+        action="store_true",
+        default=False,
+        help="COLMAP互換ディレクトリ（colmap/）を追加出力する"
     )
 
     parser.add_argument(
@@ -575,6 +600,14 @@ def resolve_cli_input(args) -> Tuple[str, bool, bool]:
 
 def apply_cli_overrides(config: dict, args) -> None:
     """CLI引数で設定を上書きする。"""
+    if args.analysis_run_id:
+        config["analysis_run_id"] = str(args.analysis_run_id).strip()
+    if args.resume:
+        config["resume_enabled"] = True
+    if args.keep_temp:
+        config["keep_temp_on_success"] = True
+    if args.colmap_format:
+        config["colmap_format"] = True
     if args.min_interval is not None:
         config["min_keyframe_interval"] = args.min_interval
     if args.ssim_threshold is not None:
@@ -778,6 +811,89 @@ def save_frame_image(frame, filepath: Path, fmt: str, jpeg_quality: int) -> bool
     if fmt == "jpg":
         return write_image(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
     return write_image(filepath, frame)
+
+
+def _extract_intrinsics(
+    calib_dict: Optional[Dict[str, Any]],
+    *,
+    fallback_width: int,
+    fallback_height: int,
+) -> Tuple[float, float, float, float]:
+    if calib_dict and isinstance(calib_dict, dict):
+        try:
+            k = np.asarray(calib_dict.get("camera_matrix", []), dtype=np.float64).reshape(3, 3)
+            fx = float(k[0, 0])
+            fy = float(k[1, 1])
+            cx = float(k[0, 2])
+            cy = float(k[1, 2])
+            if fx > 0.0 and fy > 0.0:
+                return fx, fy, cx, cy
+        except Exception:
+            pass
+    w = max(1, int(fallback_width))
+    h = max(1, int(fallback_height))
+    f = float(max(w, h) * 0.5)
+    return f, f, float(w * 0.5), float(h * 0.5)
+
+
+def _write_colmap_bundle(
+    output_dir: Path,
+    image_paths: List[Path],
+    *,
+    width: int,
+    height: int,
+    calibration_runtime: Dict[str, Any],
+) -> Optional[Path]:
+    if not image_paths:
+        return None
+
+    colmap_root = output_dir / "colmap"
+    colmap_images = colmap_root / "images"
+    colmap_root.mkdir(parents=True, exist_ok=True)
+    colmap_images.mkdir(parents=True, exist_ok=True)
+
+    camera_entries: Dict[int, Tuple[float, float, float, float]] = {}
+    image_rows: List[Tuple[str, int]] = []
+    mono_intr = _extract_intrinsics(calibration_runtime.get("mono"), fallback_width=width, fallback_height=height)
+    left_intr = _extract_intrinsics(calibration_runtime.get("front"), fallback_width=width, fallback_height=height)
+    right_intr = _extract_intrinsics(calibration_runtime.get("rear"), fallback_width=width, fallback_height=height)
+
+    for src_path in image_paths:
+        parent = src_path.parent.name
+        camera_id = 1
+        if parent in {"L", "F"}:
+            camera_id = 2
+        elif parent in {"R"}:
+            camera_id = 3
+        if camera_id == 1:
+            camera_entries[camera_id] = mono_intr
+        elif camera_id == 2:
+            camera_entries[camera_id] = left_intr
+        else:
+            camera_entries[camera_id] = right_intr
+
+        dst_name = f"{parent}__{src_path.name}" if parent in {"L", "R", "F"} else src_path.name
+        dst_path = colmap_images / dst_name
+        shutil.copy2(src_path, dst_path)
+        image_rows.append((dst_name, camera_id))
+
+    cameras_txt = colmap_root / "cameras.txt"
+    with cameras_txt.open("w", encoding="utf-8") as f:
+        f.write("# Camera list with one line of data per camera:\n")
+        f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        for camera_id in sorted(camera_entries.keys()):
+            fx, fy, cx, cy = camera_entries[camera_id]
+            f.write(
+                f"{camera_id} PINHOLE {int(width)} {int(height)} "
+                f"{fx:.6f} {fy:.6f} {cx:.6f} {cy:.6f}\n"
+            )
+
+    image_list_txt = colmap_root / "image_list.txt"
+    with image_list_txt.open("w", encoding="utf-8") as f:
+        for image_name, camera_id in image_rows:
+            f.write(f"{image_name} {camera_id}\n")
+
+    return colmap_root
 
 
 def serialize_rig_metadata(meta_obj):
@@ -1096,6 +1212,9 @@ def run_cli(args):
     config = load_config(args.config, args.preset)
     apply_cli_overrides(config, args)
     run_id = str(config.get("analysis_run_id", config.get("ANALYSIS_RUN_ID", "")) or "").strip()
+    if args.resume and not run_id:
+        logger.error("--resume を使う場合は --analysis-run-id を指定してください")
+        sys.exit(1)
     if not run_id:
         run_id = str(uuid.uuid4())
     config["analysis_run_id"] = run_id
@@ -1107,6 +1226,11 @@ def run_cli(args):
     logger.info("=" * 60)
     logger.info(f"入力動画: {video_path}")
     logger.info(f"出力先:   {output_dir}")
+    logger.info(f"analysis_run_id: {run_id}")
+    if bool(config.get("resume_enabled", False)):
+        logger.info("resume: 有効")
+    if bool(config.get("keep_temp_on_success", False)):
+        logger.info("keep_temp: 有効")
     logger.info(f"フォーマット: {config['output_image_format']}")
     if is_osv:
         logger.info("ステレオモード（OSV）: 有効（L/Rペア出力）")
@@ -1258,11 +1382,12 @@ def run_cli(args):
             points_world=payload.get("points_world"),
         )
 
+    stage_store = StageTempStore(run_id=run_id)
     keyframes = selector.select_keyframes(
         loader,
         progress_callback=progress_callback,
         frame_log_callback=frame_log_callback,
-        stage_temp_store=StageTempStore(run_id=run_id),
+        stage_temp_store=stage_store,
     )
 
     if not keyframes:
@@ -1364,6 +1489,7 @@ def run_cli(args):
             ext = f".{mask_output_format.lstrip('.')}"
         return masks_root / f"{stem}{ext}"
 
+    exported_image_paths: List[Path] = []
     for i, kf in enumerate(keyframes):
         # ステレオ判定
         if is_stereo_mode:
@@ -1396,6 +1522,7 @@ def run_cli(args):
                 if not saved:
                     logger.warning(f"保存失敗（フレーム {kf.frame_index}{suffix}）: {filepath}")
                     continue
+                exported_image_paths.append(filepath)
 
                 fisheye_binary_mask = None
                 if fisheye_mask_export_enabled and target_mask_generator is not None:
@@ -1473,6 +1600,7 @@ def run_cli(args):
             if not saved:
                 logger.warning(f"保存失敗（フレーム {kf.frame_index}）: {filepath}")
                 continue
+            exported_image_paths.append(filepath)
 
             # Cubemap出力
             if args.cubemap and equirect_processor:
@@ -1491,6 +1619,21 @@ def run_cli(args):
         suffix_str = " (F/R)" if is_front_rear else (" (L/R)" if is_osv else "")
         logger.info(f"  [{i+1}/{len(keyframes)}] Frame {kf.frame_index:6d}{suffix_str} | "
                     f"Time {kf.timestamp:7.2f}s | Score {kf.combined_score:.3f}")
+
+    colmap_dir = None
+    if bool(config.get("colmap_format", False)):
+        try:
+            colmap_dir = _write_colmap_bundle(
+                output_dir=output_dir,
+                image_paths=exported_image_paths,
+                width=int(meta.width),
+                height=int(meta.height),
+                calibration_runtime=dict(calibration_runtime or {}),
+            )
+            if colmap_dir is not None:
+                logger.info(f"COLMAP互換出力: {colmap_dir}")
+        except Exception as e:
+            logger.warning(f"COLMAP互換出力に失敗しました: {e}")
 
     quality_records = list(getattr(selector, "stage1_quality_records", []) or [])
     quality_summary = summarize_quality_records(quality_records) if quality_records else {
@@ -1524,6 +1667,7 @@ def run_cli(args):
             "roi_ratio": float(config.get("quality_roi_ratio", 0.40)),
             "abs_laplacian_min": float(config.get("quality_abs_laplacian_min", 35.0)),
             "use_orb": bool(config.get("quality_use_orb", True)),
+            "tenengrad_scale": float(config.get("quality_tenengrad_scale", 1.0)),
             "weights": {
                 "sharpness": float(config.get("quality_weight_sharpness", 0.40)),
                 "tenengrad": float(config.get("quality_weight_tenengrad", 0.30)),
@@ -1535,6 +1679,20 @@ def run_cli(args):
                 "p_high": float(config.get("quality_norm_p_high", 90.0)),
             },
             "debug": bool(config.get("quality_debug", False)),
+        },
+        "pipeline_runtime": {
+            "analysis_run_id": run_id,
+            "resume_enabled": bool(config.get("resume_enabled", False)),
+            "keep_temp_on_success": bool(config.get("keep_temp_on_success", False)),
+            "flow_downscale": float(config.get("flow_downscale", 1.0)),
+            "stage3_disable_traj_when_vo_unreliable": bool(
+                config.get("stage3_disable_traj_when_vo_unreliable", True)
+            ),
+            "stage3_vo_valid_ratio_threshold": float(config.get("stage3_vo_valid_ratio_threshold", 0.50)),
+        },
+        "colmap": {
+            "enabled": bool(config.get("colmap_format", False)),
+            "output_dir": str(colmap_dir) if colmap_dir is not None else None,
         },
         "quality_summary": round_json_friendly(quality_summary),
         "settings": config,

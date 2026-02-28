@@ -146,7 +146,7 @@ def test_select_keyframes_reuses_stage1_temp(monkeypatch, tmp_path):
         order.append("3")
         return list(stage2_candidates)
 
-    selector = KeyframeSelector()
+    selector = KeyframeSelector(config={"resume_enabled": True})
     monkeypatch.setattr(selector, "_stage1_fast_filter", should_not_run_stage1)
     monkeypatch.setattr(selector, "_stage0_lightweight_motion_scan", fake_stage0.__get__(selector, KeyframeSelector))
     monkeypatch.setattr(selector, "_stage2_precise_evaluation", fake_stage2.__get__(selector, KeyframeSelector))
@@ -162,6 +162,41 @@ def test_select_keyframes_reuses_stage1_temp(monkeypatch, tmp_path):
     out = selector.select_keyframes(_DummyLoader(), stage_temp_store=store)
     assert len(out) == 1
     assert order == ["0", "2", "3"]
+
+
+def test_select_keyframes_reuses_stage0_temp_when_resume(monkeypatch, tmp_path):
+    flags = {"stage0_called": False}
+
+    def fake_stage1(self, _video_loader, _metadata, _progress_cb):
+        self.stage1_quality_records = [{"frame_index": 2, "timestamp": 0.0, "quality": 0.8, "is_pass": True, "drop_reason": "pass"}]
+        return [{"frame_idx": 2, "quality_scores": {"quality": 0.8}}]
+
+    def should_not_run_stage0(*_args, **_kwargs):
+        flags["stage0_called"] = True
+        raise AssertionError("Stage0 should not run when temp artifact exists with resume")
+
+    def fake_stage2(self, _video_loader, _metadata, stage1_candidates, _progress_cb, _frame_log_cb=None, _stage0_metrics=None):
+        idx = int(stage1_candidates[0]["frame_idx"])
+        return [KeyframeInfo(frame_index=idx, timestamp=0.1, combined_score=0.6)], [
+            Stage2FrameRecord(frame_index=idx, frame=None, quality_scores={}, geometric_scores={}, adaptive_scores={}, metrics={"combined_stage2": 0.6, "combined_stage3": 0.6})
+        ]
+
+    def fake_stage3(self, metadata, stage2_candidates, stage2_final, stage2_records, stage0_metrics, video_loader):
+        return list(stage2_candidates)
+
+    selector = KeyframeSelector(config={"resume_enabled": True})
+    monkeypatch.setattr(selector, "_stage1_fast_filter", fake_stage1.__get__(selector, KeyframeSelector))
+    monkeypatch.setattr(selector, "_stage0_lightweight_motion_scan", should_not_run_stage0)
+    monkeypatch.setattr(selector, "_stage2_precise_evaluation", fake_stage2.__get__(selector, KeyframeSelector))
+    monkeypatch.setattr(selector, "_stage3_refine_with_trajectory", fake_stage3.__get__(selector, KeyframeSelector))
+
+    store = StageTempStore("run-reuse-stage0", root_dir=tmp_path)
+    store.save_stage0({2: {"motion_risk": 0.1, "vo_status_reason": "ok"}})
+    monkeypatch.setattr(store, "cleanup_on_success", lambda: None)
+
+    out = selector.select_keyframes(_DummyLoader(), stage_temp_store=store)
+    assert len(out) == 1
+    assert flags["stage0_called"] is False
 
 
 def test_select_keyframes_stage1_empty_exits_before_stage0(monkeypatch, tmp_path):

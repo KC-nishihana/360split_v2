@@ -4,6 +4,7 @@ import math
 from core.quality_score import (
     apply_abs_guard,
     compose_quality,
+    compose_legacy_quality_proxy,
     compute_raw_metrics,
     compute_raw_metrics_batch,
     normalize_batch_p10_p90,
@@ -72,3 +73,23 @@ def test_pair_quality_uses_min():
     q_a = compose_quality(lens_a, {})
     q_b = compose_quality(lens_b, {})
     assert min(q_a, q_b) == pytest.approx(q_b, abs=1e-9)
+
+
+def test_tenengrad_downscale_keeps_reasonable_range(checkerboard_bgr):
+    full = compute_raw_metrics(checkerboard_bgr, roi_spec="circle:0.4", use_orb=False, tenengrad_scale=1.0)
+    down = compute_raw_metrics(checkerboard_bgr, roi_spec="circle:0.4", use_orb=False, tenengrad_scale=0.5)
+    assert down["tenengrad"] >= 0.0
+    assert full["tenengrad"] >= 0.0
+    if full["tenengrad"] > 1e-6:
+        ratio = down["tenengrad"] / full["tenengrad"]
+        assert 0.2 <= ratio <= 5.0
+
+
+def test_compose_legacy_quality_proxy_range():
+    score = compose_legacy_quality_proxy(
+        {"sharpness": 120.0, "motion_blur": 0.2, "exposure": 0.4},
+        laplacian_threshold=100.0,
+        motion_blur_threshold=0.3,
+        exposure_threshold=0.35,
+    )
+    assert 0.0 <= score <= 1.0

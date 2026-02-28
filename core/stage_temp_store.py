@@ -46,6 +46,10 @@ class StageTempStore:
                 "error": None,
                 "cleanup_target": str(self.run_dir),
                 "cleanup_status": "pending",
+                "resume_enabled": False,
+                "resumed": False,
+                "resume_count": 0,
+                "last_resume_at": None,
             }
             self._write_manifest()
         else:
@@ -109,6 +113,19 @@ class StageTempStore:
 
     def has_stage1(self) -> bool:
         return (self.run_dir / self.STAGE1_CANDIDATES_FILE).exists() and (self.run_dir / self.STAGE1_RECORDS_FILE).exists()
+
+    def has_stage0(self) -> bool:
+        return (self.run_dir / self.STAGE0_METRICS_FILE).exists()
+
+    def has_stage2(self) -> bool:
+        return (self.run_dir / self.STAGE2_CANDIDATES_FILE).exists() and (self.run_dir / self.STAGE2_RECORDS_FILE).exists()
+
+    def has_stage3(self) -> bool:
+        return (self.run_dir / self.STAGE3_KEYFRAMES_FILE).exists()
+
+    def is_stage_done(self, stage: str) -> bool:
+        done = list(self._manifest.get("completed_stages", []))
+        return str(stage) in done
 
     def save_stage1(self, candidates: List[Dict[str, Any]], records: List[Dict[str, Any]]) -> Dict[str, str]:
         p1 = self._write_jsonl(self.STAGE1_CANDIDATES_FILE, candidates)
@@ -183,6 +200,16 @@ class StageTempStore:
         self._manifest["failed_stage"] = str(stage)
         self._manifest["error"] = str(error)
         self._manifest["cleanup_status"] = "retained_on_error"
+        self._write_manifest()
+
+    def record_resume_state(self, *, enabled: bool) -> None:
+        self._manifest["resume_enabled"] = bool(enabled)
+        if bool(enabled) and (
+            self.has_stage1() or self.has_stage0() or self.has_stage2() or self.has_stage3()
+        ):
+            self._manifest["resumed"] = True
+            self._manifest["resume_count"] = int(self._manifest.get("resume_count", 0)) + 1
+            self._manifest["last_resume_at"] = self._now_iso()
         self._write_manifest()
 
     def cleanup_on_success(self) -> None:

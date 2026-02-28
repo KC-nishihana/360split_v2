@@ -33,7 +33,13 @@ class AdaptiveSelector:
     - GPU バッチSSIM対応
     """
 
-    def __init__(self, window_size: int = 11, sigma: float = 1.5, ssim_scale: float = 0.5):
+    def __init__(
+        self,
+        window_size: int = 11,
+        sigma: float = 1.5,
+        ssim_scale: float = 0.5,
+        flow_downscale: float = 1.0,
+    ):
         """
         初期化
 
@@ -49,6 +55,7 @@ class AdaptiveSelector:
         self.window_size = window_size
         self.sigma = sigma
         self.ssim_scale = ssim_scale
+        self.flow_downscale = float(np.clip(flow_downscale, 0.1, 1.0))
         self.accelerator = get_accelerator()
 
         # ガウシアンカーネルを一度だけ生成してキャッシュ
@@ -190,12 +197,21 @@ class AdaptiveSelector:
         if gray1.shape != gray2.shape:
             return 0.0
 
+        flow_scale = float(np.clip(self.flow_downscale, 0.1, 1.0))
+        if flow_scale < 0.999:
+            h, w = gray1.shape[:2]
+            nw = max(1, int(round(w * flow_scale)))
+            nh = max(1, int(round(h * flow_scale)))
+            gray1 = cv2.resize(gray1, (nw, nh), interpolation=cv2.INTER_AREA)
+            gray2 = cv2.resize(gray2, (nw, nh), interpolation=cv2.INTER_AREA)
+
         try:
             if method == 'lucas_kanade':
                 # GPU最適化パスを優先
                 if self.accelerator.has_gpu:
                     try:
-                        return self.accelerator.compute_optical_flow_sparse(gray1, gray2)
+                        mean_mag = float(self.accelerator.compute_optical_flow_sparse(gray1, gray2))
+                        return float(mean_mag / flow_scale)
                     except Exception:
                         pass
 
@@ -232,6 +248,8 @@ class AdaptiveSelector:
                 magnitudes = magnitude.flatten()
 
             mean_magnitude = float(np.mean(magnitudes))
+            if flow_scale > 1e-12:
+                mean_magnitude = float(mean_magnitude / flow_scale)
 
         except Exception as e:
             logger.warning(f"光学フロー計算エラー: {e}")

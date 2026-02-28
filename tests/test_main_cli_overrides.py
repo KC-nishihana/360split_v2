@@ -11,6 +11,10 @@ class _Args(SimpleNamespace):
 def test_apply_cli_overrides_performance_knobs():
     config = {}
     args = _Args(
+        analysis_run_id="run-123",
+        resume=True,
+        keep_temp=True,
+        colmap_format=True,
         opencv_threads=8,
         stage1_process_workers=6,
         stage1_prefetch_size=48,
@@ -22,6 +26,10 @@ def test_apply_cli_overrides_performance_knobs():
 
     apply_cli_overrides(config, args)
 
+    assert config["analysis_run_id"] == "run-123"
+    assert config["resume_enabled"] is True
+    assert config["keep_temp_on_success"] is True
+    assert config["colmap_format"] is True
     assert config["opencv_thread_count"] == 8
     assert config["stage1_process_workers"] == 6
     assert config["stage1_prefetch_size"] == 48

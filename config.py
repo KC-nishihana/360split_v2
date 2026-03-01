@@ -89,6 +89,12 @@ class SelectionConfig:
     quality_norm_p_high: float = 90.0
     quality_debug: bool = False
     quality_tenengrad_scale: float = 1.0
+    stage1_lr_merge_mode: str = "asymmetric_sky_v1"
+    stage1_lr_asym_weak_floor: float = 0.35
+    stage1_lr_sky_ratio_threshold: float = 0.55
+    stage1_lr_sky_ratio_diff_threshold: float = 0.20
+    stage1_lr_quality_gap_threshold: float = 0.15
+    stage1_lr_semantic_sky_enabled: bool = True
     ssim_change_threshold: float = 0.85  # SSIM変化検知閾値
     softmax_beta: float = 5.0           # Softmax温度パラメータ
     nms_time_window: float = 1.0        # NMS時間ウィンドウ（秒）
@@ -197,7 +203,9 @@ class KeyframeConfig:
     colmap_path: str = "colmap"
     colmap_workspace: str = ""
     colmap_db_path: str = ""
+    colmap_pipeline_mode: str = ""
     colmap_keyframe_policy: str = ""
+    colmap_selection_profile: str = ""
     colmap_keyframe_target_mode: str = "auto"
     colmap_keyframe_target_min: int = 120
     colmap_keyframe_target_max: int = 240
@@ -208,6 +216,14 @@ class KeyframeConfig:
     colmap_stage1_adaptive_threshold: bool = True
     colmap_stage1_min_candidates_per_bin: int = 3
     colmap_stage1_max_candidates: int = 360
+    colmap_stage2_entry_budget: int = 180
+    colmap_stage2_entry_min_gap: int = 3
+    colmap_diversity_ssim_threshold: float = 0.93
+    colmap_diversity_phash_hamming: int = 10
+    colmap_final_target_policy: str = "soft_auto"
+    colmap_final_soft_min: int = 80
+    colmap_final_soft_max: int = 220
+    colmap_no_supplement_on_low_quality: bool = True
     colmap_rig_policy: str = "lr_opk"
     colmap_rig_seed_opk_deg: Tuple[float, float, float] = (0.0, 0.0, 180.0)
     colmap_workspace_scope: str = "run_scoped"
@@ -266,6 +282,12 @@ class KeyframeConfig:
             'QUALITY_NORM_P_HIGH': self.selection.quality_norm_p_high,
             'QUALITY_DEBUG': self.selection.quality_debug,
             'QUALITY_TENENGRAD_SCALE': self.selection.quality_tenengrad_scale,
+            'STAGE1_LR_MERGE_MODE': self.selection.stage1_lr_merge_mode,
+            'STAGE1_LR_ASYM_WEAK_FLOOR': self.selection.stage1_lr_asym_weak_floor,
+            'STAGE1_LR_SKY_RATIO_THRESHOLD': self.selection.stage1_lr_sky_ratio_threshold,
+            'STAGE1_LR_SKY_RATIO_DIFF_THRESHOLD': self.selection.stage1_lr_sky_ratio_diff_threshold,
+            'STAGE1_LR_QUALITY_GAP_THRESHOLD': self.selection.stage1_lr_quality_gap_threshold,
+            'STAGE1_LR_SEMANTIC_SKY_ENABLED': self.selection.stage1_lr_semantic_sky_enabled,
             'MIN_FEATURE_MATCHES': self.gric.min_matches,
             'STATIONARY_ENABLE': self.selection.stationary_enable,
             'STATIONARY_MIN_DURATION_SEC': self.selection.stationary_min_duration_sec,
@@ -351,7 +373,9 @@ class KeyframeConfig:
             'COLMAP_PATH': self.colmap_path,
             'COLMAP_WORKSPACE': self.colmap_workspace,
             'COLMAP_DB_PATH': self.colmap_db_path,
+            'COLMAP_PIPELINE_MODE': self.colmap_pipeline_mode,
             'COLMAP_KEYFRAME_POLICY': self.colmap_keyframe_policy,
+            'COLMAP_SELECTION_PROFILE': self.colmap_selection_profile,
             'COLMAP_KEYFRAME_TARGET_MODE': self.colmap_keyframe_target_mode,
             'COLMAP_KEYFRAME_TARGET_MIN': self.colmap_keyframe_target_min,
             'COLMAP_KEYFRAME_TARGET_MAX': self.colmap_keyframe_target_max,
@@ -362,6 +386,14 @@ class KeyframeConfig:
             'COLMAP_STAGE1_ADAPTIVE_THRESHOLD': self.colmap_stage1_adaptive_threshold,
             'COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN': self.colmap_stage1_min_candidates_per_bin,
             'COLMAP_STAGE1_MAX_CANDIDATES': self.colmap_stage1_max_candidates,
+            'COLMAP_STAGE2_ENTRY_BUDGET': self.colmap_stage2_entry_budget,
+            'COLMAP_STAGE2_ENTRY_MIN_GAP': self.colmap_stage2_entry_min_gap,
+            'COLMAP_DIVERSITY_SSIM_THRESHOLD': self.colmap_diversity_ssim_threshold,
+            'COLMAP_DIVERSITY_PHASH_HAMMING': self.colmap_diversity_phash_hamming,
+            'COLMAP_FINAL_TARGET_POLICY': self.colmap_final_target_policy,
+            'COLMAP_FINAL_SOFT_MIN': self.colmap_final_soft_min,
+            'COLMAP_FINAL_SOFT_MAX': self.colmap_final_soft_max,
+            'COLMAP_NO_SUPPLEMENT_ON_LOW_QUALITY': self.colmap_no_supplement_on_low_quality,
             'COLMAP_RIG_POLICY': self.colmap_rig_policy,
             'COLMAP_RIG_SEED_OPK_DEG': list(self.colmap_rig_seed_opk_deg),
             'COLMAP_WORKSPACE_SCOPE': self.colmap_workspace_scope,
@@ -444,6 +476,45 @@ class KeyframeConfig:
                 0.1,
                 1.0,
             )
+        )
+        config.selection.stage1_lr_merge_mode = str(
+            normalized.get('stage1_lr_merge_mode', config.selection.stage1_lr_merge_mode) or "asymmetric_sky_v1"
+        ).strip().lower()
+        if config.selection.stage1_lr_merge_mode not in {"asymmetric_sky_v1", "strict_min"}:
+            config.selection.stage1_lr_merge_mode = "asymmetric_sky_v1"
+        config.selection.stage1_lr_asym_weak_floor = float(
+            np.clip(
+                normalized.get('stage1_lr_asym_weak_floor', config.selection.stage1_lr_asym_weak_floor),
+                0.0,
+                1.0,
+            )
+        )
+        config.selection.stage1_lr_sky_ratio_threshold = float(
+            np.clip(
+                normalized.get('stage1_lr_sky_ratio_threshold', config.selection.stage1_lr_sky_ratio_threshold),
+                0.0,
+                1.0,
+            )
+        )
+        config.selection.stage1_lr_sky_ratio_diff_threshold = float(
+            np.clip(
+                normalized.get(
+                    'stage1_lr_sky_ratio_diff_threshold',
+                    config.selection.stage1_lr_sky_ratio_diff_threshold,
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        config.selection.stage1_lr_quality_gap_threshold = float(
+            np.clip(
+                normalized.get('stage1_lr_quality_gap_threshold', config.selection.stage1_lr_quality_gap_threshold),
+                0.0,
+                1.0,
+            )
+        )
+        config.selection.stage1_lr_semantic_sky_enabled = bool(
+            normalized.get('stage1_lr_semantic_sky_enabled', config.selection.stage1_lr_semantic_sky_enabled)
         )
         config.selection.stationary_enable = bool(normalized.get('stationary_enable', config.selection.stationary_enable))
         config.selection.stationary_min_duration_sec = float(normalized.get(
@@ -621,11 +692,21 @@ class KeyframeConfig:
         config.colmap_path = str(normalized.get('colmap_path', config.colmap_path) or "colmap").strip() or "colmap"
         config.colmap_workspace = str(normalized.get('colmap_workspace', config.colmap_workspace) or "").strip()
         config.colmap_db_path = str(normalized.get('colmap_db_path', config.colmap_db_path) or "").strip()
+        config.colmap_pipeline_mode = str(
+            normalized.get('colmap_pipeline_mode', config.colmap_pipeline_mode) or ""
+        ).strip().lower()
+        if config.colmap_pipeline_mode not in {"", "legacy", "minimal_v1"}:
+            config.colmap_pipeline_mode = ""
         config.colmap_keyframe_policy = str(
             normalized.get('colmap_keyframe_policy', config.colmap_keyframe_policy) or ""
         ).strip().lower()
         if config.colmap_keyframe_policy not in {"", "legacy", "stage2_relaxed", "stage1_only"}:
             config.colmap_keyframe_policy = ""
+        config.colmap_selection_profile = str(
+            normalized.get('colmap_selection_profile', config.colmap_selection_profile) or ""
+        ).strip().lower()
+        if config.colmap_selection_profile not in {"", "legacy", "no_vo_coverage"}:
+            config.colmap_selection_profile = ""
         config.colmap_keyframe_target_mode = str(
             normalized.get('colmap_keyframe_target_mode', config.colmap_keyframe_target_mode) or "auto"
         ).strip().lower()
@@ -660,6 +741,36 @@ class KeyframeConfig:
         )
         config.colmap_stage1_max_candidates = int(
             max(1, normalized.get('colmap_stage1_max_candidates', config.colmap_stage1_max_candidates))
+        )
+        config.colmap_stage2_entry_budget = int(
+            max(1, normalized.get('colmap_stage2_entry_budget', config.colmap_stage2_entry_budget))
+        )
+        config.colmap_stage2_entry_min_gap = int(
+            max(0, normalized.get('colmap_stage2_entry_min_gap', config.colmap_stage2_entry_min_gap))
+        )
+        config.colmap_diversity_ssim_threshold = float(
+            np.clip(
+                normalized.get('colmap_diversity_ssim_threshold', config.colmap_diversity_ssim_threshold),
+                0.0,
+                1.0,
+            )
+        )
+        config.colmap_diversity_phash_hamming = int(
+            max(0, normalized.get('colmap_diversity_phash_hamming', config.colmap_diversity_phash_hamming))
+        )
+        config.colmap_final_target_policy = str(
+            normalized.get('colmap_final_target_policy', config.colmap_final_target_policy) or "soft_auto"
+        ).strip().lower()
+        if config.colmap_final_target_policy not in {"soft_auto", "fixed"}:
+            config.colmap_final_target_policy = "soft_auto"
+        config.colmap_final_soft_min = int(
+            max(1, normalized.get('colmap_final_soft_min', config.colmap_final_soft_min))
+        )
+        config.colmap_final_soft_max = int(
+            max(config.colmap_final_soft_min, normalized.get('colmap_final_soft_max', config.colmap_final_soft_max))
+        )
+        config.colmap_no_supplement_on_low_quality = bool(
+            normalized.get('colmap_no_supplement_on_low_quality', config.colmap_no_supplement_on_low_quality)
         )
         config.colmap_rig_policy = str(
             normalized.get('colmap_rig_policy', config.colmap_rig_policy) or "lr_opk"
@@ -745,6 +856,12 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'quality_norm_p_high': 'QUALITY_NORM_P_HIGH',
     'quality_debug': 'QUALITY_DEBUG',
     'quality_tenengrad_scale': 'QUALITY_TENENGRAD_SCALE',
+    'stage1_lr_merge_mode': 'STAGE1_LR_MERGE_MODE',
+    'stage1_lr_asym_weak_floor': 'STAGE1_LR_ASYM_WEAK_FLOOR',
+    'stage1_lr_sky_ratio_threshold': 'STAGE1_LR_SKY_RATIO_THRESHOLD',
+    'stage1_lr_sky_ratio_diff_threshold': 'STAGE1_LR_SKY_RATIO_DIFF_THRESHOLD',
+    'stage1_lr_quality_gap_threshold': 'STAGE1_LR_QUALITY_GAP_THRESHOLD',
+    'stage1_lr_semantic_sky_enabled': 'STAGE1_LR_SEMANTIC_SKY_ENABLED',
     'min_keyframe_interval': 'MIN_KEYFRAME_INTERVAL',
     'max_keyframe_interval': 'MAX_KEYFRAME_INTERVAL',
     'softmax_beta': 'SOFTMAX_BETA',
@@ -854,7 +971,9 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'colmap_path': 'COLMAP_PATH',
     'colmap_workspace': 'COLMAP_WORKSPACE',
     'colmap_db_path': 'COLMAP_DB_PATH',
+    'colmap_pipeline_mode': 'COLMAP_PIPELINE_MODE',
     'colmap_keyframe_policy': 'COLMAP_KEYFRAME_POLICY',
+    'colmap_selection_profile': 'COLMAP_SELECTION_PROFILE',
     'colmap_keyframe_target_mode': 'COLMAP_KEYFRAME_TARGET_MODE',
     'colmap_keyframe_target_min': 'COLMAP_KEYFRAME_TARGET_MIN',
     'colmap_keyframe_target_max': 'COLMAP_KEYFRAME_TARGET_MAX',
@@ -865,6 +984,14 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'colmap_stage1_adaptive_threshold': 'COLMAP_STAGE1_ADAPTIVE_THRESHOLD',
     'colmap_stage1_min_candidates_per_bin': 'COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN',
     'colmap_stage1_max_candidates': 'COLMAP_STAGE1_MAX_CANDIDATES',
+    'colmap_stage2_entry_budget': 'COLMAP_STAGE2_ENTRY_BUDGET',
+    'colmap_stage2_entry_min_gap': 'COLMAP_STAGE2_ENTRY_MIN_GAP',
+    'colmap_diversity_ssim_threshold': 'COLMAP_DIVERSITY_SSIM_THRESHOLD',
+    'colmap_diversity_phash_hamming': 'COLMAP_DIVERSITY_PHASH_HAMMING',
+    'colmap_final_target_policy': 'COLMAP_FINAL_TARGET_POLICY',
+    'colmap_final_soft_min': 'COLMAP_FINAL_SOFT_MIN',
+    'colmap_final_soft_max': 'COLMAP_FINAL_SOFT_MAX',
+    'colmap_no_supplement_on_low_quality': 'COLMAP_NO_SUPPLEMENT_ON_LOW_QUALITY',
     'colmap_rig_policy': 'COLMAP_RIG_POLICY',
     'colmap_rig_seed_opk_deg': 'COLMAP_RIG_SEED_OPK_DEG',
     'colmap_workspace_scope': 'COLMAP_WORKSPACE_SCOPE',

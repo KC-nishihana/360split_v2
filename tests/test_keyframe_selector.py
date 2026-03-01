@@ -123,7 +123,9 @@ def test_colmap_stage2_relaxed_enables_stage0_and_disables_stage3(monkeypatch, t
     selector = KeyframeSelector(
         config={
             "pose_backend": "colmap",
+            "colmap_pipeline_mode": "legacy",
             "colmap_keyframe_policy": "stage2_relaxed",
+            "colmap_selection_profile": "legacy",
             "colmap_keyframe_target_min": 1,
             "colmap_keyframe_target_max": 5,
         }
@@ -211,6 +213,95 @@ def test_colmap_retarget_auto_mode_stays_within_bounds():
     assert info["effective_target_min"] >= 120
     assert info["effective_target_max"] <= 240
     assert info["effective_target_min"] <= len(out) <= info["effective_target_max"]
+
+
+def test_stage15_budget_reduces_dense_cluster():
+    selector = KeyframeSelector()
+    stage1 = []
+    for i in range(100, 220):
+        stage1.append({"frame_idx": i, "quality_scores": {"quality": 0.8}})
+    for i in range(0, 100, 10):
+        stage1.append({"frame_idx": i, "quality_scores": {"quality": 0.7}})
+    stage1 = sorted(stage1, key=lambda x: x["frame_idx"])
+
+    class _Loader:
+        is_paired = False
+
+        @staticmethod
+        def get_frame(idx):
+            import numpy as np
+            v = int(idx % 255)
+            return np.full((64, 64, 3), v, dtype=np.uint8)
+
+    out, info, _trace = selector._run_stage15_entry_budget(
+        stage1,
+        total_frames=240,
+        video_loader=_Loader(),
+        entry_budget=60,
+        min_gap=3,
+        diversity_ssim_threshold=0.95,
+        diversity_phash_hamming=8,
+    )
+    assert len(out) <= 60
+    assert int(info["entry_count"]) == len(out)
+    assert int(info["coverage_bins_after"]) > 0
+
+
+def test_stage15_preserves_time_bin_coverage():
+    selector = KeyframeSelector()
+    stage1 = [{"frame_idx": i, "quality_scores": {"quality": 0.6}} for i in range(0, 240, 4)]
+
+    class _Loader:
+        is_paired = False
+
+        @staticmethod
+        def get_frame(_idx):
+            import numpy as np
+            return np.zeros((64, 64, 3), dtype=np.uint8)
+
+    out, info, _trace = selector._run_stage15_entry_budget(
+        stage1,
+        total_frames=240,
+        video_loader=_Loader(),
+        entry_budget=48,
+        min_gap=0,
+        diversity_ssim_threshold=1.0,
+        diversity_phash_hamming=0,
+    )
+    assert len(out) <= 48
+    assert int(info["coverage_bins_after"]) >= 20
+
+
+def test_final_soft_auto_no_forced_supplement():
+    selector = KeyframeSelector(config={"quality_threshold": 0.9})
+    base = [
+        KeyframeInfo(frame_index=i * 20, timestamp=(i * 20) / 30.0, combined_score=0.7)
+        for i in range(3)
+    ]
+    stage1_candidates = [{"frame_idx": i * 10, "quality_scores": {"quality": 0.2}} for i in range(30)]
+    out, info = selector._retarget_keyframes_for_colmap(
+        base,
+        stage1_candidates,
+        total_frames=300,
+        fps=30.0,
+        target_mode="fixed",
+        target_min=120,
+        target_max=240,
+        final_target_policy="soft_auto",
+        final_soft_min=10,
+        final_soft_max=50,
+        no_supplement_on_low_quality=True,
+    )
+    assert len(out) == len(base)
+    assert info["final_reject_reason"] == "under_target_quality_guard"
+
+
+def test_no_vo_profile_ignores_vo_metrics():
+    selector = KeyframeSelector(config={"pose_backend": "colmap", "colmap_selection_profile": "no_vo_coverage"})
+    runtime = selector._resolve_colmap_keyframe_runtime()
+    assert runtime["selection_profile"] == "no_vo_coverage"
+    assert runtime["colmap_motion_aware_selection"] is False
+    assert runtime["force_stage0_off"] is True
 
 
 def test_build_cumulative_motion_map_interpolation():
@@ -330,3 +421,162 @@ def test_stage2_drop_reason_annotation_min_interval():
     reasons = [r.drop_reason for r in records]
     assert "selected" in reasons
     assert "min_interval" in reasons
+
+
+def test_colmap_minimal_runtime_defaults():
+    selector = KeyframeSelector(config={"pose_backend": "colmap"})
+    runtime = selector._resolve_colmap_keyframe_runtime()
+    assert runtime["pipeline_mode"] == "minimal_v1"
+    assert runtime["minimal_mode"] is True
+    assert runtime["force_stage0_off"] is True
+    assert runtime["force_stage3_off"] is True
+    assert runtime["colmap_shortcut"] is False
+    assert runtime["effective_stage_plan"] == "Stage1->Stage2(minimal_v1)"
+
+
+def test_stage2_minimal_selects_all_read_success():
+    import numpy as np
+
+    class _Cap:
+        def __init__(self, frames):
+            self.frames = frames
+            self.pos = 0
+
+        def set(self, _prop, value):
+            self.pos = int(value)
+
+        def read(self):
+            if 0 <= self.pos < len(self.frames):
+                out = self.frames[self.pos]
+                self.pos += 1
+                return True, out.copy()
+            return False, None
+
+        def release(self):
+            return None
+
+    class _Loader:
+        is_paired = False
+        is_stereo = False
+        rig_type = "monocular"
+        _video_path = "dummy.mp4"
+
+    selector = KeyframeSelector(config={"MIN_KEYFRAME_INTERVAL": 99, "ENABLE_DYNAMIC_MASK_REMOVAL": True})
+    frames = [np.zeros((32, 32, 3), dtype=np.uint8), np.full((32, 32, 3), 16, dtype=np.uint8)]
+    selector._open_independent_capture = lambda _path: _Cap(frames)
+    metadata = SimpleNamespace(frame_count=6, fps=30.0, rig_calibration=None)
+    stage1_candidates = [
+        {"frame_idx": 0, "quality_scores": {"quality": 0.8, "sharpness": 100.0, "exposure": 0.8}},
+        {"frame_idx": 1, "quality_scores": {"quality": 0.8, "sharpness": 100.0, "exposure": 0.8}},
+        {"frame_idx": 5, "quality_scores": {"quality": 0.8, "sharpness": 100.0, "exposure": 0.8}},
+    ]
+    out, records = selector._stage2_minimal_motion_only_evaluation(
+        _Loader(),
+        metadata,
+        stage1_candidates,
+        progress_callback=None,
+    )
+    assert [k.frame_index for k in out] == [0, 1]
+    assert any(r.drop_reason == "read_fail" for r in records)
+    assert all(r.drop_reason in {"selected", "read_fail"} for r in records)
+    assert "optical_flow" in out[1].adaptive_scores
+
+
+def _run_paired_stage1_with_mocked_scores(monkeypatch, scores, sky_ratios, config_extra=None):
+    import numpy as np
+    import core.keyframe_selector as ks_mod
+
+    class _Loader:
+        is_paired = True
+
+        @staticmethod
+        def get_frame_pair(_idx):
+            return (
+                np.full((32, 32, 3), 80, dtype=np.uint8),
+                np.full((32, 32, 3), 120, dtype=np.uint8),
+            )
+
+    selector = KeyframeSelector(
+        config={
+            "SAMPLE_INTERVAL": 1,
+            "QUALITY_FILTER_ENABLED": True,
+            "ENABLE_FISHEYE_BORDER_MASK": False,
+            **(config_extra or {}),
+        }
+    )
+    selector._open_independent_pair_captures = lambda _loader: (None, None)
+    score_iter = iter(scores)
+    sky_iter = iter(sky_ratios)
+    monkeypatch.setattr(ks_mod, "compose_quality", lambda *_args, **_kwargs: float(next(score_iter)))
+    monkeypatch.setattr(ks_mod, "apply_abs_guard", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(selector, "_estimate_sky_ratio", lambda *_args, **_kwargs: float(next(sky_iter)))
+    selector._stage1_fast_filter(_Loader(), SimpleNamespace(frame_count=1, fps=30.0), progress_callback=None)
+    return selector
+
+
+def test_stage1_lr_strict_min_keeps_legacy_behavior(monkeypatch):
+    selector = _run_paired_stage1_with_mocked_scores(
+        monkeypatch,
+        scores=[0.80, 0.30],
+        sky_ratios=[0.75, 0.10],
+        config_extra={"STAGE1_LR_MERGE_MODE": "strict_min"},
+    )
+    assert len(selector.stage1_quality_records) == 1
+    rec = selector.stage1_quality_records[0]
+    assert rec["is_pass"] is False
+    assert rec["drop_reason"] == "quality_below_threshold"
+    assert rec["quality_merge_strategy"] == "strict_min"
+    assert rec["lr_merge_mode_applied"] == "strict_min"
+
+
+def test_stage1_lr_asymmetric_mode_selects_high_quality_side(monkeypatch):
+    selector = _run_paired_stage1_with_mocked_scores(
+        monkeypatch,
+        scores=[0.80, 0.40],
+        sky_ratios=[0.75, 0.10],
+        config_extra={"STAGE1_LR_MERGE_MODE": "asymmetric_sky_v1"},
+    )
+    rec = selector.stage1_quality_records[0]
+    assert rec["is_pass"] is True
+    assert rec["quality"] == 0.80
+    assert rec["quality_merge_strategy"] == "asymmetric_max_with_weak_floor"
+    assert rec["lr_merge_mode_applied"] == "asymmetric_sky_v1"
+    assert rec["lr_asym_eligible"] is True
+
+
+def test_stage1_lr_asymmetric_mode_rejects_below_weak_floor(monkeypatch):
+    selector = _run_paired_stage1_with_mocked_scores(
+        monkeypatch,
+        scores=[0.80, 0.34],
+        sky_ratios=[0.75, 0.10],
+        config_extra={
+            "STAGE1_LR_MERGE_MODE": "asymmetric_sky_v1",
+            "STAGE1_LR_ASYM_WEAK_FLOOR": 0.35,
+        },
+    )
+    rec = selector.stage1_quality_records[0]
+    assert rec["is_pass"] is False
+    assert rec["drop_reason"] == "lr_weak_floor"
+    assert rec["quality_merge_strategy"] == "asymmetric_max_with_weak_floor"
+    assert rec["lr_asym_eligible"] is True
+
+
+def test_stage1_lr_auto_relax_when_sky_threshold_unreachable(monkeypatch):
+    selector = _run_paired_stage1_with_mocked_scores(
+        monkeypatch,
+        scores=[0.80, 0.31],
+        sky_ratios=[0.52, 0.22],
+        config_extra={
+            "STAGE1_LR_MERGE_MODE": "asymmetric_sky_v1",
+            "STAGE1_LR_SKY_RATIO_THRESHOLD": 0.55,
+            "STAGE1_LR_SKY_RATIO_DIFF_THRESHOLD": 0.20,
+            "STAGE1_LR_QUALITY_GAP_THRESHOLD": 0.15,
+            "STAGE1_LR_ASYM_WEAK_FLOOR": 0.35,
+        },
+    )
+    rec = selector.stage1_quality_records[0]
+    assert rec["lr_auto_relaxed"] is True
+    assert rec["lr_sky_ratio_threshold"] <= 0.35 + 1e-9
+    assert rec["lr_weak_floor"] <= 0.30 + 1e-9
+    assert rec["is_pass"] is True
+    assert rec["quality_merge_strategy"] == "asymmetric_max_with_weak_floor"

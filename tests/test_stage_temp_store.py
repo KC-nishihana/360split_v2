@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from core.keyframe_selector import KeyframeInfo, KeyframeSelector, Stage2FrameRecord
@@ -22,10 +23,12 @@ def test_stage_temp_store_roundtrip_and_cleanup(tmp_path):
     recs = [{"frame_index": 1, "quality": 0.8, "is_pass": True}]
     store.save_stage1(cands, recs)
     store.save_stage1_effective(cands)
+    store.save_stage15(cands)
     lc, lr = store.load_stage1()
     assert lc == cands
     assert lr == recs
     assert store.load_stage1_effective() == cands
+    assert store.load_stage15() == cands
 
     s0 = {1: {"motion_risk": 0.2, "vo_status_reason": "ok"}}
     store.save_stage0(s0)
@@ -222,3 +225,92 @@ def test_select_keyframes_stage1_empty_exits_before_stage0(monkeypatch, tmp_path
     out = selector.select_keyframes(_DummyLoader(), stage_temp_store=store)
     assert out == []
     assert flags["stage0_called"] is False
+
+
+def test_select_keyframes_minimal_mode_disables_legacy_stages(monkeypatch, tmp_path):
+    flags = {"stage0_called": False, "stage2_precise_called": False, "stage3_called": False}
+
+    def fake_stage1(self, _video_loader, _metadata, _progress_cb):
+        self.stage1_quality_records = [
+            {"frame_index": 2, "timestamp": 0.0, "quality": 0.8, "is_pass": True, "drop_reason": "pass"},
+            {"frame_index": 4, "timestamp": 0.1, "quality": 0.7, "is_pass": True, "drop_reason": "pass"},
+        ]
+        return [
+            {"frame_idx": 2, "quality_scores": {"quality": 0.8, "sharpness": 100.0, "exposure": 0.8}},
+            {"frame_idx": 4, "quality_scores": {"quality": 0.7, "sharpness": 80.0, "exposure": 0.7}},
+        ]
+
+    def should_not_run_stage0(*_args, **_kwargs):
+        flags["stage0_called"] = True
+        raise AssertionError("Stage0 should not run in minimal mode")
+
+    def should_not_run_stage2_precise(*_args, **_kwargs):
+        flags["stage2_precise_called"] = True
+        raise AssertionError("Legacy Stage2 should not run in minimal mode")
+
+    def fake_stage2_minimal(self, _video_loader, _metadata, stage1_candidates, _progress_cb):
+        idx = int(stage1_candidates[0]["frame_idx"])
+        cands = [KeyframeInfo(frame_index=idx, timestamp=idx / 30.0, combined_score=0.8)]
+        records = [
+            Stage2FrameRecord(
+                frame_index=idx,
+                frame=None,
+                quality_scores={"quality": 0.8},
+                geometric_scores={},
+                adaptive_scores={"optical_flow": 0.0},
+                metrics={"combined_stage2": 0.8, "combined_stage3": 0.8},
+                is_candidate=True,
+                drop_reason="selected",
+            ),
+            Stage2FrameRecord(
+                frame_index=int(stage1_candidates[1]["frame_idx"]),
+                frame=None,
+                quality_scores={"quality": 0.7},
+                geometric_scores={},
+                adaptive_scores={},
+                metrics={"combined_stage2": 0.7, "combined_stage3": 0.7},
+                is_candidate=False,
+                drop_reason="read_fail",
+            ),
+        ]
+        return cands, records
+
+    def should_not_run_stage3(*_args, **_kwargs):
+        flags["stage3_called"] = True
+        raise AssertionError("Stage3 should not run in minimal mode")
+
+    selector = KeyframeSelector(config={"pose_backend": "colmap", "colmap_pipeline_mode": "minimal_v1"})
+    monkeypatch.setattr(selector, "_stage1_fast_filter", fake_stage1.__get__(selector, KeyframeSelector))
+    monkeypatch.setattr(selector, "_stage0_lightweight_motion_scan", should_not_run_stage0)
+    monkeypatch.setattr(selector, "_stage2_precise_evaluation", should_not_run_stage2_precise)
+    monkeypatch.setattr(
+        selector,
+        "_stage2_minimal_motion_only_evaluation",
+        fake_stage2_minimal.__get__(selector, KeyframeSelector),
+    )
+    monkeypatch.setattr(selector, "_stage3_refine_with_trajectory", should_not_run_stage3)
+
+    store = StageTempStore("run-minimal-stage-order", root_dir=tmp_path)
+    monkeypatch.setattr(store, "cleanup_on_success", lambda: None)
+    out = selector.select_keyframes(_DummyLoader(), stage_temp_store=store)
+
+    assert len(out) == 1
+    assert flags["stage0_called"] is False
+    assert flags["stage2_precise_called"] is False
+    assert flags["stage3_called"] is False
+
+    summary_path = store.run_dir / store.ANALYSIS_SUMMARY_FILE
+    with summary_path.open("r", encoding="utf-8") as f:
+        summary = json.load(f)
+    assert bool(summary.get("minimal_mode")) is True
+    assert summary.get("retarget", {}).get("reason") == "disabled_minimal_mode"
+    assert int(summary.get("stage_counts", {}).get("stage0_executed_count", 1)) == 0
+    assert int(summary.get("stage_counts", {}).get("stage3_executed_count", 1)) == 0
+    assert int(summary.get("stage_counts", {}).get("final_keyframes", -1)) == 1
+
+    with store.manifest_path.open("r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    stage3_counts = dict(manifest.get("stage_counts", {}).get("3", {}))
+    assert int(stage3_counts.get("keyframes", -1)) == 0
+    assert int(stage3_counts.get("compat_keyframes", -1)) == 1
+    assert (store.run_dir / store.STAGE3_KEYFRAMES_FILE).exists()

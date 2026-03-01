@@ -22,8 +22,11 @@ def test_apply_cli_overrides_performance_knobs():
         stage1_gpu_batch=False,
         darwin_capture_backend="ffmpeg",
         mps_min_pixels=131072,
+        stage1_lr_merge_mode="strict_min",
+        stage1_lr_asym_weak_floor=0.42,
         pose_backend="colmap",
         colmap_path="/opt/homebrew/bin/colmap",
+        colmap_pipeline_mode="minimal_v1",
         colmap_keyframe_policy="stage2_relaxed",
         colmap_keyframe_target_mode="auto",
         colmap_keyframe_target_min=120,
@@ -35,6 +38,15 @@ def test_apply_cli_overrides_performance_knobs():
         colmap_stage1_adaptive_threshold=True,
         colmap_stage1_min_candidates_per_bin=3,
         colmap_stage1_max_candidates=360,
+        colmap_selection_profile="no_vo_coverage",
+        colmap_stage2_entry_budget=180,
+        colmap_stage2_entry_min_gap=3,
+        colmap_diversity_ssim_threshold=0.93,
+        colmap_diversity_phash_hamming=10,
+        colmap_final_target_policy="soft_auto",
+        colmap_final_soft_min=80,
+        colmap_final_soft_max=220,
+        colmap_no_supplement_on_low_quality=True,
         colmap_rig_policy="lr_opk",
         colmap_rig_seed_opk=[0.0, 0.0, 180.0],
         colmap_workspace_scope="run_scoped",
@@ -56,8 +68,11 @@ def test_apply_cli_overrides_performance_knobs():
     assert config["stage1_gpu_batch_enabled"] is False
     assert config["darwin_capture_backend"] == "ffmpeg"
     assert config["mps_min_pixels"] == 131072
+    assert config["stage1_lr_merge_mode"] == "strict_min"
+    assert config["stage1_lr_asym_weak_floor"] == 0.42
     assert config["pose_backend"] == "colmap"
     assert config["colmap_path"] == "/opt/homebrew/bin/colmap"
+    assert config["colmap_pipeline_mode"] == "minimal_v1"
     assert config["colmap_keyframe_policy"] == "stage2_relaxed"
     assert config["colmap_keyframe_target_mode"] == "auto"
     assert config["colmap_keyframe_target_min"] == 120
@@ -69,6 +84,15 @@ def test_apply_cli_overrides_performance_knobs():
     assert config["colmap_stage1_adaptive_threshold"] is True
     assert config["colmap_stage1_min_candidates_per_bin"] == 3
     assert config["colmap_stage1_max_candidates"] == 360
+    assert config["colmap_selection_profile"] == "no_vo_coverage"
+    assert config["colmap_stage2_entry_budget"] == 180
+    assert config["colmap_stage2_entry_min_gap"] == 3
+    assert config["colmap_diversity_ssim_threshold"] == 0.93
+    assert config["colmap_diversity_phash_hamming"] == 10
+    assert config["colmap_final_target_policy"] == "soft_auto"
+    assert config["colmap_final_soft_min"] == 80
+    assert config["colmap_final_soft_max"] == 220
+    assert config["colmap_no_supplement_on_low_quality"] is True
     assert config["colmap_rig_policy"] == "lr_opk"
     assert config["colmap_rig_seed_opk_deg"] == [0.0, 0.0, 180.0]
     assert config["colmap_workspace_scope"] == "run_scoped"

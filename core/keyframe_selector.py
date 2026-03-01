@@ -7,6 +7,7 @@
 import cv2
 import numpy as np
 import uuid
+import csv
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -1734,12 +1735,27 @@ class KeyframeSelector:
         if pose_backend not in {"vo", "colmap"}:
             pose_backend = "vo"
 
+        raw_pipeline_mode = str(
+            self.config.get("COLMAP_PIPELINE_MODE", self.config.get("colmap_pipeline_mode", "")) or ""
+        ).strip().lower()
+        if raw_pipeline_mode not in {"", "legacy", "minimal_v1"}:
+            raw_pipeline_mode = ""
+        pipeline_mode = raw_pipeline_mode if raw_pipeline_mode else ("minimal_v1" if pose_backend == "colmap" else "legacy")
+        minimal_mode = bool(pose_backend == "colmap" and pipeline_mode == "minimal_v1")
+
         raw_policy = str(
             self.config.get("COLMAP_KEYFRAME_POLICY", self.config.get("colmap_keyframe_policy", "")) or ""
         ).strip().lower()
         if raw_policy not in {"", "legacy", "stage2_relaxed", "stage1_only"}:
             raw_policy = ""
         policy = raw_policy if raw_policy else ("stage2_relaxed" if pose_backend == "colmap" else "legacy")
+
+        raw_profile = str(
+            self.config.get("COLMAP_SELECTION_PROFILE", self.config.get("colmap_selection_profile", "")) or ""
+        ).strip().lower()
+        if raw_profile not in {"", "legacy", "no_vo_coverage"}:
+            raw_profile = ""
+        selection_profile = raw_profile if raw_profile else ("no_vo_coverage" if pose_backend == "colmap" else "legacy")
 
         raw_target_mode = str(
             self.config.get("COLMAP_KEYFRAME_TARGET_MODE", self.config.get("colmap_keyframe_target_mode", "")) or ""
@@ -1767,6 +1783,8 @@ class KeyframeSelector:
                 self.config.get("colmap_motion_aware_selection", True),
             )
         )
+        if selection_profile == "no_vo_coverage" or minimal_mode:
+            colmap_motion_aware_selection = False
         colmap_nms_motion_window_ratio = float(
             max(
                 0.0,
@@ -1800,6 +1818,76 @@ class KeyframeSelector:
                 ),
             )
         )
+        colmap_stage2_entry_budget = int(
+            max(
+                1,
+                self.config.get(
+                    "COLMAP_STAGE2_ENTRY_BUDGET",
+                    self.config.get("colmap_stage2_entry_budget", 180),
+                ),
+            )
+        )
+        colmap_stage2_entry_min_gap = int(
+            max(
+                0,
+                self.config.get(
+                    "COLMAP_STAGE2_ENTRY_MIN_GAP",
+                    self.config.get("colmap_stage2_entry_min_gap", 3),
+                ),
+            )
+        )
+        colmap_diversity_ssim_threshold = float(
+            np.clip(
+                self.config.get(
+                    "COLMAP_DIVERSITY_SSIM_THRESHOLD",
+                    self.config.get("colmap_diversity_ssim_threshold", 0.93),
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        colmap_diversity_phash_hamming = int(
+            max(
+                0,
+                self.config.get(
+                    "COLMAP_DIVERSITY_PHASH_HAMMING",
+                    self.config.get("colmap_diversity_phash_hamming", 10),
+                ),
+            )
+        )
+        colmap_final_target_policy = str(
+            self.config.get(
+                "COLMAP_FINAL_TARGET_POLICY",
+                self.config.get("colmap_final_target_policy", "soft_auto"),
+            ) or "soft_auto"
+        ).strip().lower()
+        if colmap_final_target_policy not in {"soft_auto", "fixed"}:
+            colmap_final_target_policy = "soft_auto"
+        colmap_final_soft_min = int(
+            max(
+                1,
+                self.config.get(
+                    "COLMAP_FINAL_SOFT_MIN",
+                    self.config.get("colmap_final_soft_min", 80),
+                ),
+            )
+        )
+        colmap_final_soft_max = int(
+            max(
+                colmap_final_soft_min,
+                self.config.get(
+                    "COLMAP_FINAL_SOFT_MAX",
+                    self.config.get("colmap_final_soft_max", 220),
+                ),
+            )
+        )
+        colmap_no_supplement_on_low_quality = bool(
+            self.config.get(
+                "COLMAP_NO_SUPPLEMENT_ON_LOW_QUALITY",
+                self.config.get("colmap_no_supplement_on_low_quality", True),
+            )
+        )
+
         rig_policy = str(
             self.config.get("COLMAP_RIG_POLICY", self.config.get("colmap_rig_policy", ""))
             or ""
@@ -1835,20 +1923,37 @@ class KeyframeSelector:
             max(0.01, self.config.get("NMS_TIME_WINDOW", self.config.get("nms_time_window", 1.0)))
         )
 
-        colmap_shortcut = bool(pose_backend == "colmap" and policy != "legacy")
+        colmap_shortcut = bool(pose_backend == "colmap" and policy != "legacy" and (not minimal_mode))
         stage1_only = bool(pose_backend == "colmap" and policy == "stage1_only")
         relax_stage2 = bool(pose_backend == "colmap" and policy == "stage2_relaxed")
         effective_nms = colmap_nms_window if colmap_shortcut else default_nms_window
         stage0_on = bool(self.config.get("ENABLE_STAGE0_SCAN", True))
         stage3_on = bool(self.config.get("ENABLE_STAGE3_REFINEMENT", True))
+        disabled_components = [
+            "stage0",
+            "stage1_5",
+            "stage3",
+            "dynamic_mask",
+            "retarget",
+            "vo_dependent_selection",
+        ] if minimal_mode else []
         if colmap_shortcut:
-            stage0_on = bool(colmap_enable_stage0)
+            stage0_on = bool(colmap_enable_stage0) and selection_profile != "no_vo_coverage"
+            stage3_on = False
+        if minimal_mode:
+            stage0_on = False
             stage3_on = False
         effective_stage_plan = (
-            "Stage1 only"
+            "Stage1->Stage2(minimal_v1)"
+            if minimal_mode
+            else "Stage1 only"
             if stage1_only
             else (
-                f"{'Stage1->Stage0->Stage2(relaxed)' if stage0_on else 'Stage1->Stage2(relaxed)'}"
+                (
+                    "Stage1->Stage1.5->Stage2->Stage2.5(no_vo_coverage)"
+                    if (selection_profile == "no_vo_coverage" and colmap_shortcut)
+                    else f"{'Stage1->Stage0->Stage2(relaxed)' if stage0_on else 'Stage1->Stage2(relaxed)'}"
+                )
                 if relax_stage2
                 else f"Stage1->{'0->' if stage0_on else ''}2{'->3' if stage3_on else ''}"
             )
@@ -1856,7 +1961,10 @@ class KeyframeSelector:
 
         # Persist normalized runtime config for downstream consumers.
         self.config["POSE_BACKEND"] = pose_backend
+        self.config["COLMAP_PIPELINE_MODE"] = pipeline_mode
+        self.config["colmap_pipeline_mode"] = pipeline_mode
         self.config["COLMAP_KEYFRAME_POLICY"] = policy
+        self.config["COLMAP_SELECTION_PROFILE"] = selection_profile
         self.config["COLMAP_KEYFRAME_TARGET_MODE"] = target_mode
         self.config["COLMAP_KEYFRAME_TARGET_MIN"] = target_min
         self.config["COLMAP_KEYFRAME_TARGET_MAX"] = target_max
@@ -1867,11 +1975,32 @@ class KeyframeSelector:
         self.config["COLMAP_STAGE1_ADAPTIVE_THRESHOLD"] = bool(colmap_stage1_adaptive_threshold)
         self.config["COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN"] = int(colmap_stage1_min_candidates_per_bin)
         self.config["COLMAP_STAGE1_MAX_CANDIDATES"] = int(colmap_stage1_max_candidates)
+        self.config["COLMAP_STAGE2_ENTRY_BUDGET"] = int(colmap_stage2_entry_budget)
+        self.config["COLMAP_STAGE2_ENTRY_MIN_GAP"] = int(colmap_stage2_entry_min_gap)
+        self.config["COLMAP_DIVERSITY_SSIM_THRESHOLD"] = float(colmap_diversity_ssim_threshold)
+        self.config["COLMAP_DIVERSITY_PHASH_HAMMING"] = int(colmap_diversity_phash_hamming)
+        self.config["COLMAP_FINAL_TARGET_POLICY"] = str(colmap_final_target_policy)
+        self.config["COLMAP_FINAL_SOFT_MIN"] = int(colmap_final_soft_min)
+        self.config["COLMAP_FINAL_SOFT_MAX"] = int(colmap_final_soft_max)
+        self.config["COLMAP_NO_SUPPLEMENT_ON_LOW_QUALITY"] = bool(colmap_no_supplement_on_low_quality)
         self.config["COLMAP_RIG_POLICY"] = rig_policy
         self.config["COLMAP_RIG_SEED_OPK_DEG"] = list(rig_seed_opk)
         self.config["COLMAP_WORKSPACE_SCOPE"] = workspace_scope
         self.config["COLMAP_REUSE_DB"] = reuse_db
         self.config["COLMAP_ANALYSIS_MASK_PROFILE"] = analysis_mask_profile
+        self.config["COLMAP_MINIMAL_MODE"] = bool(minimal_mode)
+        self.config["colmap_minimal_mode"] = bool(minimal_mode)
+        if minimal_mode:
+            logger.warning(
+                "COLMAP minimal_v1 mode enabled: "
+                "legacy knobs (policy/target/stage0/stage1.5/stage3/retarget/dynamic-mask) are ignored."
+            )
+        if pose_backend == "colmap" and selection_profile == "no_vo_coverage":
+            self.config["ENABLE_DYNAMIC_MASK_REMOVAL"] = True
+            self.config["enable_dynamic_mask_removal"] = True
+        if minimal_mode:
+            self.config["ENABLE_DYNAMIC_MASK_REMOVAL"] = False
+            self.config["enable_dynamic_mask_removal"] = False
         if pose_backend == "colmap" and analysis_mask_profile == "colmap_safe":
             classes = self.config.get("DYNAMIC_MASK_TARGET_CLASSES", DYNAMIC_MASK_DEFAULT_CLASSES)
             if not isinstance(classes, list):
@@ -1885,7 +2014,10 @@ class KeyframeSelector:
 
         return {
             "pose_backend": pose_backend,
+            "pipeline_mode": pipeline_mode,
+            "minimal_mode": bool(minimal_mode),
             "policy": policy,
+            "selection_profile": selection_profile,
             "target_mode": target_mode,
             "target_min": target_min,
             "target_max": target_max,
@@ -1899,13 +2031,22 @@ class KeyframeSelector:
             "colmap_stage1_adaptive_threshold": bool(colmap_stage1_adaptive_threshold),
             "colmap_stage1_min_candidates_per_bin": int(colmap_stage1_min_candidates_per_bin),
             "colmap_stage1_max_candidates": int(colmap_stage1_max_candidates),
-            "force_stage0_off": bool(colmap_shortcut and (not colmap_enable_stage0)),
-            "force_stage3_off": colmap_shortcut,
+            "colmap_stage2_entry_budget": int(colmap_stage2_entry_budget),
+            "colmap_stage2_entry_min_gap": int(colmap_stage2_entry_min_gap),
+            "colmap_diversity_ssim_threshold": float(colmap_diversity_ssim_threshold),
+            "colmap_diversity_phash_hamming": int(colmap_diversity_phash_hamming),
+            "colmap_final_target_policy": str(colmap_final_target_policy),
+            "colmap_final_soft_min": int(colmap_final_soft_min),
+            "colmap_final_soft_max": int(colmap_final_soft_max),
+            "colmap_no_supplement_on_low_quality": bool(colmap_no_supplement_on_low_quality),
+            "force_stage0_off": bool((colmap_shortcut and (not stage0_on)) or minimal_mode),
+            "force_stage3_off": bool(colmap_shortcut or minimal_mode),
             "rig_policy": rig_policy,
             "rig_seed_opk_deg": list(rig_seed_opk),
             "workspace_scope": workspace_scope,
             "reuse_db": reuse_db,
             "analysis_mask_profile": analysis_mask_profile,
+            "disabled_components": list(disabled_components),
             "effective_stage_plan": effective_stage_plan,
         }
 
@@ -2216,6 +2357,419 @@ class KeyframeSelector:
             occupied.add(b)
         return int(len(occupied))
 
+    @staticmethod
+    def _count_time_bins_occupied(
+        frame_indices: List[int],
+        *,
+        total_frames: int,
+        bins: int = 24,
+    ) -> int:
+        if total_frames <= 0 or not frame_indices:
+            return 0
+        bins = int(max(1, bins))
+        width = float(max(1, total_frames)) / float(max(1, bins))
+        occupied = set()
+        for idx in frame_indices:
+            b = int(np.floor(float(max(0, idx)) / max(width, 1e-12)))
+            b = max(0, min(bins - 1, b))
+            occupied.add(b)
+        return int(len(occupied))
+
+    @staticmethod
+    def _estimate_sky_ratio(frame: Optional[np.ndarray], valid_mask: Optional[np.ndarray] = None) -> float:
+        if frame is None:
+            return 0.0
+        try:
+            from processing.target_mask_generator import TargetMaskGenerator
+
+            sky_mask = TargetMaskGenerator._detect_sky_mask(frame)
+            if sky_mask is None or sky_mask.size == 0:
+                return 0.0
+
+            if valid_mask is not None and valid_mask.shape[:2] == sky_mask.shape[:2]:
+                valid = valid_mask > 0
+            else:
+                if frame.ndim == 3:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray = frame
+                valid = gray > 8
+
+            denom = int(np.count_nonzero(valid))
+            if denom <= 0:
+                return 0.0
+            numer = int(np.count_nonzero((sky_mask > 0) & valid))
+            return float(numer / max(denom, 1))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _summarize_stage1_lr_statistics(
+        stage1_records: List[Dict[str, Any]],
+        *,
+        quality_threshold: float,
+        merge_mode: str,
+    ) -> Dict[str, Any]:
+        matrix = {
+            "both_pass": 0,
+            "a_only_pass": 0,
+            "b_only_pass": 0,
+            "neither": 0,
+        }
+        merge_counts = {
+            "merge_mode_configured": str(merge_mode),
+            "strict_min_applied": 0,
+            "asymmetric_applied": 0,
+            "asym_eligible": 0,
+            "weak_floor_reject": 0,
+            "asym_abs_guard_reject": 0,
+            "auto_relaxed_records": 0,
+        }
+        sky_diffs: List[float] = []
+        sky_values: List[float] = []
+        effective_sky_thrs: List[float] = []
+        effective_weak_floors: List[float] = []
+        for rec in stage1_records or []:
+            qa = rec.get("quality_lens_a")
+            qb = rec.get("quality_lens_b")
+            if isinstance(qa, (int, float)) and isinstance(qb, (int, float)):
+                pass_a = float(qa) >= float(quality_threshold)
+                pass_b = float(qb) >= float(quality_threshold)
+                if pass_a and pass_b:
+                    matrix["both_pass"] += 1
+                elif pass_a and not pass_b:
+                    matrix["a_only_pass"] += 1
+                elif pass_b and not pass_a:
+                    matrix["b_only_pass"] += 1
+                else:
+                    matrix["neither"] += 1
+            if bool(rec.get("lr_asym_eligible", False)):
+                merge_counts["asym_eligible"] += 1
+            mode_applied = str(rec.get("lr_merge_mode_applied", "") or "")
+            if mode_applied == "asymmetric_sky_v1":
+                merge_counts["asymmetric_applied"] += 1
+            elif mode_applied == "strict_min":
+                merge_counts["strict_min_applied"] += 1
+            if str(rec.get("drop_reason", "")) == "lr_weak_floor":
+                merge_counts["weak_floor_reject"] += 1
+            if mode_applied == "asymmetric_sky_v1" and str(rec.get("drop_reason", "")) == "abs_laplacian_guard":
+                merge_counts["asym_abs_guard_reject"] += 1
+            if bool(rec.get("lr_auto_relaxed", False)):
+                merge_counts["auto_relaxed_records"] += 1
+
+            sky_a = rec.get("sky_ratio_lens_a")
+            sky_b = rec.get("sky_ratio_lens_b")
+            if isinstance(sky_a, (int, float)) and isinstance(sky_b, (int, float)):
+                a = float(np.clip(float(sky_a), 0.0, 1.0))
+                b = float(np.clip(float(sky_b), 0.0, 1.0))
+                sky_values.extend([a, b])
+                sky_diffs.append(abs(a - b))
+            if isinstance(rec.get("lr_sky_ratio_threshold"), (int, float)):
+                effective_sky_thrs.append(float(np.clip(float(rec.get("lr_sky_ratio_threshold")), 0.0, 1.0)))
+            if isinstance(rec.get("lr_weak_floor"), (int, float)):
+                effective_weak_floors.append(float(np.clip(float(rec.get("lr_weak_floor")), 0.0, 1.0)))
+
+        if effective_sky_thrs:
+            sky_thr_arr = np.asarray(effective_sky_thrs, dtype=np.float64)
+            merge_counts["effective_sky_ratio_threshold_median"] = float(np.median(sky_thr_arr))
+        if effective_weak_floors:
+            weak_arr = np.asarray(effective_weak_floors, dtype=np.float64)
+            merge_counts["effective_weak_floor_median"] = float(np.median(weak_arr))
+
+        if sky_diffs:
+            sky_arr = np.asarray(sky_diffs, dtype=np.float64)
+            sky_val_arr = np.asarray(sky_values, dtype=np.float64) if sky_values else np.zeros(0, dtype=np.float64)
+            sky_stats = {
+                "count": int(sky_arr.size),
+                "diff_mean": float(np.mean(sky_arr)),
+                "diff_median": float(np.median(sky_arr)),
+                "diff_p90": float(np.percentile(sky_arr, 90)),
+                "diff_max": float(np.max(sky_arr)),
+                "sky_mean": float(np.mean(sky_val_arr)) if sky_val_arr.size > 0 else 0.0,
+            }
+        else:
+            sky_stats = {
+                "count": 0,
+                "diff_mean": 0.0,
+                "diff_median": 0.0,
+                "diff_p90": 0.0,
+                "diff_max": 0.0,
+                "sky_mean": 0.0,
+            }
+
+        return {
+            "stage1_lr_merge_mode": str(merge_mode),
+            "stage1_lr_merge_counts": dict(merge_counts),
+            "stage1_lens_pass_matrix": dict(matrix),
+            "stage1_sky_asymmetry_stats": dict(sky_stats),
+        }
+
+    @staticmethod
+    def _gray_preview(frame: Optional[np.ndarray], size: int = 96) -> Optional[np.ndarray]:
+        if frame is None:
+            return None
+        try:
+            if frame.ndim == 3:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = frame
+            return cv2.resize(gray, (size, size), interpolation=cv2.INTER_AREA)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _compute_phash_signature(gray: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if gray is None:
+            return None
+        try:
+            resized = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+            dct = cv2.dct(resized)
+            low = dct[:8, :8]
+            med = float(np.median(low[1:, :])) if low.size > 1 else float(np.median(low))
+            bits = (low.flatten() > med).astype(np.uint8)
+            return bits
+        except Exception:
+            return None
+
+    @staticmethod
+    def _hamming_distance_bits(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> int:
+        if a is None or b is None:
+            return 64
+        if a.shape != b.shape:
+            return 64
+        return int(np.count_nonzero(a != b))
+
+    def _stage15_build_visual_signatures(
+        self,
+        video_loader,
+        frame_indices: List[int],
+    ) -> Dict[int, Dict[str, Any]]:
+        is_paired = bool(getattr(video_loader, "is_paired", False))
+        out: Dict[int, Dict[str, Any]] = {}
+        for idx in frame_indices:
+            if is_paired and hasattr(video_loader, "get_frame_pair"):
+                frame_l, frame_r = video_loader.get_frame_pair(int(idx))
+                gray_l = self._gray_preview(frame_l)
+                gray_r = self._gray_preview(frame_r)
+                out[int(idx)] = {
+                    "paired": True,
+                    "gray_l": gray_l,
+                    "gray_r": gray_r,
+                    "phash_l": self._compute_phash_signature(gray_l),
+                    "phash_r": self._compute_phash_signature(gray_r),
+                }
+            elif hasattr(video_loader, "get_frame"):
+                frame = video_loader.get_frame(int(idx))
+                gray = self._gray_preview(frame)
+                out[int(idx)] = {
+                    "paired": False,
+                    "gray": gray,
+                    "phash": self._compute_phash_signature(gray),
+                }
+            else:
+                out[int(idx)] = {"paired": False}
+        return out
+
+    def _stage15_similarity(
+        self,
+        a: Dict[str, Any],
+        b: Dict[str, Any],
+    ) -> Tuple[float, int]:
+        if bool(a.get("paired", False)) and bool(b.get("paired", False)):
+            gray_al = a.get("gray_l")
+            gray_ar = a.get("gray_r")
+            gray_bl = b.get("gray_l")
+            gray_br = b.get("gray_r")
+            ssim_l = float(self.adaptive_selector.compute_ssim(gray_al, gray_bl)) if gray_al is not None and gray_bl is not None else 0.0
+            ssim_r = float(self.adaptive_selector.compute_ssim(gray_ar, gray_br)) if gray_ar is not None and gray_br is not None else 0.0
+            ham_l = self._hamming_distance_bits(a.get("phash_l"), b.get("phash_l"))
+            ham_r = self._hamming_distance_bits(a.get("phash_r"), b.get("phash_r"))
+            return float(min(ssim_l, ssim_r)), int(max(ham_l, ham_r))
+        gray_a = a.get("gray")
+        gray_b = b.get("gray")
+        ssim = float(self.adaptive_selector.compute_ssim(gray_a, gray_b)) if gray_a is not None and gray_b is not None else 0.0
+        ham = self._hamming_distance_bits(a.get("phash"), b.get("phash"))
+        return ssim, ham
+
+    def _run_stage15_entry_budget(
+        self,
+        stage1_candidates: List[Dict[str, Any]],
+        *,
+        total_frames: int,
+        video_loader,
+        entry_budget: int,
+        min_gap: int,
+        diversity_ssim_threshold: float,
+        diversity_phash_hamming: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[Dict[str, Any]]]:
+        if not stage1_candidates:
+            return [], {
+                "entry_count": 0,
+                "drop_reason_counts": {},
+                "coverage_bins_before": 0,
+                "coverage_bins_after": 0,
+            }, []
+
+        by_idx: Dict[int, Dict[str, Any]] = {}
+        for cand in stage1_candidates:
+            if not isinstance(cand, dict):
+                continue
+            idx = int(cand.get("frame_idx", -1))
+            if idx < 0:
+                continue
+            by_idx[idx] = dict(cand)
+        sorted_idxs = sorted(by_idx.keys())
+        if not sorted_idxs:
+            return [], {
+                "entry_count": 0,
+                "drop_reason_counts": {},
+                "coverage_bins_before": 0,
+                "coverage_bins_after": 0,
+            }, []
+
+        if len(sorted_idxs) <= int(max(1, entry_budget)):
+            trace = []
+            for idx in sorted_idxs:
+                trace.append(
+                    {
+                        "frame": int(idx),
+                        "stage": "stage15",
+                        "kept": 1,
+                        "reason": "pass_through",
+                        "score_quality": float(self._score_from_stage1_candidate(by_idx[idx])),
+                        "score_novelty_ssim": 0.0,
+                        "score_novelty_phash": 0.0,
+                        "score_combined": float(self._score_from_stage1_candidate(by_idx[idx])),
+                    }
+                )
+            coverage_bins = self._count_time_bins_occupied(sorted_idxs, total_frames=int(total_frames), bins=24)
+            return [by_idx[idx] for idx in sorted_idxs], {
+                "entry_count": int(len(sorted_idxs)),
+                "drop_reason_counts": {},
+                "coverage_bins_before": int(coverage_bins),
+                "coverage_bins_after": int(coverage_bins),
+            }, trace
+
+        signatures = self._stage15_build_visual_signatures(video_loader, sorted_idxs)
+        bins = 24
+        bin_width = float(max(1, total_frames)) / float(max(1, bins))
+
+        trace_map: Dict[int, Dict[str, Any]] = {}
+        drop_counts: Counter = Counter()
+        quality_map = {idx: float(self._score_from_stage1_candidate(by_idx[idx])) for idx in sorted_idxs}
+        novelty_map: Dict[int, Tuple[float, float, float]] = {}
+        for pos, idx in enumerate(sorted_idxs):
+            if pos <= 0:
+                novelty_map[idx] = (1.0, 1.0, quality_map[idx])
+                continue
+            prev_idx = sorted_idxs[pos - 1]
+            ssim_prev, ham_prev = self._stage15_similarity(signatures.get(idx, {}), signatures.get(prev_idx, {}))
+            novelty_ssim = float(np.clip(1.0 - ssim_prev, 0.0, 1.0))
+            novelty_phash = float(np.clip(float(ham_prev) / 64.0, 0.0, 1.0))
+            combined = float(0.6 * quality_map[idx] + 0.25 * novelty_ssim + 0.15 * novelty_phash)
+            novelty_map[idx] = (novelty_ssim, novelty_phash, combined)
+
+        selected_idxs: List[int] = []
+        selected_set = set()
+        # Coverage-first: each time bin keeps best candidate.
+        for b in range(bins):
+            start = int(np.floor(b * bin_width))
+            end = int(np.floor((b + 1) * bin_width)) if b < bins - 1 else int(max(total_frames, 1))
+            pool = [idx for idx in sorted_idxs if start <= idx < end]
+            if not pool:
+                continue
+            best_idx = max(
+                pool,
+                key=lambda idx: (
+                    novelty_map[idx][2],
+                    quality_map[idx],
+                    -abs(idx - int((start + end) * 0.5)),
+                ),
+            )
+            if best_idx in selected_set:
+                continue
+            selected_set.add(best_idx)
+            selected_idxs.append(best_idx)
+            trace_map[best_idx] = {
+                "frame": int(best_idx),
+                "stage": "stage15",
+                "kept": 1,
+                "reason": "coverage_seed",
+                "score_quality": float(quality_map[best_idx]),
+                "score_novelty_ssim": float(novelty_map[best_idx][0]),
+                "score_novelty_phash": float(novelty_map[best_idx][1]),
+                "score_combined": float(novelty_map[best_idx][2]),
+            }
+
+        ranked = sorted(
+            [idx for idx in sorted_idxs if idx not in selected_set],
+            key=lambda idx: (novelty_map[idx][2], quality_map[idx], -idx),
+            reverse=True,
+        )
+        for idx in ranked:
+            base_trace = {
+                "frame": int(idx),
+                "stage": "stage15",
+                "score_quality": float(quality_map[idx]),
+                "score_novelty_ssim": float(novelty_map[idx][0]),
+                "score_novelty_phash": float(novelty_map[idx][1]),
+                "score_combined": float(novelty_map[idx][2]),
+            }
+            if len(selected_set) >= int(max(1, entry_budget)):
+                drop_counts["entry_budget_trim"] += 1
+                trace_map[idx] = dict(base_trace, kept=0, reason="entry_budget_trim")
+                continue
+            if any(abs(int(idx) - int(sidx)) < int(max(0, min_gap)) for sidx in selected_idxs):
+                drop_counts["min_gap_trim"] += 1
+                trace_map[idx] = dict(base_trace, kept=0, reason="min_gap_trim")
+                continue
+            duplicate_reason = ""
+            for sidx in selected_idxs:
+                ssim_pair, ham_pair = self._stage15_similarity(signatures.get(idx, {}), signatures.get(sidx, {}))
+                if ssim_pair >= float(diversity_ssim_threshold):
+                    duplicate_reason = "near_duplicate_ssim"
+                    break
+                if ham_pair <= int(max(0, diversity_phash_hamming)):
+                    duplicate_reason = "near_duplicate_phash"
+                    break
+            if duplicate_reason:
+                drop_counts[duplicate_reason] += 1
+                trace_map[idx] = dict(base_trace, kept=0, reason=duplicate_reason)
+                continue
+            selected_set.add(idx)
+            selected_idxs.append(idx)
+            trace_map[idx] = dict(base_trace, kept=1, reason="selected")
+
+        selected_idxs = sorted(selected_set)
+        out = [by_idx[idx] for idx in selected_idxs]
+        trace_rows = [trace_map[idx] for idx in sorted(trace_map.keys())]
+        coverage_before = self._count_time_bins_occupied(sorted_idxs, total_frames=int(total_frames), bins=24)
+        coverage_after = self._count_time_bins_occupied(selected_idxs, total_frames=int(total_frames), bins=24)
+        return out, {
+            "entry_count": int(len(out)),
+            "drop_reason_counts": dict(drop_counts),
+            "coverage_bins_before": int(coverage_before),
+            "coverage_bins_after": int(coverage_after),
+        }, trace_rows
+
+    @staticmethod
+    def _save_selection_trace_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+        fieldnames = [
+            "frame",
+            "stage",
+            "kept",
+            "reason",
+            "score_quality",
+            "score_novelty_ssim",
+            "score_novelty_phash",
+            "score_combined",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in fieldnames})
+
     def _coverage_backfill_stage1_candidates(
         self,
         stage1_candidates: List[Dict[str, Any]],
@@ -2517,6 +3071,10 @@ class KeyframeSelector:
         target_max: int,
         stage2_records: Optional[List[Stage2FrameRecord]] = None,
         cumulative_motion_map: Optional[Dict[int, float]] = None,
+        final_target_policy: str = "fixed",
+        final_soft_min: int = 80,
+        final_soft_max: int = 220,
+        no_supplement_on_low_quality: bool = True,
     ) -> Tuple[List[KeyframeInfo], Dict[str, Any]]:
         mode = str(target_mode or "fixed").strip().lower()
         if mode not in {"fixed", "auto"}:
@@ -2533,10 +3091,17 @@ class KeyframeSelector:
                 min_bound=effective_min,
                 max_bound=effective_max,
             )
+        policy = str(final_target_policy or "fixed").strip().lower()
+        if policy not in {"soft_auto", "fixed"}:
+            policy = "fixed"
+        if policy == "soft_auto":
+            effective_min = int(max(1, final_soft_min))
+            effective_max = int(max(effective_min, final_soft_max))
 
         selected = sorted(keyframes, key=lambda k: int(k.frame_index))
         pre_count = len(selected)
         reason_parts: List[str] = []
+        final_reject_reason = ""
         pre_motion_bins = self._count_motion_bins_occupied(
             [int(k.frame_index) for k in selected],
             cumulative_motion_map or {},
@@ -2563,7 +3128,15 @@ class KeyframeSelector:
                     continue
                 stage1_map[idx] = cand
 
-            pool = [idx for idx in sorted(stage1_map.keys()) if idx not in selected_by_idx]
+            quality_guard = float(np.clip(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50)), 0.0, 1.0))
+            if no_supplement_on_low_quality:
+                pool = [
+                    idx for idx in sorted(stage1_map.keys())
+                    if idx not in selected_by_idx and self._score_from_stage1_candidate(stage1_map[idx]) >= quality_guard
+                ]
+            else:
+                pool = [idx for idx in sorted(stage1_map.keys()) if idx not in selected_by_idx]
+            pre_supplement_count = len(selected_by_idx)
             while len(selected_by_idx) < effective_min and pool:
                 if selected_idxs and cumulative_motion_map:
                     best_idx = max(
@@ -2602,9 +3175,14 @@ class KeyframeSelector:
                 )
                 pool.remove(best_idx)
                 selected_idxs = sorted(selected_by_idx.keys())
-            reason_parts.append("supplement_to_min")
+            if len(selected_by_idx) > pre_supplement_count:
+                reason_parts.append("supplement_to_min" if policy == "fixed" else "supplement_soft_min")
             if len(selected_by_idx) < effective_min:
-                reason_parts.append("insufficient_stage1_candidates")
+                if no_supplement_on_low_quality:
+                    final_reject_reason = "under_target_quality_guard"
+                    reason_parts.append("under_target_quality_guard")
+                else:
+                    reason_parts.append("insufficient_stage1_candidates")
 
         out = [selected_by_idx[idx] for idx in sorted(selected_by_idx.keys())]
         post_count = len(out)
@@ -2615,12 +3193,14 @@ class KeyframeSelector:
         reason = "+".join(reason_parts) if reason_parts else "within_target"
         return out, {
             "target_mode": mode,
+            "final_target_policy": policy,
             "effective_target_min": int(effective_min),
             "effective_target_max": int(effective_max),
             "auto_target": dict(auto_details),
             "pre_retarget_count": int(pre_count),
             "post_retarget_count": int(post_count),
             "retarget_reason": reason,
+            "final_reject_reason": str(final_reject_reason),
             "motion_bins_occupied_before": int(pre_motion_bins),
             "motion_bins_occupied_after": int(post_motion_bins),
         }
@@ -2705,7 +3285,10 @@ class KeyframeSelector:
         logger.info(
             "keyframe_policy, "
             f"pose_backend={colmap_runtime['pose_backend']}, "
+            f"pipeline={colmap_runtime.get('pipeline_mode', 'legacy')}, "
+            f"minimal_mode={bool(colmap_runtime.get('minimal_mode', False))}, "
             f"policy={colmap_runtime['policy']}, "
+            f"profile={colmap_runtime.get('selection_profile', 'legacy')}, "
             f"target_mode={colmap_runtime['target_mode']}, "
             f"target={colmap_runtime['target_min']}-{colmap_runtime['target_max']}, "
             f"nms={colmap_runtime['effective_nms_window']:.2f}, "
@@ -2717,11 +3300,20 @@ class KeyframeSelector:
         )
         self.last_selection_runtime = {
             "pose_backend": colmap_runtime["pose_backend"],
+            "pipeline_mode": str(colmap_runtime.get("pipeline_mode", "legacy")),
+            "minimal_mode": bool(colmap_runtime.get("minimal_mode", False)),
+            "disabled_components": list(colmap_runtime.get("disabled_components", [])),
             "policy": colmap_runtime["policy"],
+            "selection_profile": colmap_runtime.get("selection_profile", "legacy"),
             "target_mode": colmap_runtime["target_mode"],
             "effective_stage_plan": colmap_runtime["effective_stage_plan"],
             "stage1_candidates_raw": 0,
             "stage1_candidates_effective": 0,
+            "stage15_entry_count": 0,
+            "stage15_drop_reason_counts": {},
+            "stage0_executed_count": 0,
+            "stage3_executed_count": 0,
+            "stage2_read_success_count": 0,
             "stage1_adaptive_threshold_base": float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50))),
             "stage1_adaptive_threshold_effective": float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50))),
             "stage1_bin_floor_added_count": 0,
@@ -2733,11 +3325,21 @@ class KeyframeSelector:
             "pre_retarget_count": 0,
             "post_retarget_count": 0,
             "retarget_reason": "n/a",
+            "final_target_policy": str(colmap_runtime.get("colmap_final_target_policy", "soft_auto")),
+            "final_target_soft_range": [
+                int(colmap_runtime.get("colmap_final_soft_min", 80)),
+                int(colmap_runtime.get("colmap_final_soft_max", 220)),
+            ],
+            "final_reject_reason": "",
             "effective_target_min": int(colmap_runtime["target_min"]),
             "effective_target_max": int(colmap_runtime["target_max"]),
             "auto_target": {},
             "coverage_before": {},
             "coverage_after": {},
+            "coverage_bins_before_stage15": 0,
+            "coverage_bins_after_stage15": 0,
+            "coverage_bins_before_final": 0,
+            "coverage_bins_after_final": 0,
         }
 
         def _stage_start(stage: str, **kwargs):
@@ -2795,6 +3397,7 @@ class KeyframeSelector:
             mode_enable_stage3 = True
 
         try:
+            selection_trace_rows: List[Dict[str, Any]] = []
             # ===== Stage 0 only mode =====
             if analysis_mode == "stage0":
                 current_stage = "0"
@@ -2857,6 +3460,17 @@ class KeyframeSelector:
                 )
             stage1_candidates, stage1_records = store.load_stage1()
             self.stage1_quality_records = list(stage1_records)
+            stage1_lr_merge_mode = str(
+                self.config.get("STAGE1_LR_MERGE_MODE", self.config.get("stage1_lr_merge_mode", "asymmetric_sky_v1"))
+                or "asymmetric_sky_v1"
+            ).strip().lower()
+            if stage1_lr_merge_mode not in {"asymmetric_sky_v1", "strict_min"}:
+                stage1_lr_merge_mode = "asymmetric_sky_v1"
+            stage1_lr_summary = self._summarize_stage1_lr_statistics(
+                list(stage1_records),
+                quality_threshold=float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50))),
+                merge_mode=stage1_lr_merge_mode,
+            )
             stage1_candidates_raw = sorted(
                 [dict(c) for c in stage1_candidates if isinstance(c, dict)],
                 key=lambda x: int(x.get("frame_idx", 0)),
@@ -2954,8 +3568,85 @@ class KeyframeSelector:
                     "stage1_threshold_added_count": int(stage1_adaptive_info.get("threshold_added_count", 0)),
                     "stage1_bin_floor_added_count": int(stage1_adaptive_info.get("bin_floor_added_count", 0)),
                     "stage1_backfill_added_count": int(stage1_backfill_info.get("added", 0)),
+                    "stage1_lr_merge_mode": str(stage1_lr_summary.get("stage1_lr_merge_mode", "")),
+                    "stage1_lr_merge_counts": dict(stage1_lr_summary.get("stage1_lr_merge_counts", {})),
+                    "stage1_lens_pass_matrix": dict(stage1_lr_summary.get("stage1_lens_pass_matrix", {})),
+                    "stage1_sky_asymmetry_stats": dict(stage1_lr_summary.get("stage1_sky_asymmetry_stats", {})),
                 }
             )
+
+            # ===== Stage 1.5: COLMAP no-VO coverage entry budgeting =====
+            stage15_info: Dict[str, Any] = {
+                "entry_count": 0 if colmap_runtime["minimal_mode"] else int(len(stage1_candidates)),
+                "drop_reason_counts": {},
+                "coverage_bins_before": 0 if colmap_runtime["minimal_mode"] else self._count_time_bins_occupied(
+                    [int(c.get("frame_idx", -1)) for c in stage1_candidates if int(c.get("frame_idx", -1)) >= 0],
+                    total_frames=int(total_frames),
+                    bins=24,
+                ),
+                "coverage_bins_after": 0 if colmap_runtime["minimal_mode"] else self._count_time_bins_occupied(
+                    [int(c.get("frame_idx", -1)) for c in stage1_candidates if int(c.get("frame_idx", -1)) >= 0],
+                    total_frames=int(total_frames),
+                    bins=24,
+                ),
+            }
+            if (
+                (not colmap_runtime["minimal_mode"])
+                and colmap_runtime["colmap_shortcut"]
+                and str(colmap_runtime.get("selection_profile", "legacy")) == "no_vo_coverage"
+            ):
+                stage15_file = store.run_dir / store.STAGE15_CANDIDATES_FILE
+                if resume_enabled and stage15_file.exists():
+                    stage15_rows = [dict(c) for c in store.load_stage15() if isinstance(c, dict)]
+                    if stage15_rows:
+                        stage1_candidates = sorted(stage15_rows, key=lambda x: int(x.get("frame_idx", 0)))
+                        stage15_info["entry_count"] = int(len(stage1_candidates))
+                        stage15_info["coverage_bins_after"] = self._count_time_bins_occupied(
+                            [int(c.get("frame_idx", -1)) for c in stage1_candidates if int(c.get("frame_idx", -1)) >= 0],
+                            total_frames=int(total_frames),
+                            bins=24,
+                        )
+                else:
+                    stage1_candidates, stage15_info, stage15_trace_rows = self._run_stage15_entry_budget(
+                        stage1_candidates,
+                        total_frames=int(total_frames),
+                        video_loader=video_loader,
+                        entry_budget=int(colmap_runtime.get("colmap_stage2_entry_budget", 180)),
+                        min_gap=int(colmap_runtime.get("colmap_stage2_entry_min_gap", 3)),
+                        diversity_ssim_threshold=float(colmap_runtime.get("colmap_diversity_ssim_threshold", 0.93)),
+                        diversity_phash_hamming=int(colmap_runtime.get("colmap_diversity_phash_hamming", 10)),
+                    )
+                    selection_trace_rows.extend(stage15_trace_rows)
+                    stage15_path = store.save_stage15(stage1_candidates)
+                    store.mark_stage_done(
+                        "1.5",
+                        files={"candidates": stage15_path},
+                        counts={"entry_count": int(len(stage1_candidates))},
+                    )
+                logger.info(
+                    "stage1_5_summary, "
+                    f"entry_count={int(stage15_info.get('entry_count', len(stage1_candidates)))}, "
+                    f"coverage_bins={int(stage15_info.get('coverage_bins_before', 0))}->{int(stage15_info.get('coverage_bins_after', 0))}, "
+                    f"drop_reason_counts={dict(stage15_info.get('drop_reason_counts', {}))}"
+                )
+                self.last_selection_runtime.update(
+                    {
+                        "stage15_entry_count": int(stage15_info.get("entry_count", len(stage1_candidates))),
+                        "stage15_drop_reason_counts": dict(stage15_info.get("drop_reason_counts", {})),
+                        "coverage_bins_before_stage15": int(stage15_info.get("coverage_bins_before", 0)),
+                        "coverage_bins_after_stage15": int(stage15_info.get("coverage_bins_after", 0)),
+                        "stage1_candidates_effective": int(len(stage1_candidates)),
+                    }
+                )
+            elif colmap_runtime["minimal_mode"]:
+                self.last_selection_runtime.update(
+                    {
+                        "stage15_entry_count": 0,
+                        "stage15_drop_reason_counts": {},
+                        "coverage_bins_before_stage15": 0,
+                        "coverage_bins_after_stage15": 0,
+                    }
+                )
 
             if not stage1_candidates:
                 logger.warning("Stage 1でフレームが残りませんでした")
@@ -2985,6 +3676,7 @@ class KeyframeSelector:
             }
             effective_motion_window = 0.0
             if mode_enable_stage0:
+                self.last_selection_runtime["stage0_executed_count"] = 1
                 t_stage0 = perf_counter() if profile_enabled else 0.0
                 _stage_start("0", total_frames=total_frames, stride=int(self.config.get("STAGE0_STRIDE", 5)))
                 if resume_enabled and store.has_stage0():
@@ -3006,6 +3698,9 @@ class KeyframeSelector:
                 _stage_summary("0", samples=len(stage0_metrics), temp_file=str(store.run_dir / store.STAGE0_METRICS_FILE))
                 if profile_enabled:
                     _profile_log("0", perf_counter() - t_stage0, len(stage0_metrics))
+            else:
+                self.last_selection_runtime["stage0_executed_count"] = 0
+                _stage_summary("0", samples=0, skipped="disabled")
             if colmap_runtime["colmap_shortcut"] and bool(colmap_runtime.get("colmap_motion_aware_selection", True)):
                 cumulative_motion_map, motion_map_info = self._build_cumulative_motion_map(
                     stage0_metrics,
@@ -3065,7 +3760,35 @@ class KeyframeSelector:
             current_stage = "2"
             t_stage2 = perf_counter() if profile_enabled else 0.0
             stage2_records: List[Stage2FrameRecord] = []
-            if colmap_runtime["stage1_only"]:
+            if colmap_runtime["minimal_mode"]:
+                _stage_start("2", candidates=len(stage1_candidates), mode="minimal_v1")
+                logger.info(
+                    "Stage 2(minimal_v1): read_successフレームを全採用（optical_flowは記録のみ）"
+                )
+                if resume_enabled and store.has_stage2():
+                    logger.info("Stage 2(minimal_v1): テンポラリ結果を再利用")
+                    stage2_candidate_rows, stage2_record_rows = store.load_stage2()
+                    stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
+                    stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+                else:
+                    stage2_candidates, stage2_records = self._stage2_minimal_motion_only_evaluation(
+                        video_loader,
+                        metadata,
+                        stage1_candidates,
+                        progress_callback,
+                    )
+                    stage2_candidate_rows = [self._serialize_keyframe_info(c) for c in stage2_candidates]
+                    stage2_record_rows = [self._serialize_stage2_record(r) for r in stage2_records]
+                    stage2_files = store.save_stage2(stage2_candidate_rows, stage2_record_rows)
+                    store.mark_stage_done(
+                        "2",
+                        files=stage2_files,
+                        counts={"candidates": len(stage2_candidate_rows), "records": len(stage2_record_rows)},
+                    )
+                    stage2_candidate_rows, stage2_record_rows = store.load_stage2()
+                    stage2_candidates = [self._deserialize_keyframe_info(row) for row in stage2_candidate_rows]
+                    stage2_records = [self._deserialize_stage2_record(row) for row in stage2_record_rows]
+            elif colmap_runtime["stage1_only"]:
                 _stage_start("2", candidates=len(stage1_candidates), mode="stage1_only")
                 logger.info("Stage 2: stage1_only policy により Stage1候補を直接利用します")
                 stage2_candidates = self._build_stage1_keyframes(stage1_candidates, fps=metadata.fps)
@@ -3127,30 +3850,46 @@ class KeyframeSelector:
             stage2_drop_reason_counts = dict(
                 Counter(str(getattr(r, "drop_reason", "") or "unknown") for r in stage2_records)
             )
+            stage2_read_success_count = int(
+                sum(
+                    1
+                    for r in stage2_records
+                    if str(getattr(r, "drop_reason", "") or "") != "read_fail"
+                )
+            )
+            if not stage2_records and not colmap_runtime["minimal_mode"]:
+                stage2_read_success_count = int(len(stage2_candidates))
             self.last_selection_runtime["stage2_drop_reason_counts"] = dict(stage2_drop_reason_counts)
+            self.last_selection_runtime["stage2_read_success_count"] = int(stage2_read_success_count)
             if stage2_drop_reason_counts:
                 logger.info(f"stage2_drop_reason_counts, {stage2_drop_reason_counts}")
 
-            stage2_keyframes_pre_stage3 = self._enforce_max_interval(
-                self._apply_nms(
-                    stage2_candidates,
-                    time_window=colmap_runtime["effective_nms_window"],
-                    cumulative_motion_map=cumulative_motion_map,
-                    motion_window=effective_motion_window,
-                    motion_aware_selection=bool(colmap_runtime.get("colmap_motion_aware_selection", True)),
-                ),
-                metadata.fps,
-                source_candidates=stage2_candidates,
-            )
+            if colmap_runtime["minimal_mode"]:
+                stage2_keyframes_pre_stage3 = list(stage2_candidates)
+            else:
+                stage2_keyframes_pre_stage3 = self._enforce_max_interval(
+                    self._apply_nms(
+                        stage2_candidates,
+                        time_window=colmap_runtime["effective_nms_window"],
+                        cumulative_motion_map=cumulative_motion_map,
+                        motion_window=effective_motion_window,
+                        motion_aware_selection=bool(colmap_runtime.get("colmap_motion_aware_selection", True)),
+                    ),
+                    metadata.fps,
+                    source_candidates=stage2_candidates,
+                )
 
             # ===== Stage 3: 軌跡再評価 =====
             current_stage = "3"
             keyframes = stage2_keyframes_pre_stage3
+            stage3_executed_count = 0
             if mode_enable_stage3 and resume_enabled and store.has_stage3():
+                stage3_executed_count = 1
                 logger.info("Stage 3: テンポラリ結果を再利用")
                 keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
             else:
                 if mode_enable_stage3:
+                    stage3_executed_count = 1
                     t_stage3 = perf_counter() if profile_enabled else 0.0
                     _stage_start("3", input_candidates=len(stage2_candidates))
                     logger.info("Stage 3: 軌跡再評価開始")
@@ -3178,11 +3917,25 @@ class KeyframeSelector:
                         _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
                 stage3_rows = [self._serialize_keyframe_info(kf) for kf in keyframes]
                 stage3_path = store.save_stage3(stage3_rows)
-                store.mark_stage_done("3", files={"keyframes": stage3_path}, counts={"keyframes": len(stage3_rows)})
+                stage3_counts = (
+                    {"keyframes": 0, "compat_keyframes": len(stage3_rows)}
+                    if colmap_runtime["minimal_mode"]
+                    else {"keyframes": len(stage3_rows)}
+                )
+                store.mark_stage_done("3", files={"keyframes": stage3_path}, counts=stage3_counts)
                 keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
 
+            if colmap_runtime["minimal_mode"]:
+                stage3_executed_count = 0
+            self.last_selection_runtime["stage3_executed_count"] = int(stage3_executed_count)
             logger.info(f"Stage 3完了: {len(keyframes)}個")
-            _stage_summary("3", keyframes=len(keyframes), temp_file=str(store.run_dir / store.STAGE3_KEYFRAMES_FILE))
+            _stage_summary(
+                "3",
+                keyframes=(0 if colmap_runtime["minimal_mode"] else len(keyframes)),
+                compat_keyframes=len(keyframes),
+                temp_file=str(store.run_dir / store.STAGE3_KEYFRAMES_FILE),
+                skipped=("minimal_v1" if colmap_runtime["minimal_mode"] else ""),
+            )
 
             pre_retarget_count = len(keyframes)
             post_retarget_count = pre_retarget_count
@@ -3190,7 +3943,22 @@ class KeyframeSelector:
             retarget: Dict[str, Any] = {}
             coverage_before = self._compute_temporal_coverage(keyframes, total_frames=int(total_frames))
             coverage_after = dict(coverage_before)
-            if colmap_runtime["colmap_shortcut"]:
+            coverage_bins_before_final = self._count_time_bins_occupied(
+                [int(k.frame_index) for k in keyframes],
+                total_frames=int(total_frames),
+                bins=24,
+            )
+            coverage_bins_after_final = int(coverage_bins_before_final)
+            if colmap_runtime["minimal_mode"]:
+                retarget_reason = "disabled_minimal_mode"
+                retarget = {
+                    "retarget_reason": "disabled_minimal_mode",
+                    "target_mode": colmap_runtime["target_mode"],
+                    "effective_target_min": int(colmap_runtime["target_min"]),
+                    "effective_target_max": int(colmap_runtime["target_max"]),
+                    "post_retarget_count": int(len(keyframes)),
+                }
+            elif colmap_runtime["colmap_shortcut"]:
                 keyframes, retarget = self._retarget_keyframes_for_colmap(
                     keyframes,
                     stage1_candidates,
@@ -3205,26 +3973,55 @@ class KeyframeSelector:
                         if bool(colmap_runtime.get("colmap_motion_aware_selection", True))
                         else None
                     ),
+                    final_target_policy=str(colmap_runtime.get("colmap_final_target_policy", "soft_auto")),
+                    final_soft_min=int(colmap_runtime.get("colmap_final_soft_min", 80)),
+                    final_soft_max=int(colmap_runtime.get("colmap_final_soft_max", 220)),
+                    no_supplement_on_low_quality=bool(colmap_runtime.get("colmap_no_supplement_on_low_quality", True)),
                 )
                 post_retarget_count = int(retarget.get("post_retarget_count", len(keyframes)))
                 retarget_reason = str(retarget.get("retarget_reason", "n/a"))
                 coverage_after = self._compute_temporal_coverage(keyframes, total_frames=int(total_frames))
+                coverage_bins_after_final = self._count_time_bins_occupied(
+                    [int(k.frame_index) for k in keyframes],
+                    total_frames=int(total_frames),
+                    bins=24,
+                )
                 logger.info(
                     "keyframe_retarget, "
                     f"policy={colmap_runtime['policy']}, "
+                    f"final_policy={str(retarget.get('final_target_policy', colmap_runtime.get('colmap_final_target_policy', 'soft_auto')))}, "
                     f"target_mode={str(retarget.get('target_mode', colmap_runtime['target_mode']))}, "
                     f"target={int(retarget.get('effective_target_min', colmap_runtime['target_min']))}"
                     f"-{int(retarget.get('effective_target_max', colmap_runtime['target_max']))}, "
                     f"before={pre_retarget_count}, after={post_retarget_count}, "
                     f"coverage={coverage_before.get('coverage_ratio', 0.0):.3f}->{coverage_after.get('coverage_ratio', 0.0):.3f}, "
                     f"max_gap={coverage_before.get('max_gap_frames', 0)}->{coverage_after.get('max_gap_frames', 0)}, "
-                    f"reason={retarget_reason}, auto={retarget.get('auto_target', {})}"
+                    f"reason={retarget_reason}, reject={retarget.get('final_reject_reason', '')}, auto={retarget.get('auto_target', {})}"
+                )
+            for kf in keyframes:
+                selection_trace_rows.append(
+                    {
+                        "frame": int(kf.frame_index),
+                        "stage": "final",
+                        "kept": 1,
+                        "reason": "selected",
+                        "score_quality": float(kf.quality_scores.get("quality", 0.0) if isinstance(kf.quality_scores, dict) else 0.0),
+                        "score_novelty_ssim": "",
+                        "score_novelty_phash": "",
+                        "score_combined": float(kf.combined_score),
+                    }
                 )
             self.last_selection_runtime.update(
                 {
                     "pre_retarget_count": int(pre_retarget_count),
                     "post_retarget_count": int(post_retarget_count),
                     "retarget_reason": retarget_reason,
+                    "final_target_policy": str(retarget.get("final_target_policy", colmap_runtime.get("colmap_final_target_policy", "soft_auto"))),
+                    "final_target_soft_range": [
+                        int(colmap_runtime.get("colmap_final_soft_min", 80)),
+                        int(colmap_runtime.get("colmap_final_soft_max", 220)),
+                    ],
+                    "final_reject_reason": str(retarget.get("final_reject_reason", "")),
                     "effective_target_min": int(
                         retarget.get("effective_target_min", colmap_runtime["target_min"])
                     ) if colmap_runtime["colmap_shortcut"] else int(colmap_runtime["target_min"]),
@@ -3236,11 +4033,23 @@ class KeyframeSelector:
                     "coverage_after": dict(coverage_after),
                     "motion_bins_occupied_before": int(retarget.get("motion_bins_occupied_before", 0)),
                     "motion_bins_occupied_after": int(retarget.get("motion_bins_occupied_after", 0)),
+                    "coverage_bins_before_final": int(coverage_bins_before_final),
+                    "coverage_bins_after_final": int(coverage_bins_after_final),
                 }
             )
+            selection_trace_path = None
+            if selection_trace_rows:
+                try:
+                    selection_trace_path = store.run_dir / "selection_trace.csv"
+                    self._save_selection_trace_csv(selection_trace_path, selection_trace_rows)
+                    logger.info(f"selection_trace_saved, path={selection_trace_path}")
+                except Exception:
+                    logger.debug("selection trace save failed")
             analysis_summary_payload = {
                 "analysis_run_id": str(run_id),
                 "analysis_mode": str(analysis_mode),
+                "minimal_mode": bool(colmap_runtime.get("minimal_mode", False)),
+                "disabled_components": list(colmap_runtime.get("disabled_components", [])),
                 "total_frames": int(total_frames),
                 "fps": float(metadata.fps),
                 "stage_plan": str(colmap_runtime.get("effective_stage_plan", "Stage1->Stage2->Stage3")),
@@ -3249,30 +4058,58 @@ class KeyframeSelector:
                     "stage1_candidates_raw": int(len(stage1_candidates_raw)),
                     "stage1_candidates_effective": int(len(stage1_candidates)),
                     "stage1_candidates": int(len(stage1_candidates)),
+                    "stage15_entry_count": int(
+                        0 if colmap_runtime["minimal_mode"] else stage15_info.get("entry_count", len(stage1_candidates))
+                    ),
                     "stage1_records": int(len(stage1_records)),
                     "stage0_samples": int(len(stage0_metrics)),
                     "stage2_candidates": int(len(stage2_candidates)),
                     "stage2_records": int(len(stage2_records)),
+                    "stage2_read_success_count": int(stage2_read_success_count),
                     "stage3_keyframes_pre_retarget": int(pre_retarget_count),
-                    "final_keyframes": int(len(keyframes)),
+                    "final_keyframes": int(
+                        stage2_read_success_count if colmap_runtime["minimal_mode"] else len(keyframes)
+                    ),
+                    "stage0_executed_count": int(self.last_selection_runtime.get("stage0_executed_count", 0)),
+                    "stage3_executed_count": int(self.last_selection_runtime.get("stage3_executed_count", 0)),
                 },
                 "stage1_candidates_raw": int(len(stage1_candidates_raw)),
                 "stage1_candidates_effective": int(len(stage1_candidates)),
+                "stage15_entry_count": int(
+                    0 if colmap_runtime["minimal_mode"] else stage15_info.get("entry_count", len(stage1_candidates))
+                ),
+                "stage15_drop_reason_counts": dict(stage15_info.get("drop_reason_counts", {})),
+                "stage2_read_success_count": int(stage2_read_success_count),
                 "stage1_adaptive_threshold_base": float(stage1_adaptive_info.get("base_threshold", 0.0)),
                 "stage1_adaptive_threshold_effective": float(stage1_adaptive_info.get("effective_threshold", 0.0)),
                 "stage1_q_pass_target": float(stage1_adaptive_info.get("q_pass_target", 0.0)),
                 "stage1_bin_floor_added_count": int(stage1_adaptive_info.get("bin_floor_added_count", 0)),
+                "stage1_lr_merge_mode": str(stage1_lr_summary.get("stage1_lr_merge_mode", "")),
+                "stage1_lr_merge_counts": dict(stage1_lr_summary.get("stage1_lr_merge_counts", {})),
+                "stage1_lens_pass_matrix": dict(stage1_lr_summary.get("stage1_lens_pass_matrix", {})),
+                "stage1_sky_asymmetry_stats": dict(stage1_lr_summary.get("stage1_sky_asymmetry_stats", {})),
                 "motion_median_step": float(motion_map_info.get("motion_median_step", 0.0)),
                 "effective_motion_window": float(effective_motion_window),
                 "motion_bins_occupied_before": int(retarget.get("motion_bins_occupied_before", 0)),
                 "motion_bins_occupied_after_retarget": int(retarget.get("motion_bins_occupied_after", 0)),
+                "coverage_bins_before_stage15": int(stage15_info.get("coverage_bins_before", 0)),
+                "coverage_bins_after_stage15": int(stage15_info.get("coverage_bins_after", 0)),
+                "coverage_bins_before_final": int(coverage_bins_before_final),
+                "coverage_bins_after_final": int(coverage_bins_after_final),
                 "stage2_drop_reason_counts": dict(stage2_drop_reason_counts),
+                "final_target_policy": str(retarget.get("final_target_policy", colmap_runtime.get("colmap_final_target_policy", "soft_auto"))),
+                "final_target_soft_range": [
+                    int(colmap_runtime.get("colmap_final_soft_min", 80)),
+                    int(colmap_runtime.get("colmap_final_soft_max", 220)),
+                ],
+                "final_reject_reason": str(retarget.get("final_reject_reason", "")),
                 "retarget": {
                     "reason": str(retarget_reason),
                     "details": dict(retarget),
                     "coverage_before": dict(coverage_before),
                     "coverage_after": dict(coverage_after),
                 },
+                "selection_trace_csv": str(selection_trace_path) if selection_trace_path is not None else "",
                 "selection_runtime": dict(self.last_selection_runtime),
             }
             summary_path = None
@@ -3389,6 +4226,51 @@ class KeyframeSelector:
             "quality_weight_keypoints": float(max(0.0, self.config.get('QUALITY_WEIGHT_KEYPOINTS', 0.15))),
         }
         quality_fields = ("laplacian_var", "tenengrad", "exposure", "orb_keypoints")
+        stage1_lr_merge_mode = str(
+            self.config.get("STAGE1_LR_MERGE_MODE", self.config.get("stage1_lr_merge_mode", "asymmetric_sky_v1")) or "asymmetric_sky_v1"
+        ).strip().lower()
+        if stage1_lr_merge_mode not in {"asymmetric_sky_v1", "strict_min"}:
+            stage1_lr_merge_mode = "asymmetric_sky_v1"
+        stage1_lr_asym_weak_floor = float(
+            np.clip(
+                self.config.get("STAGE1_LR_ASYM_WEAK_FLOOR", self.config.get("stage1_lr_asym_weak_floor", 0.35)),
+                0.0,
+                1.0,
+            )
+        )
+        stage1_lr_sky_ratio_threshold = float(
+            np.clip(
+                self.config.get("STAGE1_LR_SKY_RATIO_THRESHOLD", self.config.get("stage1_lr_sky_ratio_threshold", 0.55)),
+                0.0,
+                1.0,
+            )
+        )
+        stage1_lr_sky_ratio_diff_threshold = float(
+            np.clip(
+                self.config.get(
+                    "STAGE1_LR_SKY_RATIO_DIFF_THRESHOLD",
+                    self.config.get("stage1_lr_sky_ratio_diff_threshold", 0.20),
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        stage1_lr_quality_gap_threshold = float(
+            np.clip(
+                self.config.get(
+                    "STAGE1_LR_QUALITY_GAP_THRESHOLD",
+                    self.config.get("stage1_lr_quality_gap_threshold", 0.15),
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        stage1_lr_semantic_sky_enabled = bool(
+            self.config.get(
+                "STAGE1_LR_SEMANTIC_SKY_ENABLED",
+                self.config.get("stage1_lr_semantic_sky_enabled", True),
+            )
+        )
 
         is_paired = hasattr(video_loader, 'is_paired') and video_loader.is_paired
         use_fisheye_border_mask = self._is_fisheye_border_mask_enabled(is_paired)
@@ -3472,6 +4354,14 @@ class KeyframeSelector:
                                 "timestamp": timestamp,
                                 "lens_a_raw": raw_a,
                                 "lens_b_raw": raw_b,
+                                "sky_ratio_lens_a": (
+                                    self._estimate_sky_ratio(frame_a, cached_mask_a if use_fisheye_border_mask else None)
+                                    if stage1_lr_semantic_sky_enabled else 0.0
+                                ),
+                                "sky_ratio_lens_b": (
+                                    self._estimate_sky_ratio(frame_b, cached_mask_b if use_fisheye_border_mask else None)
+                                    if stage1_lr_semantic_sky_enabled else 0.0
+                                ),
                             }
                         )
                     else:
@@ -3517,33 +4407,117 @@ class KeyframeSelector:
                 fields=quality_fields,
             )
 
+            effective_sky_ratio_threshold = float(stage1_lr_sky_ratio_threshold)
+            effective_weak_floor = float(stage1_lr_asym_weak_floor)
+            stage1_lr_auto_relaxed = False
+            if stage1_lr_merge_mode == "asymmetric_sky_v1" and stage1_lr_semantic_sky_enabled and pair_entries:
+                sky_max_values = [
+                    float(
+                        max(
+                            float(entry.get("sky_ratio_lens_a", 0.0)),
+                            float(entry.get("sky_ratio_lens_b", 0.0)),
+                        )
+                    )
+                    for entry in pair_entries
+                ]
+                sky_max_arr = np.asarray(sky_max_values, dtype=np.float64)
+                observed_sky_max = float(np.max(sky_max_arr)) if sky_max_arr.size > 0 else 0.0
+                if observed_sky_max + 1e-9 < effective_sky_ratio_threshold:
+                    observed_sky_p90 = float(np.percentile(sky_max_arr, 90)) if sky_max_arr.size > 0 else observed_sky_max
+                    effective_sky_ratio_threshold = float(
+                        np.clip(
+                            max(0.20, min(0.35, observed_sky_p90)),
+                            0.0,
+                            1.0,
+                        )
+                    )
+                    # Keep weak-side quality guard, but relax one step to avoid dead zone.
+                    effective_weak_floor = float(min(effective_weak_floor, 0.30))
+                    stage1_lr_auto_relaxed = True
+                    logger.warning(
+                        "stage1_lr_auto_relax_applied,"
+                        f" configured_sky_threshold={stage1_lr_sky_ratio_threshold:.3f},"
+                        f" effective_sky_threshold={effective_sky_ratio_threshold:.3f},"
+                        f" configured_weak_floor={stage1_lr_asym_weak_floor:.3f},"
+                        f" effective_weak_floor={effective_weak_floor:.3f},"
+                        f" observed_sky_max={observed_sky_max:.3f},"
+                        f" observed_sky_p90={observed_sky_p90:.3f}"
+                    )
+
             for entry, norm_a, norm_b in zip(pair_entries, norm_a_list, norm_b_list):
                 frame_idx = int(entry["frame_idx"])
                 raw_a = entry["lens_a_raw"]
                 raw_b = entry["lens_b_raw"]
+                sky_ratio_a = float(np.clip(entry.get("sky_ratio_lens_a", 0.0), 0.0, 1.0))
+                sky_ratio_b = float(np.clip(entry.get("sky_ratio_lens_b", 0.0), 0.0, 1.0))
                 quality_a = compose_quality(norm_a, quality_weights)
                 quality_b = compose_quality(norm_b, quality_weights)
-                quality = float(min(quality_a, quality_b))
-
                 abs_ok_a = apply_abs_guard(raw_a.get("laplacian_var", 0.0), quality_abs_laplacian_min)
                 abs_ok_b = apply_abs_guard(raw_b.get("laplacian_var", 0.0), quality_abs_laplacian_min)
-                abs_ok = bool(abs_ok_a and abs_ok_b)
+
+                quality_min = float(min(quality_a, quality_b))
+                quality_max = float(max(quality_a, quality_b))
+                quality_gap = float(quality_max - quality_min)
+                sky_max = float(max(sky_ratio_a, sky_ratio_b))
+                sky_diff = float(abs(sky_ratio_a - sky_ratio_b))
+                dominant_lens = "a" if quality_a >= quality_b else "b"
+                weak_lens = "b" if dominant_lens == "a" else "a"
+                asym_eligible = bool(
+                    stage1_lr_merge_mode == "asymmetric_sky_v1"
+                    and quality_gap >= stage1_lr_quality_gap_threshold
+                    and sky_max >= effective_sky_ratio_threshold
+                    and sky_diff >= stage1_lr_sky_ratio_diff_threshold
+                )
+
+                if asym_eligible:
+                    quality = quality_max
+                    abs_ok = bool(abs_ok_a if dominant_lens == "a" else abs_ok_b)
+                    weak_quality_ok = bool(quality_min >= effective_weak_floor)
+                    quality_merge_strategy = "asymmetric_max_with_weak_floor"
+                    merge_mode_applied = "asymmetric_sky_v1"
+                else:
+                    quality = quality_min
+                    abs_ok = bool(abs_ok_a and abs_ok_b)
+                    weak_quality_ok = True
+                    quality_merge_strategy = "strict_min"
+                    merge_mode_applied = "strict_min"
+
                 quality_ok = bool(quality >= quality_threshold)
-                passes = bool(quality_ok and abs_ok)
+                passes = bool(quality_ok and abs_ok and weak_quality_ok)
                 drop_reason = "pass"
                 if not abs_ok:
                     drop_reason = "abs_laplacian_guard"
+                elif not weak_quality_ok:
+                    drop_reason = "lr_weak_floor"
                 elif not quality_ok:
                     drop_reason = "quality_below_threshold"
 
                 quality_scores = {
-                    "sharpness": float(min(raw_a.get("laplacian_var", 0.0), raw_b.get("laplacian_var", 0.0))),
-                    "exposure": float(min(raw_a.get("exposure", 0.0), raw_b.get("exposure", 0.0))),
+                    "sharpness": float(
+                        raw_a.get("laplacian_var", 0.0) if asym_eligible and dominant_lens == "a"
+                        else raw_b.get("laplacian_var", 0.0) if asym_eligible and dominant_lens == "b"
+                        else min(raw_a.get("laplacian_var", 0.0), raw_b.get("laplacian_var", 0.0))
+                    ),
+                    "exposure": float(
+                        raw_a.get("exposure", 0.0) if asym_eligible and dominant_lens == "a"
+                        else raw_b.get("exposure", 0.0) if asym_eligible and dominant_lens == "b"
+                        else min(raw_a.get("exposure", 0.0), raw_b.get("exposure", 0.0))
+                    ),
                     "motion_blur": 0.0,
                     "softmax_depth": 0.0,
-                    "quality": quality,
-                    "quality_lens_a": quality_a,
-                    "quality_lens_b": quality_b,
+                    "quality": float(quality),
+                    "quality_lens_a": float(quality_a),
+                    "quality_lens_b": float(quality_b),
+                    "sky_ratio_lens_a": float(sky_ratio_a),
+                    "sky_ratio_lens_b": float(sky_ratio_b),
+                    "lr_asym_eligible": bool(asym_eligible),
+                    "lr_dominant_lens": str(dominant_lens),
+                    "lr_weak_lens": str(weak_lens),
+                    "lr_weak_floor": float(effective_weak_floor),
+                    "lr_sky_ratio_threshold": float(effective_sky_ratio_threshold),
+                    "lr_auto_relaxed": bool(stage1_lr_auto_relaxed),
+                    "quality_merge_strategy": str(quality_merge_strategy),
+                    "lr_merge_mode_applied": str(merge_mode_applied),
                     "lens_a": {
                         "raw": dict(raw_a),
                         "norm": {k: float(norm_a.get(f"norm_{k}", 0.0)) for k in quality_fields},
@@ -3561,11 +4535,21 @@ class KeyframeSelector:
                     {
                         "frame_index": frame_idx,
                         "timestamp": float(entry["timestamp"]),
-                        "quality": quality,
-                        "quality_lens_a": quality_a,
-                        "quality_lens_b": quality_b,
+                        "quality": float(quality),
+                        "quality_lens_a": float(quality_a),
+                        "quality_lens_b": float(quality_b),
                         "is_pass": passes,
                         "drop_reason": drop_reason,
+                        "sky_ratio_lens_a": float(sky_ratio_a),
+                        "sky_ratio_lens_b": float(sky_ratio_b),
+                        "lr_asym_eligible": bool(asym_eligible),
+                        "lr_dominant_lens": str(dominant_lens),
+                        "lr_weak_lens": str(weak_lens),
+                        "lr_weak_floor": float(effective_weak_floor),
+                        "lr_sky_ratio_threshold": float(effective_sky_ratio_threshold),
+                        "lr_auto_relaxed": bool(stage1_lr_auto_relaxed),
+                        "quality_merge_strategy": str(quality_merge_strategy),
+                        "lr_merge_mode_applied": str(merge_mode_applied),
                         "lens_a_raw": dict(raw_a),
                         "lens_a_norm": {k: float(norm_a.get(f"norm_{k}", 0.0)) for k in quality_fields},
                         "lens_b_raw": dict(raw_b),
@@ -3585,6 +4569,10 @@ class KeyframeSelector:
                     f" mode=paired, records={len(self.stage1_quality_records)},"
                     f" passed={passed_count}, pass_ratio={100.0*passed_count/max(len(self.stage1_quality_records), 1):.2f},"
                     f" threshold={quality_threshold:.3f}, abs_laplacian_min={quality_abs_laplacian_min:.3f},"
+                    f" lr_mode={stage1_lr_merge_mode}, weak_floor={effective_weak_floor:.3f},"
+                    f" sky_thr={effective_sky_ratio_threshold:.3f}, sky_diff_thr={stage1_lr_sky_ratio_diff_threshold:.3f},"
+                    f" lr_auto_relaxed={stage1_lr_auto_relaxed},"
+                    f" q_gap_thr={stage1_lr_quality_gap_threshold:.3f},"
                     f" q50={q50:.4f}, roi={roi_spec.mode}:{roi_spec.ratio:.2f},"
                     f" p_low={quality_norm_p_low:.1f}, p_high={quality_norm_p_high:.1f},"
                     f" stats_a={stats_a}, stats_b={stats_b}"
@@ -4075,6 +5063,285 @@ class KeyframeSelector:
             if cap is not None:
                 cap.release()
                 logger.debug("Stage 2: 独立キャプチャを解放")
+            if cap_a is not None:
+                cap_a.release()
+            if cap_b is not None:
+                cap_b.release()
+
+        return candidates, records
+
+    def _stage2_minimal_motion_only_evaluation(
+        self,
+        video_loader,
+        metadata: VideoMetadata,
+        stage1_candidates: List[Dict],
+        progress_callback: Optional[Callable[[int, int], None]],
+    ) -> Tuple[List[KeyframeInfo], List[Stage2FrameRecord]]:
+        """
+        COLMAP minimal_v1 向け Stage2。
+
+        Stage1候補を順次読み込み、read_fail 以外をすべて採用する。
+        optical_flow は記録のみで、採否判定には利用しない。
+        """
+        candidates: List[KeyframeInfo] = []
+        records: List[Stage2FrameRecord] = []
+        is_paired = hasattr(video_loader, "is_paired") and video_loader.is_paired
+        use_fisheye_border_mask = self._is_fisheye_border_mask_enabled(is_paired)
+        cap = None
+        cap_a = None
+        cap_b = None
+        if not is_paired:
+            video_path = getattr(video_loader, "_video_path", None)
+            if video_path is None:
+                raise RuntimeError("単眼モードのビデオパスが取得できません")
+            cap = self._open_independent_capture(video_path)
+        else:
+            cap_a, cap_b = self._open_independent_pair_captures(video_loader)
+
+        perf_stats = Stage2PerfStats(
+            enabled=bool(self.config.get("STAGE2_PERF_PROFILE", True)),
+            total_candidates=len(stage1_candidates),
+        )
+        stage2_started = perf_counter()
+
+        def _build_metrics(
+            q_scores: Dict[str, float],
+            a_scores: Dict[str, float],
+            combined: float,
+            *,
+            is_keyframe_flag: float,
+            vo_status_reason: str,
+        ) -> Dict[str, Any]:
+            ssim = float(a_scores.get("ssim_pair", a_scores.get("ssim", 1.0)))
+            flow_mag = float(a_scores.get("optical_flow", 0.0))
+            return {
+                "translation_delta": flow_mag,
+                "rotation_delta": float(max(0.0, 1.0 - ssim) * 180.0),
+                "flow_mag": flow_mag,
+                "vo_step_proxy": 0.0,
+                "vo_step_proxy_norm": 0.0,
+                "vo_inlier_ratio": 0.0,
+                "vo_rot_deg": float(max(0.0, 1.0 - ssim) * 180.0),
+                "vo_dir_cos_prev": 0.5,
+                "vo_confidence": 0.0,
+                "vo_feature_uniformity": 0.0,
+                "vo_track_sufficiency": 0.0,
+                "vo_pose_plausibility": 0.0,
+                "vo_tracked_count": 0.0,
+                "vo_essential_method": "none",
+                "laplacian_var": float(q_scores.get("sharpness", 0.0)),
+                "match_count": 0.0,
+                "overlap_ratio": 0.0,
+                "exposure_ratio": float(q_scores.get("exposure", 0.0)),
+                "keyframe_flag": float(is_keyframe_flag),
+                "combined_score": float(combined),
+                "stationary_vo_flag": 0.0,
+                "stationary_flow_flag": 0.0,
+                "is_stationary": 0.0,
+                "stationary_confidence": 0.0,
+                "stationary_penalty_applied": 0.0,
+                "stage0_motion_risk": 0.0,
+                "trajectory_consistency": 0.5,
+                "trajectory_consistency_effective": 0.25,
+                "combined_stage2": float(combined),
+                "combined_stage3": float(combined),
+                "stage3_selected_flag": 0.0,
+                "vo_status_reason": str(vo_status_reason),
+                "vo_pose_valid": 0.0,
+                "vo_attempted": 0.0,
+            }
+
+        def _append_record(
+            frame_idx: int,
+            frame_img: Optional[np.ndarray],
+            q_scores: Dict[str, float],
+            a_scores: Dict[str, float],
+            metrics: Dict[str, Any],
+            *,
+            is_candidate: bool,
+            drop_reason: str,
+        ) -> None:
+            keep_frame = bool(self.config.get("STAGE2_DEFERRED_FRAME_LOG_IMAGES", False))
+            records.append(
+                Stage2FrameRecord(
+                    frame_index=int(frame_idx),
+                    frame=frame_img.copy() if (keep_frame and frame_img is not None) else None,
+                    quality_scores=dict(q_scores),
+                    geometric_scores={},
+                    adaptive_scores=dict(a_scores),
+                    metrics=dict(metrics),
+                    is_candidate=is_candidate,
+                    drop_reason=str(drop_reason),
+                )
+            )
+
+        prev_frame = None
+        prev_pair = None
+        last_read_idx = -1
+        last_read_idx_pair = -1
+        try:
+            for idx, candidate_info in enumerate(stage1_candidates):
+                frame_idx = int(candidate_info.get("frame_idx", 0))
+                quality_scores = dict(candidate_info.get("quality_scores", {}) or {})
+                if progress_callback:
+                    progress_callback(idx, len(stage1_candidates))
+
+                current_frame = None
+                current_pair = None
+                frame_read_started = perf_counter() if perf_stats.enabled else 0.0
+                if is_paired:
+                    if cap_a is not None and cap_b is not None:
+                        if frame_idx != last_read_idx_pair + 1:
+                            cap_a.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            cap_b.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret_a, frame_a = cap_a.read()
+                        ret_b, frame_b = cap_b.read()
+                        last_read_idx_pair = frame_idx
+                        if not ret_a or not ret_b or frame_a is None or frame_b is None:
+                            combined = float(self._compute_combined_score(quality_scores, {}, {}))
+                            metrics = _build_metrics(
+                                quality_scores,
+                                {},
+                                combined,
+                                is_keyframe_flag=0.0,
+                                vo_status_reason="minimal_mode",
+                            )
+                            _append_record(
+                                frame_idx=frame_idx,
+                                frame_img=None,
+                                q_scores=quality_scores,
+                                a_scores={},
+                                metrics=metrics,
+                                is_candidate=False,
+                                drop_reason="read_fail",
+                            )
+                            continue
+                    else:
+                        frame_a, frame_b = video_loader.get_frame_pair(frame_idx)
+                        if frame_a is None or frame_b is None:
+                            combined = float(self._compute_combined_score(quality_scores, {}, {}))
+                            metrics = _build_metrics(
+                                quality_scores,
+                                {},
+                                combined,
+                                is_keyframe_flag=0.0,
+                                vo_status_reason="minimal_mode",
+                            )
+                            _append_record(
+                                frame_idx=frame_idx,
+                                frame_img=None,
+                                q_scores=quality_scores,
+                                a_scores={},
+                                metrics=metrics,
+                                is_candidate=False,
+                                drop_reason="read_fail",
+                            )
+                            continue
+                    if use_fisheye_border_mask:
+                        valid_mask_a = self._create_fisheye_valid_mask(frame_a)
+                        valid_mask_b = self._create_fisheye_valid_mask(frame_b)
+                        frame_a = self.mask_processor.apply_valid_region_mask(frame_a, valid_mask_a, fill_value=0)
+                        frame_b = self.mask_processor.apply_valid_region_mask(frame_b, valid_mask_b, fill_value=0)
+                    current_pair = (frame_a, frame_b)
+                    current_frame = frame_a
+                else:
+                    if frame_idx != last_read_idx + 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, current_frame = cap.read()
+                    last_read_idx = frame_idx
+                    if not ret or current_frame is None:
+                        combined = float(self._compute_combined_score(quality_scores, {}, {}))
+                        metrics = _build_metrics(
+                            quality_scores,
+                            {},
+                            combined,
+                            is_keyframe_flag=0.0,
+                            vo_status_reason="minimal_mode",
+                        )
+                        _append_record(
+                            frame_idx=frame_idx,
+                            frame_img=None,
+                            q_scores=quality_scores,
+                            a_scores={},
+                            metrics=metrics,
+                            is_candidate=False,
+                            drop_reason="read_fail",
+                        )
+                        continue
+                if perf_stats.enabled:
+                    perf_stats.frame_read_s += max(0.0, perf_counter() - frame_read_started)
+                perf_stats.processed_candidates += 1
+
+                adaptive_scores: Dict[str, float] = {}
+                adaptive_started = perf_counter() if perf_stats.enabled else 0.0
+                if is_paired and prev_pair is not None and current_pair is not None:
+                    flow_a = float(self.adaptive_selector.compute_optical_flow_magnitude(prev_pair[0], current_pair[0]))
+                    flow_b = float(self.adaptive_selector.compute_optical_flow_magnitude(prev_pair[1], current_pair[1]))
+                    ssim_a = float(self.adaptive_selector.compute_ssim(prev_pair[0], current_pair[0]))
+                    ssim_b = float(self.adaptive_selector.compute_ssim(prev_pair[1], current_pair[1]))
+                    adaptive_scores["ssim_lens_a"] = ssim_a
+                    adaptive_scores["ssim_lens_b"] = ssim_b
+                    adaptive_scores["ssim_pair"] = float(min(ssim_a, ssim_b))
+                    if self.config.get("PAIR_MOTION_AGGREGATION", "max") == "max":
+                        adaptive_scores["optical_flow"] = float(max(flow_a, flow_b))
+                    else:
+                        adaptive_scores["optical_flow"] = float((flow_a + flow_b) * 0.5)
+                    adaptive_scores["optical_flow_lens_a"] = flow_a
+                    adaptive_scores["optical_flow_lens_b"] = flow_b
+                elif prev_frame is not None and current_frame is not None:
+                    flow_mag = float(self.adaptive_selector.compute_optical_flow_magnitude(prev_frame, current_frame))
+                    ssim = float(self.adaptive_selector.compute_ssim(prev_frame, current_frame))
+                    adaptive_scores["optical_flow"] = flow_mag
+                    adaptive_scores["ssim"] = ssim
+                    adaptive_scores["ssim_pair"] = ssim
+                else:
+                    adaptive_scores["optical_flow"] = 0.0
+                    adaptive_scores["ssim"] = 1.0
+                    adaptive_scores["ssim_pair"] = 1.0
+                if perf_stats.enabled:
+                    perf_stats.adaptive_eval_s += max(0.0, perf_counter() - adaptive_started)
+
+                combined_score = float(self._compute_combined_score(quality_scores, {}, adaptive_scores))
+                candidate = KeyframeInfo(
+                    frame_index=frame_idx,
+                    timestamp=frame_idx / max(float(metadata.fps), 1e-6),
+                    quality_scores=quality_scores,
+                    geometric_scores={},
+                    adaptive_scores=adaptive_scores,
+                    combined_score=combined_score,
+                    thumbnail=None,
+                    is_rescue_mode=False,
+                    is_force_inserted=False,
+                    dynamic_mask=None,
+                )
+                candidates.append(candidate)
+                perf_stats.selected_candidates += 1
+
+                metrics = _build_metrics(
+                    quality_scores,
+                    adaptive_scores,
+                    combined_score,
+                    is_keyframe_flag=1.0,
+                    vo_status_reason="minimal_mode",
+                )
+                _append_record(
+                    frame_idx=frame_idx,
+                    frame_img=current_frame,
+                    q_scores=quality_scores,
+                    a_scores=adaptive_scores,
+                    metrics=metrics,
+                    is_candidate=True,
+                    drop_reason="selected",
+                )
+                prev_frame = current_frame
+                prev_pair = current_pair
+        finally:
+            if perf_stats.enabled:
+                perf_stats.total_s = max(0.0, perf_counter() - stage2_started)
+            self._log_stage2_perf_summary(perf_stats)
+            if cap is not None:
+                cap.release()
+                logger.debug("Stage 2(minimal_v1): 独立キャプチャを解放")
             if cap_a is not None:
                 cap_a.release()
             if cap_b is not None:

@@ -14,6 +14,7 @@ class StageTempStore:
 
     STAGE1_CANDIDATES_FILE = "stage1_candidates.jsonl"
     STAGE1_CANDIDATES_EFFECTIVE_FILE = "stage1_candidates_effective.jsonl"
+    STAGE15_CANDIDATES_FILE = "stage15_candidates.jsonl"
     STAGE1_RECORDS_FILE = "stage1_records.jsonl"
     STAGE0_METRICS_FILE = "stage0_metrics.jsonl"
     STAGE2_CANDIDATES_FILE = "stage2_candidates.jsonl"
@@ -138,11 +139,18 @@ class StageTempStore:
         p = self._write_jsonl(self.STAGE1_CANDIDATES_EFFECTIVE_FILE, candidates)
         return str(p)
 
+    def save_stage15(self, candidates: List[Dict[str, Any]]) -> str:
+        p = self._write_jsonl(self.STAGE15_CANDIDATES_FILE, candidates)
+        return str(p)
+
     def load_stage1(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         return self._read_jsonl(self.STAGE1_CANDIDATES_FILE), self._read_jsonl(self.STAGE1_RECORDS_FILE)
 
     def load_stage1_effective(self) -> List[Dict[str, Any]]:
         return self._read_jsonl(self.STAGE1_CANDIDATES_EFFECTIVE_FILE)
+
+    def load_stage15(self) -> List[Dict[str, Any]]:
+        return self._read_jsonl(self.STAGE15_CANDIDATES_FILE)
 
     def save_stage0(self, metrics: Dict[int, Dict[str, Any]]) -> str:
         rows = []

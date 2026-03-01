@@ -12,6 +12,12 @@ def test_keyframe_config_round_trip():
     assert restored.to_selector_dict()["QUALITY_FILTER_ENABLED"] is True
     assert restored.to_selector_dict()["QUALITY_THRESHOLD"] == pytest.approx(d["QUALITY_THRESHOLD"], abs=1e-6)
     assert restored.to_selector_dict()["QUALITY_ROI_RATIO"] == pytest.approx(d["QUALITY_ROI_RATIO"], abs=1e-6)
+    assert restored.to_selector_dict()["STAGE1_LR_MERGE_MODE"] == "asymmetric_sky_v1"
+    assert restored.to_selector_dict()["STAGE1_LR_ASYM_WEAK_FLOOR"] == pytest.approx(0.35, abs=1e-6)
+    assert restored.to_selector_dict()["STAGE1_LR_SKY_RATIO_THRESHOLD"] == pytest.approx(0.55, abs=1e-6)
+    assert restored.to_selector_dict()["STAGE1_LR_SKY_RATIO_DIFF_THRESHOLD"] == pytest.approx(0.20, abs=1e-6)
+    assert restored.to_selector_dict()["STAGE1_LR_QUALITY_GAP_THRESHOLD"] == pytest.approx(0.15, abs=1e-6)
+    assert restored.to_selector_dict()["STAGE1_LR_SEMANTIC_SKY_ENABLED"] is True
     assert restored.to_selector_dict()["VO_ESSENTIAL_METHOD"] == "auto"
     assert restored.to_selector_dict()["VO_SUBPIXEL_REFINE"] is True
     assert restored.to_selector_dict()["VO_ADAPTIVE_SUBSAMPLE"] is False
@@ -26,6 +32,7 @@ def test_keyframe_config_round_trip():
     assert restored.to_selector_dict()["POSE_BACKEND"] == "vo"
     assert restored.to_selector_dict()["NMS_TIME_WINDOW"] == pytest.approx(1.0, abs=1e-6)
     assert restored.to_selector_dict()["COLMAP_KEYFRAME_POLICY"] == ""
+    assert restored.to_selector_dict()["COLMAP_PIPELINE_MODE"] == ""
     assert restored.to_selector_dict()["COLMAP_KEYFRAME_TARGET_MODE"] == "auto"
     assert restored.to_selector_dict()["COLMAP_KEYFRAME_TARGET_MIN"] == 120
     assert restored.to_selector_dict()["COLMAP_KEYFRAME_TARGET_MAX"] == 240
@@ -36,6 +43,15 @@ def test_keyframe_config_round_trip():
     assert restored.to_selector_dict()["COLMAP_STAGE1_ADAPTIVE_THRESHOLD"] is True
     assert restored.to_selector_dict()["COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN"] == 3
     assert restored.to_selector_dict()["COLMAP_STAGE1_MAX_CANDIDATES"] == 360
+    assert restored.to_selector_dict()["COLMAP_SELECTION_PROFILE"] == ""
+    assert restored.to_selector_dict()["COLMAP_STAGE2_ENTRY_BUDGET"] == 180
+    assert restored.to_selector_dict()["COLMAP_STAGE2_ENTRY_MIN_GAP"] == 3
+    assert restored.to_selector_dict()["COLMAP_DIVERSITY_SSIM_THRESHOLD"] == pytest.approx(0.93, abs=1e-6)
+    assert restored.to_selector_dict()["COLMAP_DIVERSITY_PHASH_HAMMING"] == 10
+    assert restored.to_selector_dict()["COLMAP_FINAL_TARGET_POLICY"] == "soft_auto"
+    assert restored.to_selector_dict()["COLMAP_FINAL_SOFT_MIN"] == 80
+    assert restored.to_selector_dict()["COLMAP_FINAL_SOFT_MAX"] == 220
+    assert restored.to_selector_dict()["COLMAP_NO_SUPPLEMENT_ON_LOW_QUALITY"] is True
     assert restored.to_selector_dict()["COLMAP_RIG_POLICY"] == "lr_opk"
     assert restored.to_selector_dict()["COLMAP_RIG_SEED_OPK_DEG"] == [0.0, 0.0, 180.0]
     assert restored.to_selector_dict()["COLMAP_WORKSPACE_SCOPE"] == "run_scoped"

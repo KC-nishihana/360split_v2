@@ -329,6 +329,19 @@ def parse_arguments():
         help="品質フィルタのデバッグ統計ログを有効化/無効化"
     )
     parser.add_argument(
+        "--stage1-lr-merge-mode",
+        type=str,
+        choices=["asymmetric_sky_v1", "strict_min"],
+        default=None,
+        help="Stage1 LR統合方式（asymmetric_sky_v1 / strict_min）"
+    )
+    parser.add_argument(
+        "--stage1-lr-asym-weak-floor",
+        type=float,
+        default=None,
+        help="Stage1 LR非対称統合時の弱レンズ品質下限（0.0-1.0）"
+    )
+    parser.add_argument(
         "--disable-stage3-refinement",
         action="store_true",
         default=False,
@@ -534,11 +547,25 @@ def parse_arguments():
         help="COLMAP database.db パス"
     )
     parser.add_argument(
+        "--colmap-pipeline-mode",
+        type=str,
+        choices=["minimal_v1", "legacy"],
+        default=None,
+        help="COLMAPキーフレーム抽出パイプライン（minimal_v1 / legacy）"
+    )
+    parser.add_argument(
         "--colmap-keyframe-policy",
         type=str,
         choices=["legacy", "stage2_relaxed", "stage1_only"],
         default=None,
         help="COLMAP向けキーフレームポリシー"
+    )
+    parser.add_argument(
+        "--colmap-selection-profile",
+        type=str,
+        choices=["legacy", "no_vo_coverage"],
+        default=None,
+        help="COLMAP向け選抜プロファイル（legacy / no_vo_coverage）"
     )
     parser.add_argument(
         "--colmap-keyframe-target-mode",
@@ -600,6 +627,55 @@ def parse_arguments():
         type=int,
         default=None,
         help="COLMAP向けStage1候補数上限"
+    )
+    parser.add_argument(
+        "--colmap-stage2-entry-budget",
+        type=int,
+        default=None,
+        help="COLMAP向けStage2投入前の入口予算（Stage1.5）"
+    )
+    parser.add_argument(
+        "--colmap-stage2-entry-min-gap",
+        type=int,
+        default=None,
+        help="COLMAP向けStage2投入前の最小フレーム間隔（Stage1.5）"
+    )
+    parser.add_argument(
+        "--colmap-diversity-ssim-threshold",
+        type=float,
+        default=None,
+        help="COLMAP向け多様性判定SSIMしきい値（高いほど重複を除外）"
+    )
+    parser.add_argument(
+        "--colmap-diversity-phash-hamming",
+        type=int,
+        default=None,
+        help="COLMAP向け多様性判定pHashハミング距離しきい値"
+    )
+    parser.add_argument(
+        "--colmap-final-target-policy",
+        type=str,
+        choices=["soft_auto", "fixed"],
+        default=None,
+        help="COLMAP最終ターゲット方針（soft_auto / fixed）"
+    )
+    parser.add_argument(
+        "--colmap-final-soft-min",
+        type=int,
+        default=None,
+        help="COLMAP soft_auto時の下限目安"
+    )
+    parser.add_argument(
+        "--colmap-final-soft-max",
+        type=int,
+        default=None,
+        help="COLMAP soft_auto時の上限目安"
+    )
+    parser.add_argument(
+        "--colmap-no-supplement-on-low-quality",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="COLMAP最終補充時に低品質フレーム補充を禁止（--no-colmap-no-supplement-on-low-quality で解除）"
     )
     parser.add_argument(
         "--colmap-rig-policy",
@@ -854,6 +930,10 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["quality_abs_laplacian_min"] = float(max(0.0, args.quality_abs_laplacian_min))
     if args.quality_debug is not None:
         config["quality_debug"] = bool(args.quality_debug)
+    if args.stage1_lr_merge_mode is not None:
+        config["stage1_lr_merge_mode"] = str(args.stage1_lr_merge_mode).strip().lower()
+    if args.stage1_lr_asym_weak_floor is not None:
+        config["stage1_lr_asym_weak_floor"] = float(max(0.0, min(1.0, args.stage1_lr_asym_weak_floor)))
     if args.disable_stage3_refinement:
         config["enable_stage3_refinement"] = False
     if args.stage3_weight_base is not None:
@@ -932,8 +1012,12 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["colmap_workspace"] = str(args.colmap_workspace).strip()
     if args.colmap_db_path is not None:
         config["colmap_db_path"] = str(args.colmap_db_path).strip()
+    if args.colmap_pipeline_mode is not None:
+        config["colmap_pipeline_mode"] = str(args.colmap_pipeline_mode).strip().lower()
     if args.colmap_keyframe_policy is not None:
         config["colmap_keyframe_policy"] = str(args.colmap_keyframe_policy).strip().lower()
+    if args.colmap_selection_profile is not None:
+        config["colmap_selection_profile"] = str(args.colmap_selection_profile).strip().lower()
     if args.colmap_keyframe_target_mode is not None:
         config["colmap_keyframe_target_mode"] = str(args.colmap_keyframe_target_mode).strip().lower()
     if args.colmap_keyframe_target_min is not None:
@@ -954,6 +1038,22 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["colmap_stage1_min_candidates_per_bin"] = int(max(0, args.colmap_stage1_min_candidates_per_bin))
     if args.colmap_stage1_max_candidates is not None:
         config["colmap_stage1_max_candidates"] = int(max(1, args.colmap_stage1_max_candidates))
+    if args.colmap_stage2_entry_budget is not None:
+        config["colmap_stage2_entry_budget"] = int(max(1, args.colmap_stage2_entry_budget))
+    if args.colmap_stage2_entry_min_gap is not None:
+        config["colmap_stage2_entry_min_gap"] = int(max(0, args.colmap_stage2_entry_min_gap))
+    if args.colmap_diversity_ssim_threshold is not None:
+        config["colmap_diversity_ssim_threshold"] = float(max(0.0, min(1.0, args.colmap_diversity_ssim_threshold)))
+    if args.colmap_diversity_phash_hamming is not None:
+        config["colmap_diversity_phash_hamming"] = int(max(0, args.colmap_diversity_phash_hamming))
+    if args.colmap_final_target_policy is not None:
+        config["colmap_final_target_policy"] = str(args.colmap_final_target_policy).strip().lower()
+    if args.colmap_final_soft_min is not None:
+        config["colmap_final_soft_min"] = int(max(1, args.colmap_final_soft_min))
+    if args.colmap_final_soft_max is not None:
+        config["colmap_final_soft_max"] = int(max(1, args.colmap_final_soft_max))
+    if args.colmap_no_supplement_on_low_quality is not None:
+        config["colmap_no_supplement_on_low_quality"] = bool(args.colmap_no_supplement_on_low_quality)
     if args.colmap_rig_policy is not None:
         config["colmap_rig_policy"] = str(args.colmap_rig_policy).strip().lower()
     if args.colmap_rig_seed_opk is not None:
@@ -1477,6 +1577,26 @@ def _resolve_colmap_keyframe_policy(config: Dict[str, Any]) -> str:
     return "stage2_relaxed" if pose_backend == "colmap" else "legacy"
 
 
+def _resolve_colmap_pipeline_mode(config: Dict[str, Any]) -> str:
+    pose_backend = str(config.get("pose_backend", "vo") or "vo").strip().lower()
+    raw_mode = str(config.get("colmap_pipeline_mode", "") or "").strip().lower()
+    if raw_mode not in {"legacy", "minimal_v1"}:
+        raw_mode = ""
+    if raw_mode:
+        return raw_mode
+    return "minimal_v1" if pose_backend == "colmap" else "legacy"
+
+
+def _resolve_colmap_selection_profile(config: Dict[str, Any]) -> str:
+    pose_backend = str(config.get("pose_backend", "vo") or "vo").strip().lower()
+    raw_profile = str(config.get("colmap_selection_profile", "") or "").strip().lower()
+    if raw_profile not in {"legacy", "no_vo_coverage"}:
+        raw_profile = ""
+    if raw_profile:
+        return raw_profile
+    return "no_vo_coverage" if pose_backend == "colmap" else "legacy"
+
+
 def _normalize_colmap_rig_seed(seed_raw: Any) -> List[float]:
     if isinstance(seed_raw, str):
         try:
@@ -1493,7 +1613,10 @@ def _normalize_colmap_rig_seed(seed_raw: Any) -> List[float]:
 
 def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     pose_backend = str(config.get("pose_backend", "vo") or "vo").strip().lower()
+    pipeline_mode = _resolve_colmap_pipeline_mode(config)
     policy = _resolve_colmap_keyframe_policy(config)
+    selection_profile = _resolve_colmap_selection_profile(config)
+    minimal_mode = bool(pose_backend == "colmap" and pipeline_mode == "minimal_v1")
     target_mode = str(config.get("colmap_keyframe_target_mode", "") or "").strip().lower()
     if target_mode not in {"fixed", "auto"}:
         target_mode = "auto" if pose_backend == "colmap" else "fixed"
@@ -1502,10 +1625,24 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     nms_window = float(max(0.01, config.get("colmap_nms_window_sec", 0.35)))
     colmap_enable_stage0 = bool(config.get("colmap_enable_stage0", True))
     colmap_motion_aware_selection = bool(config.get("colmap_motion_aware_selection", True))
+    if selection_profile == "no_vo_coverage" or minimal_mode:
+        colmap_motion_aware_selection = False
     colmap_nms_motion_window_ratio = float(max(0.0, config.get("colmap_nms_motion_window_ratio", 0.5)))
     colmap_stage1_adaptive_threshold = bool(config.get("colmap_stage1_adaptive_threshold", True))
     colmap_stage1_min_candidates_per_bin = int(max(0, config.get("colmap_stage1_min_candidates_per_bin", 3)))
     colmap_stage1_max_candidates = int(max(1, config.get("colmap_stage1_max_candidates", 360)))
+    colmap_stage2_entry_budget = int(max(1, config.get("colmap_stage2_entry_budget", 180)))
+    colmap_stage2_entry_min_gap = int(max(0, config.get("colmap_stage2_entry_min_gap", 3)))
+    colmap_diversity_ssim_threshold = float(
+        max(0.0, min(1.0, config.get("colmap_diversity_ssim_threshold", 0.93)))
+    )
+    colmap_diversity_phash_hamming = int(max(0, config.get("colmap_diversity_phash_hamming", 10)))
+    colmap_final_target_policy = str(config.get("colmap_final_target_policy", "") or "").strip().lower()
+    if colmap_final_target_policy not in {"soft_auto", "fixed"}:
+        colmap_final_target_policy = "soft_auto"
+    colmap_final_soft_min = int(max(1, config.get("colmap_final_soft_min", 80)))
+    colmap_final_soft_max = int(max(colmap_final_soft_min, config.get("colmap_final_soft_max", 220)))
+    colmap_no_supplement_on_low_quality = bool(config.get("colmap_no_supplement_on_low_quality", True))
     rig_policy = str(config.get("colmap_rig_policy", "") or "").strip().lower()
     if rig_policy not in {"off", "lr_opk"}:
         rig_policy = "lr_opk" if pose_backend == "colmap" else "off"
@@ -1518,8 +1655,18 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     if analysis_mask_profile not in {"legacy", "colmap_safe"}:
         analysis_mask_profile = "colmap_safe" if pose_backend == "colmap" else "legacy"
 
+    if minimal_mode:
+        logger.warning(
+            "COLMAP minimal_v1 mode enabled: "
+            "legacy keyframe knobs (policy/target/stage0/stage1.5/stage3/retarget/dynamic-mask) are ignored."
+        )
+
+    config["colmap_pipeline_mode"] = pipeline_mode
+    config["COLMAP_PIPELINE_MODE"] = pipeline_mode
     config["colmap_keyframe_policy"] = policy
     config["COLMAP_KEYFRAME_POLICY"] = policy
+    config["colmap_selection_profile"] = selection_profile
+    config["COLMAP_SELECTION_PROFILE"] = selection_profile
     config["colmap_keyframe_target_mode"] = target_mode
     config["COLMAP_KEYFRAME_TARGET_MODE"] = target_mode
     config["colmap_keyframe_target_min"] = target_min
@@ -1540,6 +1687,22 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     config["COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN"] = colmap_stage1_min_candidates_per_bin
     config["colmap_stage1_max_candidates"] = colmap_stage1_max_candidates
     config["COLMAP_STAGE1_MAX_CANDIDATES"] = colmap_stage1_max_candidates
+    config["colmap_stage2_entry_budget"] = colmap_stage2_entry_budget
+    config["COLMAP_STAGE2_ENTRY_BUDGET"] = colmap_stage2_entry_budget
+    config["colmap_stage2_entry_min_gap"] = colmap_stage2_entry_min_gap
+    config["COLMAP_STAGE2_ENTRY_MIN_GAP"] = colmap_stage2_entry_min_gap
+    config["colmap_diversity_ssim_threshold"] = colmap_diversity_ssim_threshold
+    config["COLMAP_DIVERSITY_SSIM_THRESHOLD"] = colmap_diversity_ssim_threshold
+    config["colmap_diversity_phash_hamming"] = colmap_diversity_phash_hamming
+    config["COLMAP_DIVERSITY_PHASH_HAMMING"] = colmap_diversity_phash_hamming
+    config["colmap_final_target_policy"] = colmap_final_target_policy
+    config["COLMAP_FINAL_TARGET_POLICY"] = colmap_final_target_policy
+    config["colmap_final_soft_min"] = colmap_final_soft_min
+    config["COLMAP_FINAL_SOFT_MIN"] = colmap_final_soft_min
+    config["colmap_final_soft_max"] = colmap_final_soft_max
+    config["COLMAP_FINAL_SOFT_MAX"] = colmap_final_soft_max
+    config["colmap_no_supplement_on_low_quality"] = colmap_no_supplement_on_low_quality
+    config["COLMAP_NO_SUPPLEMENT_ON_LOW_QUALITY"] = colmap_no_supplement_on_low_quality
     config["colmap_rig_policy"] = rig_policy
     config["COLMAP_RIG_POLICY"] = rig_policy
     config["colmap_rig_seed_opk_deg"] = list(rig_seed_opk)
@@ -1551,11 +1714,20 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     config["colmap_analysis_mask_profile"] = analysis_mask_profile
     config["COLMAP_ANALYSIS_MASK_PROFILE"] = analysis_mask_profile
 
-    if pose_backend == "colmap" and policy != "legacy":
-        config["enable_stage0_scan"] = bool(colmap_enable_stage0)
-        config["ENABLE_STAGE0_SCAN"] = bool(colmap_enable_stage0)
+    if pose_backend == "colmap" and (policy != "legacy" or minimal_mode):
+        stage0_enabled = bool(colmap_enable_stage0) and selection_profile != "no_vo_coverage" and (not minimal_mode)
+        config["enable_stage0_scan"] = stage0_enabled
+        config["ENABLE_STAGE0_SCAN"] = stage0_enabled
         config["enable_stage3_refinement"] = False
         config["ENABLE_STAGE3_REFINEMENT"] = False
+    if pose_backend == "colmap" and minimal_mode:
+        config["enable_stage3_refinement"] = False
+        config["ENABLE_STAGE3_REFINEMENT"] = False
+        config["enable_dynamic_mask_removal"] = False
+        config["ENABLE_DYNAMIC_MASK_REMOVAL"] = False
+    elif pose_backend == "colmap" and selection_profile == "no_vo_coverage":
+        config["enable_dynamic_mask_removal"] = True
+        config["ENABLE_DYNAMIC_MASK_REMOVAL"] = True
 
     if pose_backend == "colmap" and analysis_mask_profile == "colmap_safe":
         dm_classes = config.get("dynamic_mask_target_classes", config.get("DYNAMIC_MASK_TARGET_CLASSES", []))
@@ -1570,16 +1742,24 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
 
     stage0_on = bool(config.get("enable_stage0_scan", config.get("ENABLE_STAGE0_SCAN", True)))
     stage3_on = bool(config.get("enable_stage3_refinement", config.get("ENABLE_STAGE3_REFINEMENT", True)))
-    if pose_backend == "colmap" and policy == "stage1_only":
+    if minimal_mode:
+        stage_plan = "Stage1->Stage2(minimal_v1)"
+    elif pose_backend == "colmap" and policy == "stage1_only":
         stage_plan = "Stage1 only"
     elif pose_backend == "colmap" and policy == "stage2_relaxed":
-        stage_plan = "Stage1->Stage0->Stage2(relaxed)" if stage0_on else "Stage1->Stage2(relaxed)"
+        if selection_profile == "no_vo_coverage":
+            stage_plan = "Stage1->Stage1.5->Stage2->Stage2.5(no_vo_coverage)"
+        else:
+            stage_plan = "Stage1->Stage0->Stage2(relaxed)" if stage0_on else "Stage1->Stage2(relaxed)"
     else:
         stage_plan = "Stage1->" + ("0->" if stage0_on else "") + "2" + ("->3" if stage3_on else "")
 
     return {
         "pose_backend": pose_backend,
+        "pipeline_mode": pipeline_mode,
+        "minimal_mode": minimal_mode,
         "policy": policy,
+        "selection_profile": selection_profile,
         "target_mode": target_mode,
         "target_min": target_min,
         "target_max": target_max,
@@ -1590,11 +1770,27 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
         "colmap_stage1_adaptive_threshold": colmap_stage1_adaptive_threshold,
         "colmap_stage1_min_candidates_per_bin": colmap_stage1_min_candidates_per_bin,
         "colmap_stage1_max_candidates": colmap_stage1_max_candidates,
+        "colmap_stage2_entry_budget": colmap_stage2_entry_budget,
+        "colmap_stage2_entry_min_gap": colmap_stage2_entry_min_gap,
+        "colmap_diversity_ssim_threshold": colmap_diversity_ssim_threshold,
+        "colmap_diversity_phash_hamming": colmap_diversity_phash_hamming,
+        "colmap_final_target_policy": colmap_final_target_policy,
+        "colmap_final_soft_min": colmap_final_soft_min,
+        "colmap_final_soft_max": colmap_final_soft_max,
+        "colmap_no_supplement_on_low_quality": colmap_no_supplement_on_low_quality,
         "rig_policy": rig_policy,
         "rig_seed_opk_deg": list(rig_seed_opk),
         "workspace_scope": workspace_scope,
         "reuse_db": reuse_db,
         "analysis_mask_profile": analysis_mask_profile,
+        "disabled_components": [
+            "stage0",
+            "stage1_5",
+            "stage3",
+            "dynamic_mask",
+            "retarget",
+            "vo_dependent_selection",
+        ] if minimal_mode else [],
         "effective_stage_plan": stage_plan,
     }
 
@@ -1719,7 +1915,10 @@ def run_cli(args):
     logger.info(
         "COLMAP keyframe policy: "
         f"{colmap_keyframe_runtime['policy']} "
-        f"(mode={colmap_keyframe_runtime['target_mode']}, "
+        f"(pipeline={colmap_keyframe_runtime.get('pipeline_mode', 'legacy')}, "
+        f"minimal={'ON' if colmap_keyframe_runtime.get('minimal_mode', False) else 'OFF'}, "
+        f"profile={colmap_keyframe_runtime.get('selection_profile', 'legacy')}, "
+        f"mode={colmap_keyframe_runtime['target_mode']}, "
         f"target={colmap_keyframe_runtime['target_min']}-{colmap_keyframe_runtime['target_max']}, "
         f"nms={colmap_keyframe_runtime['nms_window_sec']:.2f}s, "
         f"stage0={'ON' if colmap_keyframe_runtime.get('colmap_enable_stage0', True) else 'OFF'}, "
@@ -2346,6 +2545,9 @@ def run_cli(args):
             getattr(selector, "last_selection_runtime", {}).get("coverage_after", {})
         ),
         "colmap_runtime": {
+            "pipeline_mode": str(colmap_keyframe_runtime.get("pipeline_mode", "legacy")),
+            "minimal_mode": bool(colmap_keyframe_runtime.get("minimal_mode", False)),
+            "disabled_components": list(colmap_keyframe_runtime.get("disabled_components", [])),
             "target_mode": str(colmap_keyframe_runtime.get("target_mode", "fixed")),
             "enable_stage0": bool(colmap_keyframe_runtime.get("colmap_enable_stage0", True)),
             "motion_aware_selection": bool(colmap_keyframe_runtime.get("colmap_motion_aware_selection", True)),

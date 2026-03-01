@@ -442,6 +442,13 @@ class MainWindow(QMainWindow):
         pose_backend = str(config.get("POSE_BACKEND", config.get("pose_backend", "vo")) or "vo").strip().lower()
         if pose_backend not in {"vo", "colmap"}:
             pose_backend = "vo"
+        raw_pipeline_mode = str(
+            config.get("COLMAP_PIPELINE_MODE", config.get("colmap_pipeline_mode", "")) or ""
+        ).strip().lower()
+        if raw_pipeline_mode not in {"", "legacy", "minimal_v1"}:
+            raw_pipeline_mode = ""
+        pipeline_mode = raw_pipeline_mode if raw_pipeline_mode else ("minimal_v1" if pose_backend == "colmap" else "legacy")
+        minimal_mode = bool(pose_backend == "colmap" and pipeline_mode == "minimal_v1")
         raw_policy = str(
             config.get("COLMAP_KEYFRAME_POLICY", config.get("colmap_keyframe_policy", "")) or ""
         ).strip().lower()
@@ -461,6 +468,10 @@ class MainWindow(QMainWindow):
             mask_profile = "colmap_safe" if pose_backend == "colmap" else "legacy"
         config["pose_backend"] = pose_backend
         config["POSE_BACKEND"] = pose_backend
+        config["colmap_pipeline_mode"] = pipeline_mode
+        config["COLMAP_PIPELINE_MODE"] = pipeline_mode
+        config["colmap_minimal_mode"] = minimal_mode
+        config["COLMAP_MINIMAL_MODE"] = minimal_mode
         config["colmap_keyframe_policy"] = keyframe_policy
         config["COLMAP_KEYFRAME_POLICY"] = keyframe_policy
         config["colmap_keyframe_target_mode"] = target_mode
@@ -468,7 +479,14 @@ class MainWindow(QMainWindow):
         config["colmap_analysis_mask_profile"] = mask_profile
         config["COLMAP_ANALYSIS_MASK_PROFILE"] = mask_profile
 
-        if pose_backend == "colmap" and keyframe_policy != "legacy":
+        if pose_backend == "colmap" and minimal_mode:
+            config["enable_stage0_scan"] = False
+            config["ENABLE_STAGE0_SCAN"] = False
+            config["enable_stage3_refinement"] = False
+            config["ENABLE_STAGE3_REFINEMENT"] = False
+            config["enable_dynamic_mask_removal"] = False
+            config["ENABLE_DYNAMIC_MASK_REMOVAL"] = False
+        elif pose_backend == "colmap" and keyframe_policy != "legacy":
             config["enable_stage0_scan"] = False
             config["ENABLE_STAGE0_SCAN"] = False
             config["enable_stage3_refinement"] = False
@@ -489,7 +507,9 @@ class MainWindow(QMainWindow):
 
         stage0_on = bool(config.get("enable_stage0_scan", config.get("ENABLE_STAGE0_SCAN", True)))
         stage3_on = bool(config.get("enable_stage3_refinement", config.get("ENABLE_STAGE3_REFINEMENT", True)))
-        if pose_backend == "colmap" and keyframe_policy == "stage1_only":
+        if minimal_mode:
+            stage_mode_label = "COLMAP Minimal v1 (Stage1->Stage2)"
+        elif pose_backend == "colmap" and keyframe_policy == "stage1_only":
             stage_mode_label = "Unified(Stage1 only)"
         elif pose_backend == "colmap" and keyframe_policy == "stage2_relaxed":
             stage_mode_label = f"Unified(Stage1->2 relaxed, target={target_mode})"

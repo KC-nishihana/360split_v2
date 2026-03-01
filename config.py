@@ -171,7 +171,7 @@ class KeyframeConfig:
     stage3_vo_valid_ratio_threshold: float = 0.50
     flow_downscale: float = 1.0
     resume_enabled: bool = False
-    keep_temp_on_success: bool = False
+    keep_temp_on_success: bool = True
     vo_enabled: bool = True
     vo_center_roi_ratio: float = 0.6
     vo_downscale_long_edge: int = 1000
@@ -202,6 +202,12 @@ class KeyframeConfig:
     colmap_keyframe_target_min: int = 120
     colmap_keyframe_target_max: int = 240
     colmap_nms_window_sec: float = 0.35
+    colmap_enable_stage0: bool = True
+    colmap_motion_aware_selection: bool = True
+    colmap_nms_motion_window_ratio: float = 0.5
+    colmap_stage1_adaptive_threshold: bool = True
+    colmap_stage1_min_candidates_per_bin: int = 3
+    colmap_stage1_max_candidates: int = 360
     colmap_rig_policy: str = "lr_opk"
     colmap_rig_seed_opk_deg: Tuple[float, float, float] = (0.0, 0.0, 180.0)
     colmap_workspace_scope: str = "run_scoped"
@@ -350,6 +356,12 @@ class KeyframeConfig:
             'COLMAP_KEYFRAME_TARGET_MIN': self.colmap_keyframe_target_min,
             'COLMAP_KEYFRAME_TARGET_MAX': self.colmap_keyframe_target_max,
             'COLMAP_NMS_WINDOW_SEC': self.colmap_nms_window_sec,
+            'COLMAP_ENABLE_STAGE0': self.colmap_enable_stage0,
+            'COLMAP_MOTION_AWARE_SELECTION': self.colmap_motion_aware_selection,
+            'COLMAP_NMS_MOTION_WINDOW_RATIO': self.colmap_nms_motion_window_ratio,
+            'COLMAP_STAGE1_ADAPTIVE_THRESHOLD': self.colmap_stage1_adaptive_threshold,
+            'COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN': self.colmap_stage1_min_candidates_per_bin,
+            'COLMAP_STAGE1_MAX_CANDIDATES': self.colmap_stage1_max_candidates,
             'COLMAP_RIG_POLICY': self.colmap_rig_policy,
             'COLMAP_RIG_SEED_OPK_DEG': list(self.colmap_rig_seed_opk_deg),
             'COLMAP_WORKSPACE_SCOPE': self.colmap_workspace_scope,
@@ -631,6 +643,24 @@ class KeyframeConfig:
         config.colmap_nms_window_sec = float(
             max(0.01, normalized.get('colmap_nms_window_sec', config.colmap_nms_window_sec))
         )
+        config.colmap_enable_stage0 = bool(
+            normalized.get('colmap_enable_stage0', config.colmap_enable_stage0)
+        )
+        config.colmap_motion_aware_selection = bool(
+            normalized.get('colmap_motion_aware_selection', config.colmap_motion_aware_selection)
+        )
+        config.colmap_nms_motion_window_ratio = float(
+            max(0.0, normalized.get('colmap_nms_motion_window_ratio', config.colmap_nms_motion_window_ratio))
+        )
+        config.colmap_stage1_adaptive_threshold = bool(
+            normalized.get('colmap_stage1_adaptive_threshold', config.colmap_stage1_adaptive_threshold)
+        )
+        config.colmap_stage1_min_candidates_per_bin = int(
+            max(0, normalized.get('colmap_stage1_min_candidates_per_bin', config.colmap_stage1_min_candidates_per_bin))
+        )
+        config.colmap_stage1_max_candidates = int(
+            max(1, normalized.get('colmap_stage1_max_candidates', config.colmap_stage1_max_candidates))
+        )
         config.colmap_rig_policy = str(
             normalized.get('colmap_rig_policy', config.colmap_rig_policy) or "lr_opk"
         ).strip().lower()
@@ -829,6 +859,12 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'colmap_keyframe_target_min': 'COLMAP_KEYFRAME_TARGET_MIN',
     'colmap_keyframe_target_max': 'COLMAP_KEYFRAME_TARGET_MAX',
     'colmap_nms_window_sec': 'COLMAP_NMS_WINDOW_SEC',
+    'colmap_enable_stage0': 'COLMAP_ENABLE_STAGE0',
+    'colmap_motion_aware_selection': 'COLMAP_MOTION_AWARE_SELECTION',
+    'colmap_nms_motion_window_ratio': 'COLMAP_NMS_MOTION_WINDOW_RATIO',
+    'colmap_stage1_adaptive_threshold': 'COLMAP_STAGE1_ADAPTIVE_THRESHOLD',
+    'colmap_stage1_min_candidates_per_bin': 'COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN',
+    'colmap_stage1_max_candidates': 'COLMAP_STAGE1_MAX_CANDIDATES',
     'colmap_rig_policy': 'COLMAP_RIG_POLICY',
     'colmap_rig_seed_opk_deg': 'COLMAP_RIG_SEED_OPK_DEG',
     'colmap_workspace_scope': 'COLMAP_WORKSPACE_SCOPE',

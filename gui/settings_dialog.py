@@ -628,70 +628,102 @@ class SettingsDialog(QDialog):
         self.colmap_nms_window_sec.setValue(float(self.settings.get("colmap_nms_window_sec", 0.35)))
         pose_layout.addWidget(self.colmap_nms_window_sec, 8, 1)
 
-        pose_layout.addWidget(QLabel("COLMAP rig policy:"), 9, 0)
+        self.colmap_enable_stage0 = QCheckBox("COLMAP時もStage0を有効化")
+        self.colmap_enable_stage0.setChecked(bool(self.settings.get("colmap_enable_stage0", True)))
+        pose_layout.addWidget(self.colmap_enable_stage0, 9, 0, 1, 3)
+
+        self.colmap_motion_aware_selection = QCheckBox("COLMAP motion-aware選択を有効化")
+        self.colmap_motion_aware_selection.setChecked(bool(self.settings.get("colmap_motion_aware_selection", True)))
+        pose_layout.addWidget(self.colmap_motion_aware_selection, 10, 0, 1, 3)
+
+        pose_layout.addWidget(QLabel("COLMAP motion窓倍率:"), 11, 0)
+        self.colmap_nms_motion_window_ratio = QDoubleSpinBox()
+        self.colmap_nms_motion_window_ratio.setRange(0.0, 10.0)
+        self.colmap_nms_motion_window_ratio.setSingleStep(0.05)
+        self.colmap_nms_motion_window_ratio.setDecimals(2)
+        self.colmap_nms_motion_window_ratio.setValue(float(self.settings.get("colmap_nms_motion_window_ratio", 0.5)))
+        pose_layout.addWidget(self.colmap_nms_motion_window_ratio, 11, 1)
+
+        self.colmap_stage1_adaptive_threshold = QCheckBox("COLMAP Stage1適応しきい値を有効化")
+        self.colmap_stage1_adaptive_threshold.setChecked(bool(self.settings.get("colmap_stage1_adaptive_threshold", True)))
+        pose_layout.addWidget(self.colmap_stage1_adaptive_threshold, 12, 0, 1, 3)
+
+        pose_layout.addWidget(QLabel("Stage1 bin下限:"), 13, 0)
+        self.colmap_stage1_min_candidates_per_bin = QSpinBox()
+        self.colmap_stage1_min_candidates_per_bin.setRange(0, 1000)
+        self.colmap_stage1_min_candidates_per_bin.setValue(int(self.settings.get("colmap_stage1_min_candidates_per_bin", 3)))
+        pose_layout.addWidget(self.colmap_stage1_min_candidates_per_bin, 13, 1)
+
+        pose_layout.addWidget(QLabel("Stage1候補上限:"), 14, 0)
+        self.colmap_stage1_max_candidates = QSpinBox()
+        self.colmap_stage1_max_candidates.setRange(1, 100000)
+        self.colmap_stage1_max_candidates.setValue(int(self.settings.get("colmap_stage1_max_candidates", 360)))
+        pose_layout.addWidget(self.colmap_stage1_max_candidates, 14, 1)
+
+        pose_layout.addWidget(QLabel("COLMAP rig policy:"), 15, 0)
         self.colmap_rig_policy = QComboBox()
         self.colmap_rig_policy.addItems(["lr_opk", "off"])
         self.colmap_rig_policy.setCurrentText(str(self.settings.get("colmap_rig_policy", "lr_opk")))
-        pose_layout.addWidget(self.colmap_rig_policy, 9, 1)
+        pose_layout.addWidget(self.colmap_rig_policy, 15, 1)
 
-        pose_layout.addWidget(QLabel("COLMAP rig seed OPK:"), 10, 0)
+        pose_layout.addWidget(QLabel("COLMAP rig seed OPK:"), 16, 0)
         seed = self.settings.get("colmap_rig_seed_opk_deg", [0.0, 0.0, 180.0])
         if isinstance(seed, (list, tuple)) and len(seed) == 3:
             seed_text = f"{float(seed[0]):.6g},{float(seed[1]):.6g},{float(seed[2]):.6g}"
         else:
             seed_text = "0,0,180"
         self.colmap_rig_seed_opk_deg = QLineEdit(seed_text)
-        pose_layout.addWidget(self.colmap_rig_seed_opk_deg, 10, 1)
+        pose_layout.addWidget(self.colmap_rig_seed_opk_deg, 16, 1)
 
-        pose_layout.addWidget(QLabel("COLMAP workspace scope:"), 11, 0)
+        pose_layout.addWidget(QLabel("COLMAP workspace scope:"), 17, 0)
         self.colmap_workspace_scope = QComboBox()
         self.colmap_workspace_scope.addItems(["run_scoped", "shared"])
         self.colmap_workspace_scope.setCurrentText(str(self.settings.get("colmap_workspace_scope", "run_scoped")))
-        pose_layout.addWidget(self.colmap_workspace_scope, 11, 1)
+        pose_layout.addWidget(self.colmap_workspace_scope, 17, 1)
 
         self.colmap_reuse_db = QCheckBox("COLMAP DBを再利用する")
         self.colmap_reuse_db.setChecked(bool(self.settings.get("colmap_reuse_db", False)))
-        pose_layout.addWidget(self.colmap_reuse_db, 12, 0, 1, 3)
+        pose_layout.addWidget(self.colmap_reuse_db, 18, 0, 1, 3)
 
-        pose_layout.addWidget(QLabel("COLMAP解析マスク:"), 13, 0)
+        pose_layout.addWidget(QLabel("COLMAP解析マスク:"), 19, 0)
         self.colmap_analysis_mask_profile = QComboBox()
         self.colmap_analysis_mask_profile.addItems(["colmap_safe", "legacy"])
         self.colmap_analysis_mask_profile.setCurrentText(str(self.settings.get("colmap_analysis_mask_profile", "colmap_safe")))
-        pose_layout.addWidget(self.colmap_analysis_mask_profile, 13, 1)
+        pose_layout.addWidget(self.colmap_analysis_mask_profile, 19, 1)
 
-        pose_layout.addWidget(QLabel("並進しきい値:"), 14, 0)
+        pose_layout.addWidget(QLabel("並進しきい値:"), 20, 0)
         self.pose_select_translation_threshold = QDoubleSpinBox()
         self.pose_select_translation_threshold.setRange(0.0, 50.0)
         self.pose_select_translation_threshold.setSingleStep(0.1)
         self.pose_select_translation_threshold.setDecimals(2)
         self.pose_select_translation_threshold.setValue(float(self.settings.get("pose_select_translation_threshold", 1.2)))
-        pose_layout.addWidget(self.pose_select_translation_threshold, 14, 1)
+        pose_layout.addWidget(self.pose_select_translation_threshold, 20, 1)
 
-        pose_layout.addWidget(QLabel("回転しきい値(deg):"), 15, 0)
+        pose_layout.addWidget(QLabel("回転しきい値(deg):"), 21, 0)
         self.pose_select_rotation_threshold_deg = QDoubleSpinBox()
         self.pose_select_rotation_threshold_deg.setRange(0.0, 180.0)
         self.pose_select_rotation_threshold_deg.setSingleStep(0.5)
         self.pose_select_rotation_threshold_deg.setDecimals(2)
         self.pose_select_rotation_threshold_deg.setValue(float(self.settings.get("pose_select_rotation_threshold_deg", 5.0)))
-        pose_layout.addWidget(self.pose_select_rotation_threshold_deg, 15, 1)
+        pose_layout.addWidget(self.pose_select_rotation_threshold_deg, 21, 1)
 
-        pose_layout.addWidget(QLabel("最小観測点数:"), 16, 0)
+        pose_layout.addWidget(QLabel("最小観測点数:"), 22, 0)
         self.pose_select_min_observations = QSpinBox()
         self.pose_select_min_observations.setRange(0, 100000)
         self.pose_select_min_observations.setValue(int(self.settings.get("pose_select_min_observations", 30)))
-        pose_layout.addWidget(self.pose_select_min_observations, 16, 1)
+        pose_layout.addWidget(self.pose_select_min_observations, 22, 1)
 
         self.pose_select_enable_translation = QCheckBox("並進条件を有効化")
         self.pose_select_enable_translation.setChecked(bool(self.settings.get("pose_select_enable_translation", True)))
-        pose_layout.addWidget(self.pose_select_enable_translation, 17, 0, 1, 3)
+        pose_layout.addWidget(self.pose_select_enable_translation, 23, 0, 1, 3)
 
         self.pose_select_enable_rotation = QCheckBox("回転条件を有効化")
         self.pose_select_enable_rotation.setChecked(bool(self.settings.get("pose_select_enable_rotation", True)))
-        pose_layout.addWidget(self.pose_select_enable_rotation, 18, 0, 1, 3)
+        pose_layout.addWidget(self.pose_select_enable_rotation, 24, 0, 1, 3)
 
         self.pose_select_enable_observations = QCheckBox("観測点数条件を有効化")
         self.pose_select_enable_observations.setChecked(bool(self.settings.get("pose_select_enable_observations", False)))
-        pose_layout.addWidget(self.pose_select_enable_observations, 19, 0, 1, 3)
+        pose_layout.addWidget(self.pose_select_enable_observations, 25, 0, 1, 3)
 
         self.pose_backend.currentTextChanged.connect(self._on_pose_backend_changed)
         self._on_pose_backend_changed(self.pose_backend.currentText())
@@ -1380,6 +1412,7 @@ class SettingsDialog(QDialog):
             'stage3_weight_base': 0.70,
             'stage3_weight_trajectory': 0.25,
             'stage3_weight_stage0_risk': 0.05,
+            'keep_temp_on_success': True,
             'vo_enabled': True,
             'vo_center_roi_ratio': 0.6,
             'vo_downscale_long_edge': 1000,
@@ -1404,6 +1437,12 @@ class SettingsDialog(QDialog):
             'colmap_keyframe_target_min': 120,
             'colmap_keyframe_target_max': 240,
             'colmap_nms_window_sec': 0.35,
+            'colmap_enable_stage0': True,
+            'colmap_motion_aware_selection': True,
+            'colmap_nms_motion_window_ratio': 0.5,
+            'colmap_stage1_adaptive_threshold': True,
+            'colmap_stage1_min_candidates_per_bin': 3,
+            'colmap_stage1_max_candidates': 360,
             'colmap_rig_policy': 'lr_opk',
             'colmap_rig_seed_opk_deg': [0.0, 0.0, 180.0],
             'colmap_workspace_scope': 'run_scoped',
@@ -1532,6 +1571,7 @@ class SettingsDialog(QDialog):
             'stage3_weight_base': self.stage3_weight_base.value(),
             'stage3_weight_trajectory': self.stage3_weight_trajectory.value(),
             'stage3_weight_stage0_risk': self.stage3_weight_stage0_risk.value(),
+            'keep_temp_on_success': bool(self.settings.get('keep_temp_on_success', True)),
             'vo_enabled': self.vo_enabled.isChecked(),
             'vo_center_roi_ratio': self.vo_center_roi_ratio.value(),
             'vo_downscale_long_edge': self.vo_downscale_long_edge.value(),
@@ -1559,6 +1599,12 @@ class SettingsDialog(QDialog):
                 self.colmap_keyframe_target_max.value(),
             ),
             'colmap_nms_window_sec': self.colmap_nms_window_sec.value(),
+            'colmap_enable_stage0': self.colmap_enable_stage0.isChecked(),
+            'colmap_motion_aware_selection': self.colmap_motion_aware_selection.isChecked(),
+            'colmap_nms_motion_window_ratio': self.colmap_nms_motion_window_ratio.value(),
+            'colmap_stage1_adaptive_threshold': self.colmap_stage1_adaptive_threshold.isChecked(),
+            'colmap_stage1_min_candidates_per_bin': self.colmap_stage1_min_candidates_per_bin.value(),
+            'colmap_stage1_max_candidates': self.colmap_stage1_max_candidates.value(),
             'colmap_rig_policy': self.colmap_rig_policy.currentText(),
             'colmap_rig_seed_opk_deg': rig_seed_opk,
             'colmap_workspace_scope': self.colmap_workspace_scope.currentText(),
@@ -1755,6 +1801,12 @@ class SettingsDialog(QDialog):
             self.colmap_keyframe_target_min.setValue(int(params.get('colmap_keyframe_target_min', 120)))
             self.colmap_keyframe_target_max.setValue(int(params.get('colmap_keyframe_target_max', 240)))
             self.colmap_nms_window_sec.setValue(float(params.get('colmap_nms_window_sec', 0.35)))
+            self.colmap_enable_stage0.setChecked(bool(params.get('colmap_enable_stage0', True)))
+            self.colmap_motion_aware_selection.setChecked(bool(params.get('colmap_motion_aware_selection', True)))
+            self.colmap_nms_motion_window_ratio.setValue(float(params.get('colmap_nms_motion_window_ratio', 0.5)))
+            self.colmap_stage1_adaptive_threshold.setChecked(bool(params.get('colmap_stage1_adaptive_threshold', True)))
+            self.colmap_stage1_min_candidates_per_bin.setValue(int(params.get('colmap_stage1_min_candidates_per_bin', 3)))
+            self.colmap_stage1_max_candidates.setValue(int(params.get('colmap_stage1_max_candidates', 360)))
             self.colmap_rig_policy.setCurrentText(str(params.get('colmap_rig_policy', 'lr_opk')))
             seed = params.get('colmap_rig_seed_opk_deg', [0.0, 0.0, 180.0])
             if isinstance(seed, (list, tuple)) and len(seed) == 3:
@@ -1818,6 +1870,12 @@ class SettingsDialog(QDialog):
             self.colmap_keyframe_target_min,
             self.colmap_keyframe_target_max,
             self.colmap_nms_window_sec,
+            self.colmap_enable_stage0,
+            self.colmap_motion_aware_selection,
+            self.colmap_nms_motion_window_ratio,
+            self.colmap_stage1_adaptive_threshold,
+            self.colmap_stage1_min_candidates_per_bin,
+            self.colmap_stage1_max_candidates,
             self.colmap_rig_policy,
             self.colmap_rig_seed_opk_deg,
             self.colmap_workspace_scope,
@@ -1937,6 +1995,12 @@ class SettingsDialog(QDialog):
             self.colmap_keyframe_target_min.setValue(120)
             self.colmap_keyframe_target_max.setValue(240)
             self.colmap_nms_window_sec.setValue(0.35)
+            self.colmap_enable_stage0.setChecked(True)
+            self.colmap_motion_aware_selection.setChecked(True)
+            self.colmap_nms_motion_window_ratio.setValue(0.5)
+            self.colmap_stage1_adaptive_threshold.setChecked(True)
+            self.colmap_stage1_min_candidates_per_bin.setValue(3)
+            self.colmap_stage1_max_candidates.setValue(360)
             self.colmap_rig_policy.setCurrentText("lr_opk")
             self.colmap_rig_seed_opk_deg.setText("0,0,180")
             self.colmap_workspace_scope.setCurrentText("run_scoped")

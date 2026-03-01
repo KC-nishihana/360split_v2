@@ -21,9 +21,11 @@ def test_stage_temp_store_roundtrip_and_cleanup(tmp_path):
     cands = [{"frame_idx": 1, "quality_scores": {"quality": 0.8}}]
     recs = [{"frame_index": 1, "quality": 0.8, "is_pass": True}]
     store.save_stage1(cands, recs)
+    store.save_stage1_effective(cands)
     lc, lr = store.load_stage1()
     assert lc == cands
     assert lr == recs
+    assert store.load_stage1_effective() == cands
 
     s0 = {1: {"motion_risk": 0.2, "vo_status_reason": "ok"}}
     store.save_stage0(s0)

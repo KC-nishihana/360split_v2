@@ -566,6 +566,42 @@ def parse_arguments():
         help="COLMAP向けNMS窓（秒）"
     )
     parser.add_argument(
+        "--colmap-enable-stage0",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="COLMAPショートカット時もStage0軽量走査を有効化/無効化"
+    )
+    parser.add_argument(
+        "--colmap-motion-aware-selection",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="COLMAP向けにtime+motion選択を有効化/無効化"
+    )
+    parser.add_argument(
+        "--colmap-nms-motion-window-ratio",
+        type=float,
+        default=None,
+        help="COLMAP motion-aware NMSの移動量窓倍率（median step比）"
+    )
+    parser.add_argument(
+        "--colmap-stage1-adaptive-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="COLMAP向けStage1適応しきい値を有効化/無効化"
+    )
+    parser.add_argument(
+        "--colmap-stage1-min-candidates-per-bin",
+        type=int,
+        default=None,
+        help="COLMAP向けStage1時間ビンあたり最小候補数"
+    )
+    parser.add_argument(
+        "--colmap-stage1-max-candidates",
+        type=int,
+        default=None,
+        help="COLMAP向けStage1候補数上限"
+    )
+    parser.add_argument(
         "--colmap-rig-policy",
         type=str,
         choices=["off", "lr_opk"],
@@ -906,6 +942,18 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["colmap_keyframe_target_max"] = int(max(1, args.colmap_keyframe_target_max))
     if args.colmap_nms_window_sec is not None:
         config["colmap_nms_window_sec"] = float(max(0.01, args.colmap_nms_window_sec))
+    if args.colmap_enable_stage0 is not None:
+        config["colmap_enable_stage0"] = bool(args.colmap_enable_stage0)
+    if args.colmap_motion_aware_selection is not None:
+        config["colmap_motion_aware_selection"] = bool(args.colmap_motion_aware_selection)
+    if args.colmap_nms_motion_window_ratio is not None:
+        config["colmap_nms_motion_window_ratio"] = float(max(0.0, args.colmap_nms_motion_window_ratio))
+    if args.colmap_stage1_adaptive_threshold is not None:
+        config["colmap_stage1_adaptive_threshold"] = bool(args.colmap_stage1_adaptive_threshold)
+    if args.colmap_stage1_min_candidates_per_bin is not None:
+        config["colmap_stage1_min_candidates_per_bin"] = int(max(0, args.colmap_stage1_min_candidates_per_bin))
+    if args.colmap_stage1_max_candidates is not None:
+        config["colmap_stage1_max_candidates"] = int(max(1, args.colmap_stage1_max_candidates))
     if args.colmap_rig_policy is not None:
         config["colmap_rig_policy"] = str(args.colmap_rig_policy).strip().lower()
     if args.colmap_rig_seed_opk is not None:
@@ -1452,6 +1500,12 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     target_min = int(max(1, config.get("colmap_keyframe_target_min", 120)))
     target_max = int(max(target_min, config.get("colmap_keyframe_target_max", 240)))
     nms_window = float(max(0.01, config.get("colmap_nms_window_sec", 0.35)))
+    colmap_enable_stage0 = bool(config.get("colmap_enable_stage0", True))
+    colmap_motion_aware_selection = bool(config.get("colmap_motion_aware_selection", True))
+    colmap_nms_motion_window_ratio = float(max(0.0, config.get("colmap_nms_motion_window_ratio", 0.5)))
+    colmap_stage1_adaptive_threshold = bool(config.get("colmap_stage1_adaptive_threshold", True))
+    colmap_stage1_min_candidates_per_bin = int(max(0, config.get("colmap_stage1_min_candidates_per_bin", 3)))
+    colmap_stage1_max_candidates = int(max(1, config.get("colmap_stage1_max_candidates", 360)))
     rig_policy = str(config.get("colmap_rig_policy", "") or "").strip().lower()
     if rig_policy not in {"off", "lr_opk"}:
         rig_policy = "lr_opk" if pose_backend == "colmap" else "off"
@@ -1474,6 +1528,18 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     config["COLMAP_KEYFRAME_TARGET_MAX"] = target_max
     config["colmap_nms_window_sec"] = nms_window
     config["COLMAP_NMS_WINDOW_SEC"] = nms_window
+    config["colmap_enable_stage0"] = colmap_enable_stage0
+    config["COLMAP_ENABLE_STAGE0"] = colmap_enable_stage0
+    config["colmap_motion_aware_selection"] = colmap_motion_aware_selection
+    config["COLMAP_MOTION_AWARE_SELECTION"] = colmap_motion_aware_selection
+    config["colmap_nms_motion_window_ratio"] = colmap_nms_motion_window_ratio
+    config["COLMAP_NMS_MOTION_WINDOW_RATIO"] = colmap_nms_motion_window_ratio
+    config["colmap_stage1_adaptive_threshold"] = colmap_stage1_adaptive_threshold
+    config["COLMAP_STAGE1_ADAPTIVE_THRESHOLD"] = colmap_stage1_adaptive_threshold
+    config["colmap_stage1_min_candidates_per_bin"] = colmap_stage1_min_candidates_per_bin
+    config["COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN"] = colmap_stage1_min_candidates_per_bin
+    config["colmap_stage1_max_candidates"] = colmap_stage1_max_candidates
+    config["COLMAP_STAGE1_MAX_CANDIDATES"] = colmap_stage1_max_candidates
     config["colmap_rig_policy"] = rig_policy
     config["COLMAP_RIG_POLICY"] = rig_policy
     config["colmap_rig_seed_opk_deg"] = list(rig_seed_opk)
@@ -1486,8 +1552,8 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     config["COLMAP_ANALYSIS_MASK_PROFILE"] = analysis_mask_profile
 
     if pose_backend == "colmap" and policy != "legacy":
-        config["enable_stage0_scan"] = False
-        config["ENABLE_STAGE0_SCAN"] = False
+        config["enable_stage0_scan"] = bool(colmap_enable_stage0)
+        config["ENABLE_STAGE0_SCAN"] = bool(colmap_enable_stage0)
         config["enable_stage3_refinement"] = False
         config["ENABLE_STAGE3_REFINEMENT"] = False
 
@@ -1507,7 +1573,7 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     if pose_backend == "colmap" and policy == "stage1_only":
         stage_plan = "Stage1 only"
     elif pose_backend == "colmap" and policy == "stage2_relaxed":
-        stage_plan = "Stage1->Stage2(relaxed)"
+        stage_plan = "Stage1->Stage0->Stage2(relaxed)" if stage0_on else "Stage1->Stage2(relaxed)"
     else:
         stage_plan = "Stage1->" + ("0->" if stage0_on else "") + "2" + ("->3" if stage3_on else "")
 
@@ -1518,6 +1584,12 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
         "target_min": target_min,
         "target_max": target_max,
         "nms_window_sec": nms_window,
+        "colmap_enable_stage0": colmap_enable_stage0,
+        "colmap_motion_aware_selection": colmap_motion_aware_selection,
+        "colmap_nms_motion_window_ratio": colmap_nms_motion_window_ratio,
+        "colmap_stage1_adaptive_threshold": colmap_stage1_adaptive_threshold,
+        "colmap_stage1_min_candidates_per_bin": colmap_stage1_min_candidates_per_bin,
+        "colmap_stage1_max_candidates": colmap_stage1_max_candidates,
         "rig_policy": rig_policy,
         "rig_seed_opk_deg": list(rig_seed_opk),
         "workspace_scope": workspace_scope,
@@ -1650,6 +1722,9 @@ def run_cli(args):
         f"(mode={colmap_keyframe_runtime['target_mode']}, "
         f"target={colmap_keyframe_runtime['target_min']}-{colmap_keyframe_runtime['target_max']}, "
         f"nms={colmap_keyframe_runtime['nms_window_sec']:.2f}s, "
+        f"stage0={'ON' if colmap_keyframe_runtime.get('colmap_enable_stage0', True) else 'OFF'}, "
+        f"motion_aware={'ON' if colmap_keyframe_runtime.get('colmap_motion_aware_selection', True) else 'OFF'}"
+        f"@ratio={float(colmap_keyframe_runtime.get('colmap_nms_motion_window_ratio', 0.5)):.2f}, "
         f"rig={colmap_keyframe_runtime['rig_policy']}@opk={colmap_keyframe_runtime['rig_seed_opk_deg']}, "
         f"workspace_scope={colmap_keyframe_runtime['workspace_scope']}, "
         f"reuse_db={colmap_keyframe_runtime['reuse_db']}, "
@@ -2210,6 +2285,36 @@ def run_cli(args):
                 colmap_keyframe_runtime.get("effective_stage_plan", "unknown"),
             )
         ),
+        "stage1_candidates_raw": int(
+            getattr(selector, "last_selection_runtime", {}).get("stage1_candidates_raw", 0)
+        ),
+        "stage1_candidates_effective": int(
+            getattr(selector, "last_selection_runtime", {}).get("stage1_candidates_effective", 0)
+        ),
+        "stage1_adaptive_threshold_base": float(
+            getattr(selector, "last_selection_runtime", {}).get("stage1_adaptive_threshold_base", 0.0)
+        ),
+        "stage1_adaptive_threshold_effective": float(
+            getattr(selector, "last_selection_runtime", {}).get("stage1_adaptive_threshold_effective", 0.0)
+        ),
+        "stage1_bin_floor_added_count": int(
+            getattr(selector, "last_selection_runtime", {}).get("stage1_bin_floor_added_count", 0)
+        ),
+        "motion_median_step": float(
+            getattr(selector, "last_selection_runtime", {}).get("motion_median_step", 0.0)
+        ),
+        "effective_motion_window": float(
+            getattr(selector, "last_selection_runtime", {}).get("effective_motion_window", 0.0)
+        ),
+        "motion_bins_occupied_before": int(
+            getattr(selector, "last_selection_runtime", {}).get("motion_bins_occupied_before", 0)
+        ),
+        "motion_bins_occupied_after": int(
+            getattr(selector, "last_selection_runtime", {}).get("motion_bins_occupied_after", 0)
+        ),
+        "stage2_drop_reason_counts": round_json_friendly(
+            getattr(selector, "last_selection_runtime", {}).get("stage2_drop_reason_counts", {})
+        ),
         "pre_retarget_count": int(
             getattr(selector, "last_selection_runtime", {}).get("pre_retarget_count", len(keyframes))
         ),
@@ -2242,6 +2347,12 @@ def run_cli(args):
         ),
         "colmap_runtime": {
             "target_mode": str(colmap_keyframe_runtime.get("target_mode", "fixed")),
+            "enable_stage0": bool(colmap_keyframe_runtime.get("colmap_enable_stage0", True)),
+            "motion_aware_selection": bool(colmap_keyframe_runtime.get("colmap_motion_aware_selection", True)),
+            "nms_motion_window_ratio": float(colmap_keyframe_runtime.get("colmap_nms_motion_window_ratio", 0.5)),
+            "stage1_adaptive_threshold": bool(colmap_keyframe_runtime.get("colmap_stage1_adaptive_threshold", True)),
+            "stage1_min_candidates_per_bin": int(colmap_keyframe_runtime.get("colmap_stage1_min_candidates_per_bin", 3)),
+            "stage1_max_candidates": int(colmap_keyframe_runtime.get("colmap_stage1_max_candidates", 360)),
             "rig_policy": str(colmap_keyframe_runtime.get("rig_policy", "off")),
             "rig_seed_opk_deg": list(colmap_keyframe_runtime.get("rig_seed_opk_deg", [0.0, 0.0, 180.0])),
             "workspace_scope": str(colmap_keyframe_runtime.get("workspace_scope", "run_scoped")),

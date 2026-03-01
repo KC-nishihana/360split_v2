@@ -30,6 +30,12 @@ def test_keyframe_config_round_trip():
     assert restored.to_selector_dict()["COLMAP_KEYFRAME_TARGET_MIN"] == 120
     assert restored.to_selector_dict()["COLMAP_KEYFRAME_TARGET_MAX"] == 240
     assert restored.to_selector_dict()["COLMAP_NMS_WINDOW_SEC"] == pytest.approx(0.35, abs=1e-6)
+    assert restored.to_selector_dict()["COLMAP_ENABLE_STAGE0"] is True
+    assert restored.to_selector_dict()["COLMAP_MOTION_AWARE_SELECTION"] is True
+    assert restored.to_selector_dict()["COLMAP_NMS_MOTION_WINDOW_RATIO"] == pytest.approx(0.5, abs=1e-6)
+    assert restored.to_selector_dict()["COLMAP_STAGE1_ADAPTIVE_THRESHOLD"] is True
+    assert restored.to_selector_dict()["COLMAP_STAGE1_MIN_CANDIDATES_PER_BIN"] == 3
+    assert restored.to_selector_dict()["COLMAP_STAGE1_MAX_CANDIDATES"] == 360
     assert restored.to_selector_dict()["COLMAP_RIG_POLICY"] == "lr_opk"
     assert restored.to_selector_dict()["COLMAP_RIG_SEED_OPK_DEG"] == [0.0, 0.0, 180.0]
     assert restored.to_selector_dict()["COLMAP_WORKSPACE_SCOPE"] == "run_scoped"

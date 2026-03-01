@@ -89,7 +89,7 @@ def test_stage0_adaptive_subsample_changes_effective_interval():
     assert max(values) >= 3
 
 
-def test_colmap_stage2_relaxed_disables_stage0_stage3(monkeypatch, tmp_path):
+def test_colmap_stage2_relaxed_enables_stage0_and_disables_stage3(monkeypatch, tmp_path):
     order = []
 
     class _Loader:
@@ -138,9 +138,9 @@ def test_colmap_stage2_relaxed_disables_stage0_stage3(monkeypatch, tmp_path):
     out = selector.select_keyframes(_Loader(), stage_temp_store=store)
 
     assert len(out) == 1
-    assert order == ["1", "2"]
+    assert order == ["1", "0", "2"]
     assert selector.last_selection_runtime["policy"] == "stage2_relaxed"
-    assert selector.last_selection_runtime["effective_stage_plan"] == "Stage1->Stage2(relaxed)"
+    assert selector.last_selection_runtime["effective_stage_plan"] == "Stage1->Stage0->Stage2(relaxed)"
 
 
 def test_apply_nms_uses_configured_time_window():
@@ -211,3 +211,122 @@ def test_colmap_retarget_auto_mode_stays_within_bounds():
     assert info["effective_target_min"] >= 120
     assert info["effective_target_max"] <= 240
     assert info["effective_target_min"] <= len(out) <= info["effective_target_max"]
+
+
+def test_build_cumulative_motion_map_interpolation():
+    selector = KeyframeSelector()
+    stage0_metrics = {
+        0: {"flow_mag_light": 0.0},
+        10: {"flow_mag_light": 2.0},
+        20: {"flow_mag_light": 4.0},
+    }
+    motion_map, info = selector._build_cumulative_motion_map(stage0_metrics, total_frames=21)
+    assert len(motion_map) == 21
+    assert info["sample_count"] == 3
+    assert info["motion_median_step"] > 0.0
+    assert motion_map[0] <= motion_map[5] <= motion_map[10] <= motion_map[20]
+
+
+def test_apply_nms_with_motion_window():
+    selector = KeyframeSelector()
+    cands = [
+        KeyframeInfo(frame_index=10, timestamp=1.0, combined_score=0.9),
+        KeyframeInfo(frame_index=100, timestamp=10.0, combined_score=0.8),
+    ]
+    selected = selector._apply_nms(
+        cands,
+        time_window=0.05,
+        cumulative_motion_map={10: 5.0, 100: 5.1},
+        motion_window=0.5,
+        motion_aware_selection=True,
+    )
+    assert len(selected) == 1
+    assert selected[0].frame_index == 10
+
+
+def test_motion_distributed_downsample_keeps_edges():
+    selector = KeyframeSelector()
+    keyframes = [KeyframeInfo(frame_index=i, timestamp=i / 30.0, combined_score=0.7) for i in [0, 10, 20, 30, 40, 50]]
+    down = selector._motion_distributed_downsample(
+        keyframes,
+        target_count=3,
+        cumulative_motion_map={0: 0.0, 10: 1.0, 20: 2.0, 30: 4.0, 40: 7.0, 50: 10.0},
+    )
+    idx = [k.frame_index for k in down]
+    assert len(idx) == 3
+    assert idx[0] == 0
+    assert idx[-1] == 50
+
+
+def test_retarget_supplement_motion_distance_priority():
+    selector = KeyframeSelector()
+    existing = [
+        KeyframeInfo(frame_index=0, timestamp=0.0, combined_score=0.8),
+        KeyframeInfo(frame_index=100, timestamp=100 / 30.0, combined_score=0.7),
+    ]
+    stage1_candidates = [
+        {"frame_idx": 0, "quality_scores": {"quality": 0.7}},
+        {"frame_idx": 50, "quality_scores": {"quality": 0.7}},
+        {"frame_idx": 90, "quality_scores": {"quality": 0.7}},
+        {"frame_idx": 100, "quality_scores": {"quality": 0.7}},
+    ]
+    out, _info = selector._retarget_keyframes_for_colmap(
+        existing,
+        stage1_candidates,
+        total_frames=120,
+        fps=30.0,
+        target_mode="fixed",
+        target_min=3,
+        target_max=10,
+        cumulative_motion_map={0: 0.0, 50: 99.0, 90: 50.0, 100: 100.0},
+    )
+    idx = [k.frame_index for k in out]
+    assert 90 in idx
+    assert 50 not in idx
+
+
+def test_stage2_drop_reason_annotation_min_interval():
+    import numpy as np
+
+    class _Cap:
+        def __init__(self, frames):
+            self.frames = frames
+            self.pos = 0
+
+        def set(self, _prop, value):
+            self.pos = int(value)
+
+        def read(self):
+            if 0 <= self.pos < len(self.frames):
+                out = self.frames[self.pos]
+                self.pos += 1
+                return True, out.copy()
+            return False, None
+
+        def release(self):
+            return None
+
+    class _Loader:
+        is_paired = False
+        is_stereo = False
+        rig_type = "monocular"
+        _video_path = "dummy.mp4"
+
+    selector = KeyframeSelector(config={"MIN_KEYFRAME_INTERVAL": 5, "ENABLE_DYNAMIC_MASK_REMOVAL": False})
+    frames = [np.zeros((32, 32, 3), dtype=np.uint8) for _ in range(4)]
+    selector._open_independent_capture = lambda _path: _Cap(frames)
+
+    metadata = SimpleNamespace(frame_count=4, fps=30.0, rig_calibration=None)
+    stage1_candidates = [
+        {"frame_idx": 0, "quality_scores": {"quality": 0.8, "sharpness": 100.0, "exposure": 0.8}},
+        {"frame_idx": 1, "quality_scores": {"quality": 0.8, "sharpness": 100.0, "exposure": 0.8}},
+    ]
+    _cands, records = selector._stage2_precise_evaluation(
+        _Loader(),
+        metadata,
+        stage1_candidates,
+        progress_callback=None,
+    )
+    reasons = [r.drop_reason for r in records]
+    assert "selected" in reasons
+    assert "min_interval" in reasons

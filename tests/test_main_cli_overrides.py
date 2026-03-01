@@ -29,6 +29,12 @@ def test_apply_cli_overrides_performance_knobs():
         colmap_keyframe_target_min=120,
         colmap_keyframe_target_max=240,
         colmap_nms_window_sec=0.35,
+        colmap_enable_stage0=True,
+        colmap_motion_aware_selection=True,
+        colmap_nms_motion_window_ratio=0.5,
+        colmap_stage1_adaptive_threshold=True,
+        colmap_stage1_min_candidates_per_bin=3,
+        colmap_stage1_max_candidates=360,
         colmap_rig_policy="lr_opk",
         colmap_rig_seed_opk=[0.0, 0.0, 180.0],
         colmap_workspace_scope="run_scoped",
@@ -57,6 +63,12 @@ def test_apply_cli_overrides_performance_knobs():
     assert config["colmap_keyframe_target_min"] == 120
     assert config["colmap_keyframe_target_max"] == 240
     assert config["colmap_nms_window_sec"] == 0.35
+    assert config["colmap_enable_stage0"] is True
+    assert config["colmap_motion_aware_selection"] is True
+    assert config["colmap_nms_motion_window_ratio"] == 0.5
+    assert config["colmap_stage1_adaptive_threshold"] is True
+    assert config["colmap_stage1_min_candidates_per_bin"] == 3
+    assert config["colmap_stage1_max_candidates"] == 360
     assert config["colmap_rig_policy"] == "lr_opk"
     assert config["colmap_rig_seed_opk_deg"] == [0.0, 0.0, 180.0]
     assert config["colmap_workspace_scope"] == "run_scoped"

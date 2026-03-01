@@ -13,11 +13,13 @@ class StageTempStore:
     """Persist stage outputs to temporary files under ~/.360split/tmp_runs/<run_id>."""
 
     STAGE1_CANDIDATES_FILE = "stage1_candidates.jsonl"
+    STAGE1_CANDIDATES_EFFECTIVE_FILE = "stage1_candidates_effective.jsonl"
     STAGE1_RECORDS_FILE = "stage1_records.jsonl"
     STAGE0_METRICS_FILE = "stage0_metrics.jsonl"
     STAGE2_CANDIDATES_FILE = "stage2_candidates.jsonl"
     STAGE2_RECORDS_FILE = "stage2_records.jsonl"
     STAGE3_KEYFRAMES_FILE = "stage3_keyframes.jsonl"
+    ANALYSIS_SUMMARY_FILE = "analysis_summary.json"
     MANIFEST_FILE = "manifest.json"
 
     def __init__(self, run_id: str, root_dir: Optional[Path] = None):
@@ -132,8 +134,15 @@ class StageTempStore:
         p2 = self._write_jsonl(self.STAGE1_RECORDS_FILE, records)
         return {"candidates": str(p1), "records": str(p2)}
 
+    def save_stage1_effective(self, candidates: List[Dict[str, Any]]) -> str:
+        p = self._write_jsonl(self.STAGE1_CANDIDATES_EFFECTIVE_FILE, candidates)
+        return str(p)
+
     def load_stage1(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         return self._read_jsonl(self.STAGE1_CANDIDATES_FILE), self._read_jsonl(self.STAGE1_RECORDS_FILE)
+
+    def load_stage1_effective(self) -> List[Dict[str, Any]]:
+        return self._read_jsonl(self.STAGE1_CANDIDATES_EFFECTIVE_FILE)
 
     def save_stage0(self, metrics: Dict[int, Dict[str, Any]]) -> str:
         rows = []
@@ -173,6 +182,14 @@ class StageTempStore:
     def load_stage3(self) -> List[Dict[str, Any]]:
         return self._read_jsonl(self.STAGE3_KEYFRAMES_FILE)
 
+    def save_analysis_summary(self, summary: Dict[str, Any]) -> str:
+        path = self.run_dir / self.ANALYSIS_SUMMARY_FILE
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2, default=self._json_default)
+        self._manifest["analysis_summary_file"] = str(path)
+        self._write_manifest()
+        return str(path)
+
     def mark_stage_done(
         self,
         stage: str,
@@ -200,6 +217,13 @@ class StageTempStore:
         self._manifest["failed_stage"] = str(stage)
         self._manifest["error"] = str(error)
         self._manifest["cleanup_status"] = "retained_on_error"
+        self._write_manifest()
+
+    def mark_retained_on_success(self) -> None:
+        self._manifest["failed"] = False
+        self._manifest["failed_stage"] = None
+        self._manifest["error"] = None
+        self._manifest["cleanup_status"] = "retained_on_success"
         self._write_manifest()
 
     def record_resume_state(self, *, enabled: bool) -> None:

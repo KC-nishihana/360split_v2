@@ -18,7 +18,7 @@ import json
 import uuid
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 import numpy as np
 
 from PySide6.QtWidgets import (
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QMenuBar, QToolBar, QStatusBar,
     QMessageBox, QProgressBar, QLabel
 )
-from PySide6.QtCore import Qt, QSize, QUrl
+from PySide6.QtCore import Qt, QSize, QUrl, QTimer
 from PySide6.QtGui import QKeySequence, QAction, QDragEnterEvent, QDropEvent
 
 from gui.video_player import VideoPlayerWidget
@@ -37,8 +37,10 @@ from gui.settings_panel import SettingsPanel
 from gui.settings_dialog import SettingsDialog
 from gui.keyframe_panel import KeyframePanel
 from gui.log_panel import LogPanel
+from gui.analysis_dashboard import AnalysisDashboardWidget
+from gui.analysis_data_loader import load_analysis_artifacts
 from gui.export_dialog import ExportDialog
-from gui.workers import UnifiedAnalysisWorker, ExportWorker, FrameScoreData
+from gui.workers import UnifiedAnalysisWorker, PoseOnlyWorker, ExportWorker, FrameScoreData
 
 from config import KeyframeConfig, NormalizationConfig
 
@@ -63,6 +65,7 @@ class MainWindow(QMainWindow):
         self.video_path: Optional[str] = None
         self._stage1_scores: List[FrameScoreData] = []
         self._analysis_worker: Optional[UnifiedAnalysisWorker] = None
+        self._pose_only_worker: Optional[PoseOnlyWorker] = None
         self._export_worker: Optional[ExportWorker] = None
         self._analysis_masks: Dict[int, object] = {}
         self._trajectory_left: bool = False
@@ -72,6 +75,15 @@ class MainWindow(QMainWindow):
         self._last_pose_summary: Dict[str, object] = {}
         self._trajectory_runtime_counter: int = 0
         self._trajectory_runtime_stride: int = 5
+        self._analysis_artifact_run_dir: Optional[Path] = None
+        self._analysis_artifact_mtime: Dict[str, int] = {}
+        self._analysis_artifact_payload: Dict[str, Any] = {}
+        self._last_analysis_config: Dict[str, Any] = {}
+        self._colmap_pending_context: Optional[Dict[str, Any]] = None
+        self._colmap_run_action: Optional[QAction] = None
+        self._analysis_artifact_poll_timer = QTimer(self)
+        self._analysis_artifact_poll_timer.setInterval(400)
+        self._analysis_artifact_poll_timer.timeout.connect(self._poll_analysis_artifacts)
 
         # ステレオ（OSV）対応
         self.is_stereo: bool = False
@@ -161,6 +173,10 @@ class MainWindow(QMainWindow):
         self.log_panel = LogPanel()
         tab_widget.addTab(self.log_panel, "🧾 解析ログ")
 
+        # タブ 4: 解析ダッシュボード
+        self.analysis_dashboard = AnalysisDashboardWidget()
+        tab_widget.addTab(self.analysis_dashboard, "📊 解析ダッシュボード")
+
         dock.setWidget(tab_widget)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
@@ -231,6 +247,9 @@ class MainWindow(QMainWindow):
         tb.addAction("📂 開く", self.open_video)
         tb.addSeparator()
         tb.addAction("🚀 解析実行", lambda: self._run_analysis(trigger_source="toolbar:run"))
+        self._colmap_run_action = tb.addAction("⏭ COLMAP実行", self._on_toolbar_run_colmap)
+        if self._colmap_run_action:
+            self._colmap_run_action.setEnabled(False)
         tb.addSeparator()
         tb.addAction("💾 エクスポート", self.export_keyframes)
 
@@ -283,6 +302,8 @@ class MainWindow(QMainWindow):
             lambda: self._run_analysis(trigger_source="settings_panel:run_stage2_legacy")
         )
         self.settings_panel.open_settings_requested.connect(self._open_settings_dialog)
+        self.analysis_dashboard.apply_settings_requested.connect(self._on_apply_dashboard_settings)
+        self.analysis_dashboard.run_colmap_requested.connect(self._on_dashboard_run_colmap)
 
     def _log_analysis_request(self, trigger_source: str, stage_mode_label: str, config: Dict, overrides: Dict):
         run_id = str(config.get("analysis_run_id", "n/a"))
@@ -298,6 +319,13 @@ class MainWindow(QMainWindow):
             f" enable_stage3_refinement={bool(config.get('enable_stage3_refinement', config.get('ENABLE_STAGE3_REFINEMENT', True)))},"
             f" stage0_stride={int(config.get('stage0_stride', config.get('STAGE0_STRIDE', 5)))}"
         )
+
+    def _reset_colmap_pending_state(self, clear_candidates: bool = True) -> None:
+        self._colmap_pending_context = None
+        if self._colmap_run_action is not None:
+            self._colmap_run_action.setEnabled(False)
+        if clear_candidates:
+            self.analysis_dashboard.set_colmap_candidates([])
 
     # ==================================================================
     # ドラッグ＆ドロップ
@@ -346,6 +374,8 @@ class MainWindow(QMainWindow):
             self.trajectory.set_frame_data([], [])
             self.trajectory.reset_runtime_trajectory()
             self.video_player.set_keyframe_indices([])
+            self.analysis_dashboard.reset_for_run("-", self.settings_panel.get_selector_dict())
+            self._reset_colmap_pending_state(clear_candidates=False)
 
             self.video_path = path
 
@@ -420,6 +450,7 @@ class MainWindow(QMainWindow):
 
             # 設定パネルをリロード（保存された設定を反映）
             self.settings_panel.reload_from_file()
+            self.analysis_dashboard.set_current_settings(self.settings_panel.get_selector_dict())
             logger.info("設定パネルを再読み込みしました")
 
     # ==================================================================
@@ -432,6 +463,7 @@ class MainWindow(QMainWindow):
             return
 
         self._stop_workers()
+        self._reset_colmap_pending_state(clear_candidates=True)
         self._stage1_scores.clear()
         self._analysis_masks.clear()
         self._trajectory_runtime_counter = 0
@@ -519,6 +551,9 @@ class MainWindow(QMainWindow):
         config["analysis_mode"] = "full"
         config["analysis_run_id"] = self._analysis_run_id
         config["ANALYSIS_RUN_ID"] = self._analysis_run_id
+        self._last_analysis_config = dict(config)
+        self.analysis_dashboard.reset_for_run(self._analysis_run_id, self.settings_panel.get_selector_dict())
+        self._start_analysis_artifact_poll(self._analysis_run_id)
         self._log_analysis_request(
             trigger_source=trigger_source,
             stage_mode_label=stage_mode_label,
@@ -526,13 +561,19 @@ class MainWindow(QMainWindow):
             overrides={},
         )
         self._active_stage_mode_label = "解析"
-        self._analysis_worker = UnifiedAnalysisWorker(self.video_path, config=config)
+        pause_before_colmap = bool(pose_backend == "colmap")
+        self._analysis_worker = UnifiedAnalysisWorker(
+            self.video_path,
+            config=config,
+            pause_before_colmap=pause_before_colmap,
+        )
         self._analysis_worker.progress.connect(self._on_progress)
         self._analysis_worker.stage1_batch.connect(self._on_stage1_batch)
         self._analysis_worker.stage1_finished.connect(self._on_stage1_finished)
         self._analysis_worker.frame_scores_updated.connect(self._on_scores_updated)
         self._analysis_worker.trajectory_updated.connect(self._on_trajectory_updated)
         self._analysis_worker.keyframes_found.connect(self._on_keyframes_found)
+        self._analysis_worker.pose_pending.connect(self._on_pose_pending)
         self._analysis_worker.pose_finished.connect(self._on_pose_finished)
         self._analysis_worker.analysis_finished.connect(self._on_analysis_finished)
         self._analysis_worker.error.connect(self._on_error)
@@ -545,6 +586,7 @@ class MainWindow(QMainWindow):
     def _on_stage1_batch(self, batch: list):
         """Stage 1 バッチ結果をプログレッシブにグラフ追加"""
         self._stage1_scores.extend(batch)
+        self.analysis_dashboard.update_stage1_batch(list(batch))
         norm_factor = 1000.0  # NormalizationConfig.SHARPNESS_NORM_FACTOR
         indices = [s.frame_index for s in batch]
         sharpness = [min(s.sharpness / norm_factor, 1.0) for s in batch]
@@ -609,6 +651,8 @@ class MainWindow(QMainWindow):
         self.trajectory.set_frame_data(updated, self.keyframe_list.keyframe_frames, vo_summary=vo_summary)
 
     def _on_analysis_finished(self):
+        self._poll_analysis_artifacts()
+        self._stop_analysis_artifact_poll()
         self.trajectory.flush_runtime_trajectory()
         self._progress_bar.setVisible(False)
         n = len(self.keyframe_list.keyframe_frames)
@@ -626,6 +670,22 @@ class MainWindow(QMainWindow):
         pose_traj = int(self._last_pose_summary.get("trajectory_count", 0))
         pose_sel = int(self._last_pose_summary.get("selected_count", 0))
         pose_fail = str(self._last_pose_summary.get("failure_reason", "") or "")
+        has_pending_colmap = bool(self._colmap_pending_context)
+        if has_pending_colmap and pose_backend == "colmap":
+            self.statusBar().showMessage(
+                f"解析完了: {n} キーフレーム / VO有効率 {ratio:.1%} ({valid}/{attempts})。"
+                "COLMAPは手動実行待機中です。"
+            )
+            QMessageBox.information(
+                self,
+                "解析完了（COLMAP待機）",
+                f"解析完了: {n} キーフレームを検出しました\n"
+                f"VO有効率: {ratio:.1%} ({valid}/{attempts})\n"
+                "COLMAPはまだ未実行です。\n"
+                "解析ダッシュボードまたはツールバーの「⏭ COLMAP実行」から実行してください。",
+            )
+            return
+
         self.statusBar().showMessage(
             f"解析完了: {n} キーフレーム / VO有効率 {ratio:.1%} ({valid}/{attempts}), "
             f"VO pose={pose_valid}, backend={pose_backend}, pose={pose_traj}, selected={pose_sel}"
@@ -645,6 +705,7 @@ class MainWindow(QMainWindow):
     def _on_pose_finished(self, payload: dict):
         self._last_pose_summary = dict(payload or {})
         self.trajectory.set_pose_summary(self._last_pose_summary)
+        self.analysis_dashboard.update_pose_summary(self._last_pose_summary)
         backend = str(self._last_pose_summary.get("backend", "vo"))
         traj = int(self._last_pose_summary.get("trajectory_count", 0))
         selected = int(self._last_pose_summary.get("selected_count", 0))
@@ -653,6 +714,177 @@ class MainWindow(QMainWindow):
             logger.warning(f"[COLMAP_LAST_ERROR] {fail}")
         else:
             logger.info(f"pose_finished, backend={backend}, trajectory={traj}, selected={selected}")
+        if backend == "colmap" and self._colmap_pending_context:
+            self.statusBar().showMessage(
+                f"COLMAP完了: trajectory={traj}, selected={selected}。選択を変更して再実行できます。"
+            )
+
+    def _on_pose_pending(self, payload: dict):
+        info = dict(payload or {})
+        run_id = str(info.get("run_id", self._analysis_run_id or "")).strip()
+        preview_indices = [
+            int(v) for v in list(info.get("stage2_colmap_preview_indices", []) or []) if isinstance(v, (int, float))
+        ]
+        candidates = self._collect_colmap_candidates(run_id)
+        self._colmap_pending_context = {
+            "run_id": run_id,
+            "backend": "colmap",
+            "stage2_colmap_preview_indices": preview_indices,
+            "final_keyframes_count": int(info.get("final_keyframes_count", len(candidates))),
+            "candidates": list(candidates),
+            "config": dict(self._last_analysis_config or self.settings_panel.get_selector_dict()),
+            "video_path": str(self.video_path or ""),
+        }
+        self.analysis_dashboard.set_colmap_candidates(candidates)
+        if self._colmap_run_action is not None:
+            self._colmap_run_action.setEnabled(bool(candidates))
+        self._last_pose_summary = {
+            "enabled": True,
+            "backend": "colmap",
+            "trajectory_count": 0,
+            "selected_count": 0,
+            "selection_stats": {},
+            "failure_reason": None,
+            "pending": True,
+        }
+        self.statusBar().showMessage(
+            f"解析完了。COLMAP実行待機中（候補 {len(candidates)} 件）。ダッシュボードまたはツールバーから実行してください。"
+        )
+        logger.info(
+            "pose_pending,"
+            f" analysis_run_id={run_id},"
+            f" candidates={len(candidates)},"
+            f" preview_indices={len(preview_indices)}"
+        )
+
+    def _on_dashboard_run_colmap(self, selected_frames: list):
+        self._run_pending_colmap(
+            selected_frames=selected_frames,
+            trigger_source="dashboard:run_colmap",
+        )
+
+    def _on_toolbar_run_colmap(self):
+        self._run_pending_colmap(
+            selected_frames=self.analysis_dashboard.selected_colmap_frames(),
+            trigger_source="toolbar:run_colmap",
+        )
+
+    def _run_pending_colmap(self, selected_frames: Optional[List[int]], trigger_source: str) -> None:
+        if self._pose_only_worker and self._pose_only_worker.isRunning():
+            QMessageBox.warning(self, "警告", "COLMAP実行中です。完了後に再実行してください。")
+            return
+        pending = self._colmap_pending_context or {}
+        if not pending:
+            QMessageBox.warning(self, "警告", "COLMAP実行待機中の解析結果がありません。先に解析を実行してください。")
+            return
+        if not self.video_path:
+            QMessageBox.warning(self, "警告", "ビデオが読み込まれていません。")
+            return
+        selected = sorted({int(v) for v in list(selected_frames or []) if isinstance(v, (int, float)) and int(v) >= 0})
+        if not selected:
+            QMessageBox.warning(self, "警告", "COLMAP採用画像が0件です。1件以上選択してください。")
+            return
+        run_id = str(pending.get("run_id", self._analysis_run_id or "")).strip()
+        if not run_id:
+            QMessageBox.warning(self, "警告", "run_id が不明なため COLMAP を実行できません。")
+            return
+        cfg = dict(pending.get("config") or self._last_analysis_config or self.settings_panel.get_selector_dict())
+        cfg["pose_backend"] = "colmap"
+        cfg["POSE_BACKEND"] = "colmap"
+        preview_indices = [
+            int(v)
+            for v in list(pending.get("stage2_colmap_preview_indices", []) or [])
+            if isinstance(v, (int, float))
+        ]
+
+        self._pose_only_worker = PoseOnlyWorker(
+            video_path=self.video_path,
+            run_id=run_id,
+            selected_frame_indices=selected,
+            config=cfg,
+            colmap_preview_frame_indices=preview_indices,
+        )
+        self._pose_only_worker.progress.connect(self._on_progress)
+        self._pose_only_worker.pose_finished.connect(self._on_pose_finished)
+        self._pose_only_worker.error.connect(self._on_error)
+        self._pose_only_worker.finished.connect(self._on_pose_only_finished)
+
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setValue(0)
+        self.statusBar().showMessage(f"COLMAP実行中... ({len(selected)} 枚, source={trigger_source})")
+        logger.info(
+            "pose_only_request,"
+            f" analysis_run_id={run_id},"
+            f" trigger={trigger_source},"
+            f" selected={len(selected)},"
+            f" preview={len(preview_indices)}"
+        )
+        self._pose_only_worker.start()
+
+    def _on_pose_only_finished(self):
+        self._progress_bar.setVisible(False)
+        self._pose_only_worker = None
+
+    def _collect_colmap_candidates(self, run_id: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        frames = list(self.keyframe_list.keyframe_frames or [])
+        scores = list(self.keyframe_list.keyframe_scores or [])
+        if frames:
+            for i, frame_idx in enumerate(frames):
+                score = scores[i] if i < len(scores) else 0.0
+                rows.append({"frame_index": int(frame_idx), "score": float(score)})
+        else:
+            rows = self._load_stage3_keyframes_from_tmp_run(run_id)
+
+        dedup: Dict[int, float] = {}
+        for row in rows:
+            try:
+                frame_idx = int(row.get("frame_index", -1))
+            except Exception:
+                continue
+            if frame_idx < 0:
+                continue
+            try:
+                score = float(row.get("score", 0.0))
+            except Exception:
+                score = 0.0
+            dedup[frame_idx] = score
+        out = [{"frame_index": idx, "score": dedup[idx]} for idx in sorted(dedup.keys())]
+        return out
+
+    @staticmethod
+    def _load_stage3_keyframes_from_tmp_run(run_id: str) -> List[Dict[str, Any]]:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return []
+        path = Path.home() / ".360split" / "tmp_runs" / rid / "stage3_keyframes.jsonl"
+        if not path.exists():
+            return []
+        rows: List[Dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        item = json.loads(text)
+                    except Exception:
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    frame_idx = item.get("frame_index")
+                    if not isinstance(frame_idx, (int, float)):
+                        continue
+                    score = item.get("combined_stage3", item.get("combined_score", item.get("score", 0.0)))
+                    try:
+                        score_v = float(score)
+                    except Exception:
+                        score_v = 0.0
+                    rows.append({"frame_index": int(frame_idx), "score": score_v})
+        except Exception:
+            return []
+        return rows
 
     # ==================================================================
     # 共通コールバック
@@ -686,6 +918,7 @@ class MainWindow(QMainWindow):
         self.trajectory.append_runtime_pose(payload, force=force)
 
     def _on_error(self, msg: str):
+        self._stop_analysis_artifact_poll()
         self._progress_bar.setVisible(False)
         self.statusBar().showMessage(f"エラー: {msg}")
         QMessageBox.critical(self, "エラー", msg)
@@ -989,10 +1222,112 @@ class MainWindow(QMainWindow):
     # ==================================================================
 
     def _stop_workers(self):
-        for w in [self._analysis_worker, self._export_worker]:
+        self._stop_analysis_artifact_poll()
+        for w in [self._analysis_worker, self._pose_only_worker, self._export_worker]:
             if w and w.isRunning():
                 w.stop()
                 w.wait(3000)
+
+    def _start_analysis_artifact_poll(self, run_id: str) -> None:
+        rid = str(run_id or "").strip()
+        if not rid:
+            self._stop_analysis_artifact_poll()
+            return
+        self._analysis_artifact_run_dir = Path.home() / ".360split" / "tmp_runs" / rid
+        self._analysis_artifact_mtime = {}
+        self._analysis_artifact_payload = {}
+        self._analysis_artifact_poll_timer.start()
+
+    def _stop_analysis_artifact_poll(self) -> None:
+        if self._analysis_artifact_poll_timer.isActive():
+            self._analysis_artifact_poll_timer.stop()
+        self._analysis_artifact_run_dir = None
+        self._analysis_artifact_mtime = {}
+
+    def _poll_analysis_artifacts(self) -> None:
+        run_dir = self._analysis_artifact_run_dir
+        if run_dir is None:
+            return
+        artifact_files = [
+            run_dir / "stage1_records.jsonl",
+            run_dir / "stage2_records.jsonl",
+            run_dir / "stage2_colmap_preview.jsonl",
+            run_dir / "stage3_diagnostics.json",
+            run_dir / "analysis_summary.json",
+        ]
+        changed = False
+        for path in artifact_files:
+            if not path.exists():
+                continue
+            try:
+                mtime_ns = int(path.stat().st_mtime_ns)
+            except OSError:
+                continue
+            key = str(path)
+            if self._analysis_artifact_mtime.get(key) != mtime_ns:
+                self._analysis_artifact_mtime[key] = mtime_ns
+                changed = True
+        if not changed:
+            return
+        try:
+            payload = load_analysis_artifacts(run_dir, pose_summary=self._last_pose_summary)
+        except Exception:
+            # 途中書きファイル等は次回ポーリングで再試行する。
+            return
+        self._analysis_artifact_payload = dict(payload)
+        self.analysis_dashboard.update_stage_artifacts(self._analysis_artifact_payload)
+
+    @staticmethod
+    def _canonical_setting_key(key: str) -> str:
+        k = str(key or "").strip()
+        if k == "ssim_change_threshold":
+            return "ssim_threshold"
+        return k
+
+    def _on_apply_dashboard_settings(self, payload: dict) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        settings_dir = Path.home() / ".360split"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        settings_file = settings_dir / "settings.json"
+
+        current: Dict[str, Any] = {}
+        if settings_file.exists():
+            try:
+                with settings_file.open("r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    current = dict(loaded)
+            except Exception:
+                current = {}
+
+        updates: Dict[str, Any] = {}
+        for raw_key, value in payload.items():
+            key = self._canonical_setting_key(str(raw_key))
+            if not key:
+                continue
+            if current.get(key) != value:
+                updates[key] = value
+
+        if not updates:
+            self.statusBar().showMessage("更新対象の差分はありません")
+            return
+
+        merged = dict(current)
+        merged.update(updates)
+        merged = SettingsDialog._strip_vo_legacy_keys(merged)
+
+        try:
+            with settings_file.open("w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.exception("ダッシュボード設定保存エラー")
+            QMessageBox.critical(self, "エラー", f"設定保存に失敗しました:\n{e}")
+            return
+
+        self.settings_panel.reload_from_file()
+        self.analysis_dashboard.set_current_settings(self.settings_panel.get_selector_dict())
+        self.statusBar().showMessage("設定適用済み。再解析を実行してください")
 
     def closeEvent(self, event):
         self._stop_workers()

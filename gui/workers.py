@@ -18,7 +18,7 @@ import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 from collections import deque
 
@@ -494,15 +494,17 @@ class UnifiedAnalysisWorker(QThread):
     frame_scores_updated = Signal(list)
     trajectory_updated = Signal(dict)
     keyframes_found = Signal(list)
+    pose_pending = Signal(dict)
     pose_finished = Signal(dict)
     analysis_finished = Signal()
     error = Signal(str)
 
     def __init__(self, video_path: str, config: dict = None,
-                 parent: QObject = None):
+                 parent: QObject = None, pause_before_colmap: bool = False):
         super().__init__(parent)
         self.video_path = video_path
         self.config = config or {}
+        self.pause_before_colmap = bool(pause_before_colmap)
         self._is_running = True
 
     def stop(self):
@@ -850,9 +852,24 @@ class UnifiedAnalysisWorker(QThread):
                     frame_log_callback=frame_log_cb,
                     stage_temp_store=stage_store,
                 )
+                pose_backend = str(
+                    self.config.get("pose_backend", self.config.get("POSE_BACKEND", "vo")) or "vo"
+                ).strip().lower()
+                if pose_backend not in {"vo", "colmap"}:
+                    pose_backend = "vo"
+                should_pause_before_colmap = bool(
+                    self.pause_before_colmap and pose_backend == "colmap"
+                )
+                colmap_preview_indices = list(
+                    getattr(selector, "last_selection_runtime", {}).get(
+                        "stage2_colmap_preview_indices",
+                        [],
+                    )
+                    or []
+                )
                 pose_summary = {
                     "enabled": True,
-                    "backend": str(self.config.get("pose_backend", self.config.get("POSE_BACKEND", "vo")) or "vo"),
+                    "backend": pose_backend,
                     "trajectory_count": 0,
                     "selected_count": 0,
                     "selection_stats": {},
@@ -866,28 +883,25 @@ class UnifiedAnalysisWorker(QThread):
                     "failure_reason": None,
                 }
                 if self._is_running:
-                    self.progress.emit(90, 100, "Pose推定開始...")
-                    try:
-                        pose_summary = self._run_pose_phase(
-                            loader=loader,
-                            keyframes=keyframes,
-                            metrics_map=metrics_map,
-                            pose_map=pose_map,
-                            run_id=run_id,
-                            colmap_preview_frame_indices=list(
-                                getattr(selector, "last_selection_runtime", {}).get(
-                                    "stage2_colmap_preview_indices",
-                                    [],
-                                )
-                                or []
-                            ),
-                        )
-                        self.progress.emit(100, 100, "Pose推定完了")
-                    except Exception as pose_error:
-                        logger.exception("Pose phase error")
-                        pose_summary["failure_reason"] = str(pose_error)
-                        if str(pose_summary.get("backend", "vo")).lower() == "colmap":
-                            raise
+                    if should_pause_before_colmap:
+                        self.progress.emit(100, 100, "解析完了（COLMAP実行待ち）")
+                    else:
+                        self.progress.emit(90, 100, "Pose推定開始...")
+                        try:
+                            pose_summary = self._run_pose_phase(
+                                loader=loader,
+                                keyframes=keyframes,
+                                metrics_map=metrics_map,
+                                pose_map=pose_map,
+                                run_id=run_id,
+                                colmap_preview_frame_indices=colmap_preview_indices,
+                            )
+                            self.progress.emit(100, 100, "Pose推定完了")
+                        except Exception as pose_error:
+                            logger.exception("Pose phase error")
+                            pose_summary["failure_reason"] = str(pose_error)
+                            if str(pose_summary.get("backend", "vo")).lower() == "colmap":
+                                raise
             finally:
                 loader.close()
 
@@ -938,14 +952,25 @@ class UnifiedAnalysisWorker(QThread):
 
             self.frame_scores_updated.emit(updated_scores)
             self.keyframes_found.emit(keyframes)
-            self.pose_finished.emit(dict(pose_summary))
+            if should_pause_before_colmap:
+                self.pose_pending.emit(
+                    {
+                        "run_id": run_id,
+                        "backend": "colmap",
+                        "stage2_colmap_preview_indices": list(colmap_preview_indices),
+                        "final_keyframes_count": len(keyframes),
+                    }
+                )
+            else:
+                self.pose_finished.emit(dict(pose_summary))
             self.progress.emit(100, 100, "解析完了")
             self.analysis_finished.emit()
             logger.info(
                 "worker_finished, worker=UnifiedAnalysisWorker,"
                 f" analysis_run_id={run_id},"
                 f" keyframes={len(keyframes)},"
-                f" updated_scores={len(updated_scores)}"
+                f" updated_scores={len(updated_scores)},"
+                f" pose_pending={bool(should_pause_before_colmap)}"
             )
 
         except Exception as e:
@@ -956,6 +981,194 @@ class UnifiedAnalysisWorker(QThread):
 class FullAnalysisWorker(UnifiedAnalysisWorker):
     """後方互換ラッパー。GUIは UnifiedAnalysisWorker を使用する。"""
     pass
+
+
+class PoseOnlyWorker(QThread):
+    """再解析を行わず、選択フレームのみで Pose(COLMAP) を再実行するワーカー。"""
+
+    progress = Signal(int, int, str)
+    pose_finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        video_path: str,
+        run_id: str,
+        selected_frame_indices: List[int],
+        config: Optional[dict] = None,
+        colmap_preview_frame_indices: Optional[List[int]] = None,
+        parent: Optional[QObject] = None,
+    ):
+        super().__init__(parent)
+        self.video_path = str(video_path)
+        self.run_id = str(run_id or "").strip() or str(uuid.uuid4())
+        self.selected_frame_indices = [
+            int(v) for v in list(selected_frame_indices or []) if isinstance(v, (int, float))
+        ]
+        self.config = dict(config or {})
+        self.colmap_preview_frame_indices = [
+            int(v) for v in list(colmap_preview_frame_indices or []) if isinstance(v, (int, float))
+        ]
+        self._is_running = True
+
+    def stop(self) -> None:
+        self._is_running = False
+
+    @staticmethod
+    def _export_selected_frames(loader, selected_indices: List[int], image_dir: Path) -> List[Dict[str, object]]:
+        image_dir.mkdir(parents=True, exist_ok=True)
+        entries: List[Dict[str, object]] = []
+        is_paired = bool(getattr(loader, "is_paired", False))
+        for idx in selected_indices:
+            if idx < 0:
+                continue
+            if is_paired:
+                frame_a, frame_b = loader.get_frame_pair(int(idx))
+                if frame_a is None or frame_b is None:
+                    continue
+                for frame, suffix in ((frame_a, "_L"), (frame_b, "_R")):
+                    subdir = image_dir / suffix.strip("_")
+                    subdir.mkdir(parents=True, exist_ok=True)
+                    name = f"keyframe_{int(idx):06d}{suffix}.png"
+                    abs_path = subdir / name
+                    if not cv2.imwrite(str(abs_path), frame):
+                        continue
+                    rel = f"{suffix.strip('_')}/{name}"
+                    entries.append({"filename": rel, "frame_index": int(idx), "abs_path": str(abs_path)})
+            else:
+                frame = loader.get_frame(int(idx))
+                if frame is None:
+                    continue
+                name = f"keyframe_{int(idx):06d}.png"
+                abs_path = image_dir / name
+                if not cv2.imwrite(str(abs_path), frame):
+                    continue
+                entries.append({"filename": name, "frame_index": int(idx), "abs_path": str(abs_path)})
+        return entries
+
+    @staticmethod
+    def _build_pose_summary(payload: Dict[str, Any], pose_root: Path, backend: str) -> Dict[str, object]:
+        result = payload.get("result")
+        return {
+            "enabled": True,
+            "backend": str(backend or "colmap"),
+            "trajectory_count": int(payload.get("trajectory_count", 0)),
+            "selected_count": int(payload.get("selected_count", 0)),
+            "selection_stats": dict(payload.get("selection_stats", {})),
+            "pose_trajectory_csv": payload.get("pose_trajectory_csv"),
+            "metashape_csv": payload.get("metashape_csv"),
+            "selected_images_dir": payload.get("selected_images_dir"),
+            "selected_images_list": payload.get("selected_images_list"),
+            "copied_count": int(payload.get("copied_count", 0)),
+            "diagnostics": dict(getattr(result, "diagnostics", {}) or {}),
+            "raw_log_paths": dict(getattr(result, "raw_log_paths", {}) or {}),
+            "failure_reason": None,
+            "output_root": str(pose_root),
+        }
+
+    def run(self) -> None:
+        try:
+            from core.video_loader import VideoLoader, DualVideoLoader
+
+            selected = sorted({int(v) for v in self.selected_frame_indices if int(v) >= 0})
+            if not selected:
+                raise ValueError("COLMAP実行対象フレームが0件です")
+
+            backend = str(
+                self.config.get("pose_backend", self.config.get("POSE_BACKEND", "colmap")) or "colmap"
+            ).strip().lower()
+            if backend != "colmap":
+                backend = "colmap"
+            self.config["pose_backend"] = "colmap"
+            self.config["POSE_BACKEND"] = "colmap"
+
+            self.progress.emit(0, 100, "COLMAP実行準備...")
+            backend_pref = str(
+                self.config.get("darwin_capture_backend", self.config.get("DARWIN_CAPTURE_BACKEND", "auto")) or "auto"
+            )
+            if str(self.video_path).lower().endswith(".osv"):
+                loader = DualVideoLoader(backend_preference=backend_pref)
+            else:
+                loader = VideoLoader(config=self.config)
+            loader.load(self.video_path)
+            try:
+                _ensure_runtime_calibration(self.config, loader)
+                pose_root = Path.home() / ".360split" / "pose_runs" / str(self.run_id)
+                image_dir = pose_root / "images"
+                if image_dir.exists():
+                    shutil.rmtree(image_dir, ignore_errors=True)
+                image_dir.mkdir(parents=True, exist_ok=True)
+
+                exported_entries = self._export_selected_frames(loader, selected, image_dir)
+                if not exported_entries:
+                    raise RuntimeError("選択フレームの画像書き出しに失敗しました")
+            finally:
+                loader.close()
+
+            if not str(self.config.get("colmap_workspace", self.config.get("COLMAP_WORKSPACE", "")) or "").strip():
+                self.config["colmap_workspace"] = str((pose_root / "colmap_workspace").resolve())
+
+            self.progress.emit(30, 100, "COLMAP実行中...")
+            payload = run_pose_pipeline(
+                image_dir=str(image_dir),
+                output_dir=str(pose_root),
+                config=self.config,
+                context={
+                    "log_callback": lambda msg: logger.info(str(msg)),
+                    "calibration_runtime": dict(self.config.get("calibration_runtime", {}) or {}),
+                    "exported_entries": exported_entries,
+                    "frame_metrics_map": {},
+                    "colmap_workspace": str(self.config.get("colmap_workspace", "") or "").strip() or str((pose_root / "colmap_workspace").resolve()),
+                    "colmap_db_path": str(self.config.get("colmap_db_path", self.config.get("COLMAP_DB_PATH", "")) or "").strip(),
+                    "analysis_run_id": str(self.run_id),
+                    "colmap_workspace_scope": str(self.config.get("colmap_workspace_scope", self.config.get("COLMAP_WORKSPACE_SCOPE", "run_scoped")) or "run_scoped"),
+                    "colmap_reuse_db": bool(self.config.get("colmap_reuse_db", self.config.get("COLMAP_REUSE_DB", False))),
+                    "colmap_rig_policy": str(self.config.get("colmap_rig_policy", self.config.get("COLMAP_RIG_POLICY", "lr_opk")) or "lr_opk"),
+                    "colmap_rig_seed_opk_deg": list(self.config.get("colmap_rig_seed_opk_deg", self.config.get("COLMAP_RIG_SEED_OPK_DEG", [0.0, 0.0, 180.0]))),
+                    "colmap_sparse_model_pick_policy": str(
+                        self.config.get(
+                            "colmap_sparse_model_pick_policy",
+                            self.config.get("COLMAP_SPARSE_MODEL_PICK_POLICY", "registered_then_coverage"),
+                        ) or "registered_then_coverage"
+                    ),
+                    "colmap_input_subset_enabled": bool(
+                        self.config.get(
+                            "colmap_input_subset_enabled",
+                            self.config.get("COLMAP_INPUT_SUBSET_ENABLED", True),
+                        )
+                    ),
+                    "colmap_input_gate_method": str(
+                        self.config.get(
+                            "colmap_input_gate_method",
+                            self.config.get("COLMAP_INPUT_GATE_METHOD", "homography_degeneracy_v1"),
+                        ) or "homography_degeneracy_v1"
+                    ),
+                    "colmap_input_gate_strength": str(
+                        self.config.get(
+                            "colmap_input_gate_strength",
+                            self.config.get("COLMAP_INPUT_GATE_STRENGTH", "medium"),
+                        ) or "medium"
+                    ),
+                    "colmap_input_min_keep_ratio": float(
+                        self.config.get(
+                            "colmap_input_min_keep_ratio",
+                            self.config.get("COLMAP_INPUT_MIN_KEEP_RATIO", 0.20),
+                        )
+                    ),
+                    "colmap_input_max_gap_rescue_frames": int(
+                        self.config.get(
+                            "colmap_input_max_gap_rescue_frames",
+                            self.config.get("COLMAP_INPUT_MAX_GAP_RESCUE_FRAMES", 150),
+                        )
+                    ),
+                    "colmap_preview_frame_indices": list(self.colmap_preview_frame_indices),
+                },
+            )
+            self.progress.emit(100, 100, "COLMAP実行完了")
+            self.pose_finished.emit(self._build_pose_summary(payload, pose_root, backend))
+        except Exception as e:
+            logger.exception("PoseOnlyWorker error")
+            self.error.emit(f"COLMAP実行エラー: {e}")
 
 
 def _normalize_path_value(raw_path: object) -> str:

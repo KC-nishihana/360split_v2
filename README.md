@@ -334,6 +334,152 @@ Stage1: 品質フィルタ（A案）
               -> NMS/間隔補完 -> 出力
 ```
 
+## アーキテクチャ図（解析中核）
+
+以下は実装コード（`main.py`, `core/`, `processing/`, `core/pose/`, `gui/workers.py`）に基づく、解析中核のクラス関係とデータフローです。
+
+### クラス図
+
+```mermaid
+classDiagram
+    class MainCLI {
+      +run_cli(args)
+      +main()
+    }
+
+    class UnifiedAnalysisWorker {
+      +run()
+      +_run_pose_phase()
+    }
+
+    class KeyframeSelector {
+      +run_stage1_scan()
+      +select_keyframes()
+    }
+    class KeyframeInfo
+    class StageTempStore
+
+    class VideoLoader
+    class DualVideoLoader
+    class FrontRearVideoLoader
+    class VideoMetadata
+
+    class QualityEvaluator
+    class GeometricEvaluator
+    class AdaptiveSelector
+
+    class EquirectangularProcessor
+    class Cross5SplitConfig
+    class Cross5FisheyeSplitter
+
+    class TargetMaskGenerator
+    class ObjectDetector
+    class InstanceSegmentor
+    class MaskProcessor
+
+    class PoseEstimator {
+      <<abstract>>
+      +estimate(image_dir, context)
+    }
+    class VOPoseEstimator
+    class COLMAPPoseEstimator
+    class PoseSelectionConfig
+    class PoseEstimationResult
+    class run_pose_pipeline {
+      <<function>>
+    }
+
+    MainCLI --> KeyframeSelector : orchestrates
+    MainCLI --> VideoLoader : creates
+    MainCLI --> DualVideoLoader : creates
+    MainCLI --> FrontRearVideoLoader : creates
+    MainCLI --> EquirectangularProcessor : optional
+    MainCLI --> Cross5FisheyeSplitter : optional
+    MainCLI --> TargetMaskGenerator : optional
+    MainCLI --> run_pose_pipeline : pose
+
+    UnifiedAnalysisWorker --> KeyframeSelector : uses
+    UnifiedAnalysisWorker --> run_pose_pipeline : uses
+
+    KeyframeSelector --> QualityEvaluator : evaluates
+    KeyframeSelector --> GeometricEvaluator : evaluates
+    KeyframeSelector --> AdaptiveSelector : evaluates
+    KeyframeSelector --> StageTempStore : persists stage artifacts
+    KeyframeSelector --> VideoLoader : reads frames
+    KeyframeSelector --> KeyframeInfo : outputs
+
+    DualVideoLoader --> VideoMetadata : holds
+    FrontRearVideoLoader --> VideoMetadata : holds
+    VideoLoader --> VideoMetadata : holds
+
+    TargetMaskGenerator --> ObjectDetector : YOLO detection
+    TargetMaskGenerator --> InstanceSegmentor : SAM segmentation
+    TargetMaskGenerator --> MaskProcessor : mask utilities
+
+    PoseEstimator <|-- VOPoseEstimator
+    PoseEstimator <|-- COLMAPPoseEstimator
+    run_pose_pipeline --> VOPoseEstimator : backend=vo
+    run_pose_pipeline --> COLMAPPoseEstimator : backend=colmap
+    run_pose_pipeline --> PoseSelectionConfig : builds
+    run_pose_pipeline --> PoseEstimationResult : returns
+```
+
+### データフロー（全体）
+
+```mermaid
+flowchart LR
+  INPUT["入力: 単眼 / OSV LR / Front-Rear"] --> ENTRY["main.py run_cli or GUI worker"]
+  ENTRY --> LOAD["VideoLoader系でフレーム供給"]
+  LOAD --> STAGE1["Stage1: 品質フィルタ"]
+  STAGE1 --> STAGE0["Stage0: 軽量走査 + VO補助"]
+  STAGE0 --> STAGE2["Stage2: 幾何 + 適応評価"]
+  STAGE2 --> STAGE3["Stage3: 軌跡再評価"]
+  STAGE3 --> SELECT["NMS/間隔制約でキーフレーム確定"]
+
+  SELECT --> IMG["画像出力"]
+  IMG --> EX1["通常画像 / L-R or F-R"]
+  IMG --> EX2["cross5分割 任意"]
+  IMG --> EX3["cubemap/equirect処理 任意"]
+  SELECT --> META["keyframe_metadata + frame_metrics + quality_metrics"]
+
+  SELECT --> POSE["run_pose_pipeline"]
+  POSE --> VO["VOPoseEstimator"]
+  POSE --> COLMAP["COLMAPPoseEstimator"]
+  VO --> POUT["pose_trajectory.csv / selected_images"]
+  COLMAP --> POUT
+```
+
+### サブフロー（Pose 推定）
+
+```mermaid
+flowchart LR
+  KF["Keyframe images"] --> PIPE["run_pose_pipeline"]
+  PIPE --> BACKEND{"pose_backend"}
+  BACKEND -->|vo| VOE["VOPoseEstimator.estimate"]
+  BACKEND -->|colmap| COLE["COLMAPPoseEstimator.estimate"]
+  VOE --> RESULT["PoseEstimationResult"]
+  COLE --> RESULT
+  RESULT --> CFG["PoseSelectionConfigで選抜条件を構築"]
+  CFG --> SELECTP["select_required_poses"]
+  SELECTP --> SELIMG["selected_images + selected_images.txt"]
+  RESULT --> CSV1["pose_trajectory.csv"]
+  RESULT --> CSV2["metashape_import.csv 任意"]
+```
+
+### サブフロー（動体/対象マスク生成）
+
+```mermaid
+flowchart LR
+  FRAME["入力フレーム"] --> TMG["TargetMaskGenerator"]
+  TMG --> DET["ObjectDetector.detect"]
+  DET --> SEG["InstanceSegmentor.segment"]
+  SEG --> COMB["検出マスク + セグメントマスク OR結合"]
+  FRAME --> MOTION["モーション差分 任意"]
+  MOTION --> COMB
+  COMB --> MP["MaskProcessorで整形"]
+  MP --> OUT["2値マスク出力 0=対象 255=背景"]
+```
+
 ## 設定ファイル（JSON）
 
 設定は `ConfigManager.default_config()` をベースに、JSONで上書きします。

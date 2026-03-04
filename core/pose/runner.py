@@ -54,6 +54,36 @@ def run_pose_pipeline(
         ctx.setdefault("colmap_reuse_db", bool(_cfg(cfg, "colmap_reuse_db", "COLMAP_REUSE_DB", False)))
         ctx.setdefault("colmap_rig_policy", str(_cfg(cfg, "colmap_rig_policy", "COLMAP_RIG_POLICY", "lr_opk") or "lr_opk"))
         ctx.setdefault("colmap_rig_seed_opk_deg", _cfg(cfg, "colmap_rig_seed_opk_deg", "COLMAP_RIG_SEED_OPK_DEG", [0.0, 0.0, 180.0]))
+        ctx.setdefault(
+            "colmap_sparse_model_pick_policy",
+            str(_cfg(cfg, "colmap_sparse_model_pick_policy", "COLMAP_SPARSE_MODEL_PICK_POLICY", "registered_then_coverage") or "registered_then_coverage"),
+        )
+        ctx.setdefault(
+            "colmap_input_subset_enabled",
+            bool(_cfg(cfg, "colmap_input_subset_enabled", "COLMAP_INPUT_SUBSET_ENABLED", True)),
+        )
+        ctx.setdefault(
+            "colmap_input_gate_method",
+            str(_cfg(cfg, "colmap_input_gate_method", "COLMAP_INPUT_GATE_METHOD", "homography_degeneracy_v1") or "homography_degeneracy_v1"),
+        )
+        ctx.setdefault(
+            "colmap_input_gate_strength",
+            str(_cfg(cfg, "colmap_input_gate_strength", "COLMAP_INPUT_GATE_STRENGTH", "medium") or "medium"),
+        )
+        ctx.setdefault(
+            "colmap_input_min_keep_ratio",
+            float(_cfg(cfg, "colmap_input_min_keep_ratio", "COLMAP_INPUT_MIN_KEEP_RATIO", 0.20)),
+        )
+        ctx.setdefault(
+            "colmap_input_max_gap_rescue_frames",
+            int(_cfg(cfg, "colmap_input_max_gap_rescue_frames", "COLMAP_INPUT_MAX_GAP_RESCUE_FRAMES", 150)),
+        )
+        preview_idx_cfg = _cfg(cfg, "colmap_preview_frame_indices", "COLMAP_PREVIEW_FRAME_INDICES", [])
+        if isinstance(preview_idx_cfg, (list, tuple)):
+            preview_idx_norm = [int(v) for v in preview_idx_cfg if isinstance(v, (int, float)) and int(v) >= 0]
+        else:
+            preview_idx_norm = []
+        ctx.setdefault("colmap_preview_frame_indices", preview_idx_norm)
 
     result: PoseEstimationResult = estimator.estimate(image_dir=image_dir, context=ctx)
 
@@ -64,6 +94,28 @@ def run_pose_pipeline(
         enable_translation=_as_bool(_cfg(cfg, "pose_select_enable_translation", "POSE_SELECT_ENABLE_TRANSLATION", None), True),
         enable_rotation=_as_bool(_cfg(cfg, "pose_select_enable_rotation", "POSE_SELECT_ENABLE_ROTATION", None), True),
         enable_observations=_as_bool(_cfg(cfg, "pose_select_enable_observations", "POSE_SELECT_ENABLE_OBSERVATIONS", None), False),
+        enable_spatial_post_filter=_as_bool(
+            _cfg(cfg, "pose_select_spatial_post_filter", "POSE_SELECT_SPATIAL_POST_FILTER", None),
+            backend == "colmap",
+        ),
+        spatial_cell_scale=float(
+            _cfg(cfg, "pose_select_spatial_cell_scale", "POSE_SELECT_SPATIAL_CELL_SCALE", 3.0)
+        ),
+        spatial_min_distance_scale=float(
+            _cfg(cfg, "pose_select_spatial_min_distance_scale", "POSE_SELECT_SPATIAL_MIN_DISTANCE_SCALE", 1.2)
+        ),
+        spatial_max_per_cell=int(
+            _cfg(cfg, "pose_select_spatial_max_per_cell", "POSE_SELECT_SPATIAL_MAX_PER_CELL", 1)
+        ),
+        spatial_max_gap_frames=int(
+            _cfg(cfg, "pose_select_spatial_max_gap_frames", "POSE_SELECT_SPATIAL_MAX_GAP_FRAMES", 150)
+        ),
+        spatial_min_keep_ratio=float(
+            _cfg(cfg, "pose_select_spatial_min_keep_ratio", "POSE_SELECT_SPATIAL_MIN_KEEP_RATIO", 0.45)
+        ),
+        spatial_max_keep_ratio=float(
+            _cfg(cfg, "pose_select_spatial_max_keep_ratio", "POSE_SELECT_SPATIAL_MAX_KEEP_RATIO", 0.80)
+        ),
     )
 
     selected_payload = select_required_poses(result.poses, selector_cfg)

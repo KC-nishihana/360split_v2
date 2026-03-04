@@ -52,6 +52,10 @@ def test_apply_cli_overrides_performance_knobs():
         colmap_workspace_scope="run_scoped",
         colmap_reuse_db=False,
         colmap_analysis_mask_profile="colmap_safe",
+        colmap_sparse_model_pick_policy="registered_then_coverage",
+        colmap_input_subset_enabled=True,
+        colmap_input_gate_method="homography_degeneracy_v1",
+        colmap_input_gate_strength="medium",
         pose_export_format="metashape",
     )
 
@@ -98,4 +102,8 @@ def test_apply_cli_overrides_performance_knobs():
     assert config["colmap_workspace_scope"] == "run_scoped"
     assert config["colmap_reuse_db"] is False
     assert config["colmap_analysis_mask_profile"] == "colmap_safe"
+    assert config["colmap_sparse_model_pick_policy"] == "registered_then_coverage"
+    assert config["colmap_input_subset_enabled"] is True
+    assert config["colmap_input_gate_method"] == "homography_degeneracy_v1"
+    assert config["colmap_input_gate_strength"] == "medium"
     assert config["pose_export_format"] == "metashape"

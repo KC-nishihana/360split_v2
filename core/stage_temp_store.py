@@ -19,7 +19,9 @@ class StageTempStore:
     STAGE0_METRICS_FILE = "stage0_metrics.jsonl"
     STAGE2_CANDIDATES_FILE = "stage2_candidates.jsonl"
     STAGE2_RECORDS_FILE = "stage2_records.jsonl"
+    STAGE2_COLMAP_PREVIEW_FILE = "stage2_colmap_preview.jsonl"
     STAGE3_KEYFRAMES_FILE = "stage3_keyframes.jsonl"
+    STAGE3_DIAGNOSTICS_FILE = "stage3_diagnostics.json"
     ANALYSIS_SUMMARY_FILE = "analysis_summary.json"
     MANIFEST_FILE = "manifest.json"
 
@@ -123,8 +125,14 @@ class StageTempStore:
     def has_stage2(self) -> bool:
         return (self.run_dir / self.STAGE2_CANDIDATES_FILE).exists() and (self.run_dir / self.STAGE2_RECORDS_FILE).exists()
 
+    def has_stage2_colmap_preview(self) -> bool:
+        return (self.run_dir / self.STAGE2_COLMAP_PREVIEW_FILE).exists()
+
     def has_stage3(self) -> bool:
         return (self.run_dir / self.STAGE3_KEYFRAMES_FILE).exists()
+
+    def has_stage3_diagnostics(self) -> bool:
+        return (self.run_dir / self.STAGE3_DIAGNOSTICS_FILE).exists()
 
     def is_stage_done(self, stage: str) -> bool:
         done = list(self._manifest.get("completed_stages", []))
@@ -183,12 +191,33 @@ class StageTempStore:
     def load_stage2(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         return self._read_jsonl(self.STAGE2_CANDIDATES_FILE), self._read_jsonl(self.STAGE2_RECORDS_FILE)
 
+    def save_stage2_colmap_preview(self, rows: List[Dict[str, Any]]) -> str:
+        p = self._write_jsonl(self.STAGE2_COLMAP_PREVIEW_FILE, rows)
+        return str(p)
+
+    def load_stage2_colmap_preview(self) -> List[Dict[str, Any]]:
+        return self._read_jsonl(self.STAGE2_COLMAP_PREVIEW_FILE)
+
     def save_stage3(self, keyframes: List[Dict[str, Any]]) -> str:
         p = self._write_jsonl(self.STAGE3_KEYFRAMES_FILE, keyframes)
         return str(p)
 
     def load_stage3(self) -> List[Dict[str, Any]]:
         return self._read_jsonl(self.STAGE3_KEYFRAMES_FILE)
+
+    def save_stage3_diagnostics(self, diagnostics: Dict[str, Any]) -> str:
+        path = self.run_dir / self.STAGE3_DIAGNOSTICS_FILE
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(diagnostics, f, ensure_ascii=False, indent=2, default=self._json_default)
+        return str(path)
+
+    def load_stage3_diagnostics(self) -> Dict[str, Any]:
+        path = self.run_dir / self.STAGE3_DIAGNOSTICS_FILE
+        if not path.exists():
+            return {}
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
 
     def save_analysis_summary(self, summary: Dict[str, Any]) -> str:
         path = self.run_dir / self.ANALYSIS_SUMMARY_FILE

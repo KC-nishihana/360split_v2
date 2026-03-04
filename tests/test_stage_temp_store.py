@@ -38,10 +38,16 @@ def test_stage_temp_store_roundtrip_and_cleanup(tmp_path):
     s2r = [{"frame_index": 1, "metrics": {"combined_stage2": 0.9}}]
     store.save_stage2(s2c, s2r)
     assert store.load_stage2() == (s2c, s2r)
+    s2p = [{"frame_index": 1, "novelty": 0.8}]
+    store.save_stage2_colmap_preview(s2p)
+    assert store.load_stage2_colmap_preview() == s2p
 
     s3 = [{"frame_index": 1, "combined_score": 0.9}]
     store.save_stage3(s3)
     assert store.load_stage3() == s3
+    s3d = {"dominant_bin_ratio": 0.2}
+    store.save_stage3_diagnostics(s3d)
+    assert store.load_stage3_diagnostics() == s3d
 
     store.mark_stage_done("1", files={"candidates": "x"}, counts={"records": 1})
     assert store.manifest_path.exists()
@@ -305,12 +311,17 @@ def test_select_keyframes_minimal_mode_disables_legacy_stages(monkeypatch, tmp_p
     assert bool(summary.get("minimal_mode")) is True
     assert summary.get("retarget", {}).get("reason") == "disabled_minimal_mode"
     assert int(summary.get("stage_counts", {}).get("stage0_executed_count", 1)) == 0
-    assert int(summary.get("stage_counts", {}).get("stage3_executed_count", 1)) == 0
+    assert int(summary.get("stage_counts", {}).get("stage3_executed_count", 0)) == 1
     assert int(summary.get("stage_counts", {}).get("final_keyframes", -1)) == 1
+    assert int(summary.get("stage2_colmap_preview_count", 0)) >= 1
+    assert isinstance(summary.get("stage3_diagnostics", {}), dict)
 
     with store.manifest_path.open("r", encoding="utf-8") as f:
         manifest = json.load(f)
     stage3_counts = dict(manifest.get("stage_counts", {}).get("3", {}))
     assert int(stage3_counts.get("keyframes", -1)) == 0
     assert int(stage3_counts.get("compat_keyframes", -1)) == 1
+    assert int(stage3_counts.get("diagnostics_runs", 0)) == 1
     assert (store.run_dir / store.STAGE3_KEYFRAMES_FILE).exists()
+    assert (store.run_dir / store.STAGE3_DIAGNOSTICS_FILE).exists()
+    assert (store.run_dir / store.STAGE2_COLMAP_PREVIEW_FILE).exists()

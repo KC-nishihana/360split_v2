@@ -43,6 +43,42 @@ class SettingsDialog(QDialog):
         現在の設定値を保持する辞書
     """
 
+    _VO_LEGACY_KEYS = {
+        "vo_enabled",
+        "vo_center_roi_ratio",
+        "vo_downscale_long_edge",
+        "vo_max_features",
+        "vo_frame_subsample",
+        "vo_essential_method",
+        "vo_subpixel_refine",
+        "vo_adaptive_subsample",
+        "vo_subsample_min",
+        "vo_confidence_low_threshold",
+        "vo_confidence_mid_threshold",
+        "vo_quality_level",
+        "vo_min_distance",
+        "vo_min_track_points",
+        "vo_ransac_threshold",
+        "vo_match_norm_factor",
+        "vo_t_sign",
+        "vo_adaptive_roi_enable",
+        "vo_adaptive_roi_min",
+        "vo_adaptive_roi_max",
+        "vo_fast_fail_inlier_ratio",
+        "vo_step_proxy_clip_px",
+        "pose_backend",
+    }
+
+    @classmethod
+    def _strip_vo_legacy_keys(cls, settings: dict) -> dict:
+        cleaned = dict(settings or {})
+        for key in list(cleaned.keys()):
+            if key in cls._VO_LEGACY_KEYS or key.startswith("vo_"):
+                cleaned.pop(key, None)
+        cleaned["pose_backend"] = "colmap"
+        cleaned["colmap_pipeline_mode"] = "minimal_v1"
+        return cleaned
+
     def __init__(self, parent=None):
         """
         設定ダイアログの初期化
@@ -569,9 +605,30 @@ class SettingsDialog(QDialog):
         conf_row.addWidget(self.vo_confidence_mid_threshold)
         vo_layout.addLayout(conf_row, 14, 1, 1, 2)
 
+        self.vo_legacy_note = QLabel("VO関連設定は廃止され、COLMAP Minimal v1 では使用されません。")
+        self.vo_legacy_note.setWordWrap(True)
+        self.vo_legacy_note.setStyleSheet("color: #8b5e00; font-size: 11px;")
+        vo_layout.addWidget(self.vo_legacy_note, 15, 0, 1, 3)
+
+        for w in (
+            self.vo_preset_combo,
+            self.vo_enabled,
+            self.vo_center_roi_ratio,
+            self.vo_downscale_long_edge,
+            self.vo_max_features,
+            self.vo_frame_subsample,
+            self.vo_essential_method,
+            self.vo_subpixel_refine,
+            self.vo_adaptive_subsample,
+            self.vo_subsample_min,
+            self.vo_confidence_low_threshold,
+            self.vo_confidence_mid_threshold,
+        ):
+            w.setEnabled(False)
+
         self.calib_check_button = QPushButton("Calibration Check を実行")
         self.calib_check_button.clicked.connect(self._run_calibration_check_from_gui)
-        vo_layout.addWidget(self.calib_check_button, 15, 0, 1, 3)
+        vo_layout.addWidget(self.calib_check_button, 16, 0, 1, 3)
 
         vo_group.setLayout(vo_layout)
         vo_page_layout.addWidget(vo_group)
@@ -581,8 +638,8 @@ class SettingsDialog(QDialog):
 
         pose_layout.addWidget(QLabel("Pose backend:"), 0, 0)
         self.pose_backend = QComboBox()
-        self.pose_backend.addItems(["vo", "colmap"])
-        self.pose_backend.setCurrentText(str(self.settings.get("pose_backend", "vo")))
+        self.pose_backend.addItems(["colmap"])
+        self.pose_backend.setCurrentText("colmap")
         pose_layout.addWidget(self.pose_backend, 0, 1)
 
         pose_layout.addWidget(QLabel("Pose export format:"), 1, 0)
@@ -773,6 +830,54 @@ class SettingsDialog(QDialog):
             bool(self.settings.get("colmap_no_supplement_on_low_quality", True))
         )
         pose_layout.addWidget(self.colmap_no_supplement_on_low_quality, 33, 0, 1, 3)
+
+        pose_layout.addWidget(QLabel("Sparse Model選択方針:"), 34, 0)
+        self.colmap_sparse_model_pick_policy = QComboBox()
+        self.colmap_sparse_model_pick_policy.addItems(
+            ["registered_then_coverage", "coverage_then_registered", "latest_legacy"]
+        )
+        self.colmap_sparse_model_pick_policy.setCurrentText(
+            str(self.settings.get("colmap_sparse_model_pick_policy", "registered_then_coverage"))
+        )
+        pose_layout.addWidget(self.colmap_sparse_model_pick_policy, 34, 1)
+
+        self.colmap_input_subset_enabled = QCheckBox("COLMAP入力サブセット（幾何縮退ゲート）を有効化")
+        self.colmap_input_subset_enabled.setChecked(
+            bool(self.settings.get("colmap_input_subset_enabled", True))
+        )
+        pose_layout.addWidget(self.colmap_input_subset_enabled, 35, 0, 1, 3)
+
+        pose_layout.addWidget(QLabel("入力ゲート方式:"), 36, 0)
+        self.colmap_input_gate_method = QComboBox()
+        self.colmap_input_gate_method.addItems(["homography_degeneracy_v1", "off"])
+        self.colmap_input_gate_method.setCurrentText(
+            str(self.settings.get("colmap_input_gate_method", "homography_degeneracy_v1"))
+        )
+        pose_layout.addWidget(self.colmap_input_gate_method, 36, 1)
+
+        pose_layout.addWidget(QLabel("入力ゲート強度:"), 37, 0)
+        self.colmap_input_gate_strength = QComboBox()
+        self.colmap_input_gate_strength.addItems(["weak", "medium", "strong"])
+        self.colmap_input_gate_strength.setCurrentText(
+            str(self.settings.get("colmap_input_gate_strength", "medium"))
+        )
+        pose_layout.addWidget(self.colmap_input_gate_strength, 37, 1)
+
+        pose_layout.addWidget(QLabel("入力保持率下限:"), 38, 0)
+        self.colmap_input_min_keep_ratio = QDoubleSpinBox()
+        self.colmap_input_min_keep_ratio.setRange(0.0, 1.0)
+        self.colmap_input_min_keep_ratio.setSingleStep(0.01)
+        self.colmap_input_min_keep_ratio.setDecimals(2)
+        self.colmap_input_min_keep_ratio.setValue(float(self.settings.get("colmap_input_min_keep_ratio", 0.20)))
+        pose_layout.addWidget(self.colmap_input_min_keep_ratio, 38, 1)
+
+        pose_layout.addWidget(QLabel("最大gap救済フレーム:"), 39, 0)
+        self.colmap_input_max_gap_rescue_frames = QSpinBox()
+        self.colmap_input_max_gap_rescue_frames.setRange(1, 10000)
+        self.colmap_input_max_gap_rescue_frames.setValue(
+            int(self.settings.get("colmap_input_max_gap_rescue_frames", 150))
+        )
+        pose_layout.addWidget(self.colmap_input_max_gap_rescue_frames, 39, 1)
 
         pose_layout.addWidget(QLabel("並進しきい値:"), 22, 0)
         self.pose_select_translation_threshold = QDoubleSpinBox()
@@ -1520,7 +1625,7 @@ class SettingsDialog(QDialog):
             'front_calib_xml': '',
             'rear_calib_xml': '',
             'calib_model': 'auto',
-            'pose_backend': 'vo',
+            'pose_backend': 'colmap',
             'colmap_path': 'colmap',
             'colmap_workspace': '',
             'colmap_db_path': '',
@@ -1550,6 +1655,12 @@ class SettingsDialog(QDialog):
             'colmap_workspace_scope': 'run_scoped',
             'colmap_reuse_db': False,
             'colmap_analysis_mask_profile': 'colmap_safe',
+            'colmap_sparse_model_pick_policy': 'registered_then_coverage',
+            'colmap_input_subset_enabled': True,
+            'colmap_input_gate_method': 'homography_degeneracy_v1',
+            'colmap_input_gate_strength': 'medium',
+            'colmap_input_min_keep_ratio': 0.20,
+            'colmap_input_max_gap_rescue_frames': 150,
             'pose_export_format': 'internal',
             'pose_select_translation_threshold': 1.2,
             'pose_select_rotation_threshold_deg': 5.0,
@@ -1567,7 +1678,7 @@ class SettingsDialog(QDialog):
         except Exception as e:
             logger.exception(f"設定ファイル読み込みエラー: {e}")
 
-        return default_settings
+        return self._strip_vo_legacy_keys(default_settings)
 
     def _save_settings(self):
         """
@@ -1695,7 +1806,7 @@ class SettingsDialog(QDialog):
             'front_calib_xml': self.front_calib_xml.text().strip(),
             'rear_calib_xml': self.rear_calib_xml.text().strip(),
             'calib_model': self.calib_model.currentText(),
-            'pose_backend': self.pose_backend.currentText(),
+            'pose_backend': "colmap",
             'colmap_path': self.colmap_path.text().strip(),
             'colmap_workspace': self.colmap_workspace.text().strip(),
             'colmap_db_path': self.colmap_db_path.text().strip(),
@@ -1728,6 +1839,12 @@ class SettingsDialog(QDialog):
             'colmap_workspace_scope': self.colmap_workspace_scope.currentText(),
             'colmap_reuse_db': self.colmap_reuse_db.isChecked(),
             'colmap_analysis_mask_profile': self.colmap_analysis_mask_profile.currentText(),
+            'colmap_sparse_model_pick_policy': self.colmap_sparse_model_pick_policy.currentText(),
+            'colmap_input_subset_enabled': self.colmap_input_subset_enabled.isChecked(),
+            'colmap_input_gate_method': self.colmap_input_gate_method.currentText(),
+            'colmap_input_gate_strength': self.colmap_input_gate_strength.currentText(),
+            'colmap_input_min_keep_ratio': self.colmap_input_min_keep_ratio.value(),
+            'colmap_input_max_gap_rescue_frames': self.colmap_input_max_gap_rescue_frames.value(),
             'pose_export_format': self.pose_export_format.currentText(),
             'pose_select_translation_threshold': self.pose_select_translation_threshold.value(),
             'pose_select_rotation_threshold_deg': self.pose_select_rotation_threshold_deg.value(),
@@ -1736,6 +1853,8 @@ class SettingsDialog(QDialog):
             'pose_select_enable_rotation': self.pose_select_enable_rotation.isChecked(),
             'pose_select_enable_observations': self.pose_select_enable_observations.isChecked(),
         }
+
+        settings_to_save = self._strip_vo_legacy_keys(settings_to_save)
 
         try:
             with open(settings_file, 'w', encoding='utf-8') as f:
@@ -1912,7 +2031,7 @@ class SettingsDialog(QDialog):
             self.front_calib_xml.setText(str(params.get('front_calib_xml', '')))
             self.rear_calib_xml.setText(str(params.get('rear_calib_xml', '')))
             self.calib_model.setCurrentText(str(params.get('calib_model', 'auto')))
-            self.pose_backend.setCurrentText(str(params.get('pose_backend', 'vo')))
+            self.pose_backend.setCurrentText("colmap")
             self.colmap_path.setText(str(params.get('colmap_path', 'colmap')))
             self.colmap_workspace.setText(str(params.get('colmap_workspace', '')))
             self.colmap_db_path.setText(str(params.get('colmap_db_path', '')))
@@ -1946,6 +2065,18 @@ class SettingsDialog(QDialog):
             self.colmap_workspace_scope.setCurrentText(str(params.get('colmap_workspace_scope', 'run_scoped')))
             self.colmap_reuse_db.setChecked(bool(params.get('colmap_reuse_db', False)))
             self.colmap_analysis_mask_profile.setCurrentText(str(params.get('colmap_analysis_mask_profile', 'colmap_safe')))
+            self.colmap_sparse_model_pick_policy.setCurrentText(
+                str(params.get('colmap_sparse_model_pick_policy', 'registered_then_coverage'))
+            )
+            self.colmap_input_subset_enabled.setChecked(bool(params.get('colmap_input_subset_enabled', True)))
+            self.colmap_input_gate_method.setCurrentText(
+                str(params.get('colmap_input_gate_method', 'homography_degeneracy_v1'))
+            )
+            self.colmap_input_gate_strength.setCurrentText(str(params.get('colmap_input_gate_strength', 'medium')))
+            self.colmap_input_min_keep_ratio.setValue(float(params.get('colmap_input_min_keep_ratio', 0.20)))
+            self.colmap_input_max_gap_rescue_frames.setValue(
+                int(params.get('colmap_input_max_gap_rescue_frames', 150))
+            )
             self.pose_export_format.setCurrentText(str(params.get('pose_export_format', 'internal')))
             self.pose_select_translation_threshold.setValue(float(params.get('pose_select_translation_threshold', 1.2)))
             self.pose_select_rotation_threshold_deg.setValue(float(params.get('pose_select_rotation_threshold_deg', 5.0)))
@@ -2027,6 +2158,12 @@ class SettingsDialog(QDialog):
                 getattr(self, "colmap_workspace_scope", None),
                 getattr(self, "colmap_reuse_db", None),
                 getattr(self, "colmap_analysis_mask_profile", None),
+                getattr(self, "colmap_sparse_model_pick_policy", None),
+                getattr(self, "colmap_input_subset_enabled", None),
+                getattr(self, "colmap_input_gate_method", None),
+                getattr(self, "colmap_input_gate_strength", None),
+                getattr(self, "colmap_input_min_keep_ratio", None),
+                getattr(self, "colmap_input_max_gap_rescue_frames", None),
             ] if w is not None
         ]
         for w in colmap_widgets:
@@ -2191,7 +2328,7 @@ class SettingsDialog(QDialog):
             self.front_calib_xml.setText("")
             self.rear_calib_xml.setText("")
             self.calib_model.setCurrentText("auto")
-            self.pose_backend.setCurrentText("vo")
+            self.pose_backend.setCurrentText("colmap")
             self.colmap_path.setText("colmap")
             self.colmap_workspace.setText("")
             self.colmap_db_path.setText("")
@@ -2221,6 +2358,12 @@ class SettingsDialog(QDialog):
             self.colmap_workspace_scope.setCurrentText("run_scoped")
             self.colmap_reuse_db.setChecked(False)
             self.colmap_analysis_mask_profile.setCurrentText("colmap_safe")
+            self.colmap_sparse_model_pick_policy.setCurrentText("registered_then_coverage")
+            self.colmap_input_subset_enabled.setChecked(True)
+            self.colmap_input_gate_method.setCurrentText("homography_degeneracy_v1")
+            self.colmap_input_gate_strength.setCurrentText("medium")
+            self.colmap_input_min_keep_ratio.setValue(0.20)
+            self.colmap_input_max_gap_rescue_frames.setValue(150)
             self.pose_export_format.setCurrentText("internal")
             self.pose_select_translation_threshold.setValue(1.2)
             self.pose_select_rotation_threshold_deg.setValue(5.0)

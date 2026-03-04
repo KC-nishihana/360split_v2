@@ -229,6 +229,12 @@ class KeyframeConfig:
     colmap_workspace_scope: str = "run_scoped"
     colmap_reuse_db: bool = False
     colmap_analysis_mask_profile: str = "colmap_safe"
+    colmap_sparse_model_pick_policy: str = "registered_then_coverage"
+    colmap_input_subset_enabled: bool = True
+    colmap_input_gate_method: str = "homography_degeneracy_v1"
+    colmap_input_gate_strength: str = "medium"
+    colmap_input_min_keep_ratio: float = 0.20
+    colmap_input_max_gap_rescue_frames: int = 150
     pose_export_format: str = "internal"
     pose_select_translation_threshold: float = 1.2
     pose_select_rotation_threshold_deg: float = 5.0
@@ -399,6 +405,12 @@ class KeyframeConfig:
             'COLMAP_WORKSPACE_SCOPE': self.colmap_workspace_scope,
             'COLMAP_REUSE_DB': self.colmap_reuse_db,
             'COLMAP_ANALYSIS_MASK_PROFILE': self.colmap_analysis_mask_profile,
+            'COLMAP_SPARSE_MODEL_PICK_POLICY': self.colmap_sparse_model_pick_policy,
+            'COLMAP_INPUT_SUBSET_ENABLED': self.colmap_input_subset_enabled,
+            'COLMAP_INPUT_GATE_METHOD': self.colmap_input_gate_method,
+            'COLMAP_INPUT_GATE_STRENGTH': self.colmap_input_gate_strength,
+            'COLMAP_INPUT_MIN_KEEP_RATIO': self.colmap_input_min_keep_ratio,
+            'COLMAP_INPUT_MAX_GAP_RESCUE_FRAMES': self.colmap_input_max_gap_rescue_frames,
             'POSE_EXPORT_FORMAT': self.pose_export_format,
             'POSE_SELECT_TRANSLATION_THRESHOLD': self.pose_select_translation_threshold,
             'POSE_SELECT_ROTATION_THRESHOLD_DEG': self.pose_select_rotation_threshold_deg,
@@ -802,6 +814,38 @@ class KeyframeConfig:
         ).strip().lower()
         if config.colmap_analysis_mask_profile not in {"legacy", "colmap_safe"}:
             config.colmap_analysis_mask_profile = "colmap_safe"
+        config.colmap_sparse_model_pick_policy = str(
+            normalized.get('colmap_sparse_model_pick_policy', config.colmap_sparse_model_pick_policy) or "registered_then_coverage"
+        ).strip().lower()
+        if config.colmap_sparse_model_pick_policy not in {
+            "registered_then_coverage",
+            "coverage_then_registered",
+            "latest_legacy",
+        }:
+            config.colmap_sparse_model_pick_policy = "registered_then_coverage"
+        config.colmap_input_subset_enabled = bool(
+            normalized.get('colmap_input_subset_enabled', config.colmap_input_subset_enabled)
+        )
+        config.colmap_input_gate_method = str(
+            normalized.get('colmap_input_gate_method', config.colmap_input_gate_method) or "homography_degeneracy_v1"
+        ).strip().lower()
+        if config.colmap_input_gate_method not in {"homography_degeneracy_v1", "off"}:
+            config.colmap_input_gate_method = "homography_degeneracy_v1"
+        config.colmap_input_gate_strength = str(
+            normalized.get('colmap_input_gate_strength', config.colmap_input_gate_strength) or "medium"
+        ).strip().lower()
+        if config.colmap_input_gate_strength not in {"weak", "medium", "strong"}:
+            config.colmap_input_gate_strength = "medium"
+        config.colmap_input_min_keep_ratio = float(
+            np.clip(
+                normalized.get('colmap_input_min_keep_ratio', config.colmap_input_min_keep_ratio),
+                0.0,
+                1.0,
+            )
+        )
+        config.colmap_input_max_gap_rescue_frames = int(
+            max(1, normalized.get('colmap_input_max_gap_rescue_frames', config.colmap_input_max_gap_rescue_frames))
+        )
         config.pose_export_format = str(normalized.get('pose_export_format', config.pose_export_format) or "internal").strip().lower()
         if config.pose_export_format not in {"internal", "metashape"}:
             config.pose_export_format = "internal"
@@ -997,6 +1041,12 @@ SELECTOR_ALIAS_MAP: Dict[str, str] = {
     'colmap_workspace_scope': 'COLMAP_WORKSPACE_SCOPE',
     'colmap_reuse_db': 'COLMAP_REUSE_DB',
     'colmap_analysis_mask_profile': 'COLMAP_ANALYSIS_MASK_PROFILE',
+    'colmap_sparse_model_pick_policy': 'COLMAP_SPARSE_MODEL_PICK_POLICY',
+    'colmap_input_subset_enabled': 'COLMAP_INPUT_SUBSET_ENABLED',
+    'colmap_input_gate_method': 'COLMAP_INPUT_GATE_METHOD',
+    'colmap_input_gate_strength': 'COLMAP_INPUT_GATE_STRENGTH',
+    'colmap_input_min_keep_ratio': 'COLMAP_INPUT_MIN_KEEP_RATIO',
+    'colmap_input_max_gap_rescue_frames': 'COLMAP_INPUT_MAX_GAP_RESCUE_FRAMES',
     'pose_export_format': 'POSE_EXPORT_FORMAT',
     'pose_select_translation_threshold': 'POSE_SELECT_TRANSLATION_THRESHOLD',
     'pose_select_rotation_threshold_deg': 'POSE_SELECT_ROTATION_THRESHOLD_DEG',

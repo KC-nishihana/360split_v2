@@ -564,6 +564,7 @@ class UnifiedAnalysisWorker(QThread):
         metrics_map: Dict[int, Dict[str, float]],
         pose_map: Dict[int, Dict[str, Optional[List[float]]]],
         run_id: str,
+        colmap_preview_frame_indices: Optional[List[int]] = None,
     ) -> Dict[str, object]:
         pose_backend = str(
             self.config.get("pose_backend", self.config.get("POSE_BACKEND", "vo")) or "vo"
@@ -585,6 +586,11 @@ class UnifiedAnalysisWorker(QThread):
 
         if not str(self.config.get("colmap_workspace", self.config.get("COLMAP_WORKSPACE", "")) or "").strip():
             self.config["colmap_workspace"] = str((pose_root / "colmap_workspace").resolve())
+        preview_indices = [
+            int(v)
+            for v in list(colmap_preview_frame_indices or [])
+            if isinstance(v, (int, float))
+        ]
 
         payload = run_pose_pipeline(
             image_dir=str(image_dir),
@@ -602,6 +608,43 @@ class UnifiedAnalysisWorker(QThread):
                 "colmap_reuse_db": bool(self.config.get("colmap_reuse_db", self.config.get("COLMAP_REUSE_DB", False))),
                 "colmap_rig_policy": str(self.config.get("colmap_rig_policy", self.config.get("COLMAP_RIG_POLICY", "lr_opk")) or "lr_opk"),
                 "colmap_rig_seed_opk_deg": list(self.config.get("colmap_rig_seed_opk_deg", self.config.get("COLMAP_RIG_SEED_OPK_DEG", [0.0, 0.0, 180.0]))),
+                "colmap_sparse_model_pick_policy": str(
+                    self.config.get(
+                        "colmap_sparse_model_pick_policy",
+                        self.config.get("COLMAP_SPARSE_MODEL_PICK_POLICY", "registered_then_coverage"),
+                    ) or "registered_then_coverage"
+                ),
+                "colmap_input_subset_enabled": bool(
+                    self.config.get(
+                        "colmap_input_subset_enabled",
+                        self.config.get("COLMAP_INPUT_SUBSET_ENABLED", True),
+                    )
+                ),
+                "colmap_input_gate_method": str(
+                    self.config.get(
+                        "colmap_input_gate_method",
+                        self.config.get("COLMAP_INPUT_GATE_METHOD", "homography_degeneracy_v1"),
+                    ) or "homography_degeneracy_v1"
+                ),
+                "colmap_input_gate_strength": str(
+                    self.config.get(
+                        "colmap_input_gate_strength",
+                        self.config.get("COLMAP_INPUT_GATE_STRENGTH", "medium"),
+                    ) or "medium"
+                ),
+                "colmap_input_min_keep_ratio": float(
+                    self.config.get(
+                        "colmap_input_min_keep_ratio",
+                        self.config.get("COLMAP_INPUT_MIN_KEEP_RATIO", 0.20),
+                    )
+                ),
+                "colmap_input_max_gap_rescue_frames": int(
+                    self.config.get(
+                        "colmap_input_max_gap_rescue_frames",
+                        self.config.get("COLMAP_INPUT_MAX_GAP_RESCUE_FRAMES", 150),
+                    )
+                ),
+                "colmap_preview_frame_indices": preview_indices,
             },
         )
         result = payload.get("result")
@@ -831,6 +874,13 @@ class UnifiedAnalysisWorker(QThread):
                             metrics_map=metrics_map,
                             pose_map=pose_map,
                             run_id=run_id,
+                            colmap_preview_frame_indices=list(
+                                getattr(selector, "last_selection_runtime", {}).get(
+                                    "stage2_colmap_preview_indices",
+                                    [],
+                                )
+                                or []
+                            ),
                         )
                         self.progress.emit(100, 100, "Pose推定完了")
                     except Exception as pose_error:

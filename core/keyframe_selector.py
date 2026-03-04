@@ -198,6 +198,14 @@ class KeyframeSelector:
             'QUALITY_NORM_P_HIGH': 90.0,
             'QUALITY_DEBUG': False,
             'QUALITY_TENENGRAD_SCALE': 1.0,
+            'STAGE1_CANDIDATE_FLOOR_ENABLED': True,
+            'STAGE1_MIN_PASS_RATIO': 0.12,
+            'STAGE1_MIN_PASS_COUNT': 120,
+            'STAGE1_MAX_PASS_COUNT': 2400,
+            'STAGE1_STDDEV_ADAPTIVE_ENABLED': True,
+            'STAGE1_STDDEV_SIGMA_FACTOR': 0.5,
+            'STAGE1_STDDEV_THRESHOLD_MIN': 0.20,
+            'STAGE1_STDDEV_THRESHOLD_MAX': 0.50,
             'PAIR_MOTION_AGGREGATION': 'max',
             'MIN_FEATURE_MATCHES': 30,
             'THUMBNAIL_SIZE': (192, 108),
@@ -2376,6 +2384,344 @@ class KeyframeSelector:
         return int(len(occupied))
 
     @staticmethod
+    def _index_stats_from_indices(indices: List[int]) -> Dict[str, Any]:
+        if not indices:
+            return {"count": 0, "first": None, "last": None, "max_gap": None}
+        ordered = sorted(set(int(v) for v in indices if int(v) >= 0))
+        if not ordered:
+            return {"count": 0, "first": None, "last": None, "max_gap": None}
+        gaps = [b - a for a, b in zip(ordered, ordered[1:])]
+        return {
+            "count": int(len(ordered)),
+            "first": int(ordered[0]),
+            "last": int(ordered[-1]),
+            "max_gap": int(max(gaps)) if gaps else 0,
+        }
+
+    @staticmethod
+    def _extract_frame_indices_from_rows(rows: List[Dict[str, Any]]) -> List[int]:
+        out: List[int] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw = row.get("frame_index", row.get("frame_idx"))
+            if isinstance(raw, (int, float)):
+                idx = int(raw)
+                if idx >= 0:
+                    out.append(idx)
+        return sorted(set(out))
+
+    @staticmethod
+    def _normalize_minmax(values: List[float]) -> List[float]:
+        if not values:
+            return []
+        arr = np.asarray(values, dtype=np.float64)
+        lo = float(np.min(arr))
+        hi = float(np.max(arr))
+        if hi - lo <= 1e-9:
+            return [0.0 for _ in values]
+        return [float((v - lo) / (hi - lo)) for v in arr.tolist()]
+
+    def _build_stage2_novelty_rows(
+        self,
+        stage2_records: List[Stage2FrameRecord],
+    ) -> List[Dict[str, Any]]:
+        raw_rows: List[Dict[str, Any]] = []
+        for rec in stage2_records:
+            if not isinstance(rec, Stage2FrameRecord):
+                continue
+            if str(getattr(rec, "drop_reason", "") or "") == "read_fail":
+                continue
+            idx = int(getattr(rec, "frame_index", -1))
+            if idx < 0:
+                continue
+            q_scores = dict(getattr(rec, "quality_scores", {}) or {})
+            a_scores = dict(getattr(rec, "adaptive_scores", {}) or {})
+            metrics = dict(getattr(rec, "metrics", {}) or {})
+            flow_mag = metrics.get("flow_mag", a_scores.get("optical_flow", 0.0))
+            ssim_pair = a_scores.get("ssim_pair", a_scores.get("ssim", 1.0))
+            quality = q_scores.get("quality", metrics.get("combined_score", 0.0))
+            flow_mag_f = float(max(0.0, float(flow_mag))) if isinstance(flow_mag, (int, float)) else 0.0
+            ssim_pair_f = float(np.clip(float(ssim_pair), 0.0, 1.0)) if isinstance(ssim_pair, (int, float)) else 1.0
+            quality_f = float(np.clip(float(quality), 0.0, 1.0)) if isinstance(quality, (int, float)) else 0.0
+            raw_rows.append(
+                {
+                    "frame_index": int(idx),
+                    "flow_mag": flow_mag_f,
+                    "ssim_pair": ssim_pair_f,
+                    "quality": quality_f,
+                }
+            )
+        if not raw_rows:
+            return []
+
+        flow_norm = self._normalize_minmax([float(r["flow_mag"]) for r in raw_rows])
+        ssim_change_norm = self._normalize_minmax([float(max(0.0, 1.0 - float(r["ssim_pair"]))) for r in raw_rows])
+        quality_norm = self._normalize_minmax([float(r["quality"]) for r in raw_rows])
+        for i, row in enumerate(raw_rows):
+            novelty = 0.45 * float(flow_norm[i]) + 0.35 * float(ssim_change_norm[i]) + 0.20 * float(quality_norm[i])
+            row["flow_norm"] = float(flow_norm[i])
+            row["ssim_change_norm"] = float(ssim_change_norm[i])
+            row["quality_norm"] = float(quality_norm[i])
+            row["novelty"] = float(np.clip(novelty, 0.0, 1.0))
+
+        # 同一frame indexはnovelty最大を採用して決定的にする。
+        dedup: Dict[int, Dict[str, Any]] = {}
+        for row in raw_rows:
+            idx = int(row["frame_index"])
+            prev = dedup.get(idx)
+            if prev is None or float(row.get("novelty", 0.0)) > float(prev.get("novelty", 0.0)):
+                dedup[idx] = dict(row)
+        return [dedup[idx] for idx in sorted(dedup.keys())]
+
+    def _build_stage2_colmap_preview_v1(
+        self,
+        stage2_records: List[Stage2FrameRecord],
+        *,
+        total_frames: int,
+        bins: int = 24,
+        target_ratio: float = 0.35,
+        target_min: int = 180,
+        target_max: int = 800,
+        dense_neighbor_frames: int = 2,
+        max_gap_rescue_frames: int = 150,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        novelty_rows = self._build_stage2_novelty_rows(stage2_records)
+        drop_reason_counts: Dict[str, int] = {}
+        if not novelty_rows:
+            return [], {
+                "target_count": 0,
+                "input_count": 0,
+                "bins_occupied": 0,
+                "drop_reason_counts": {},
+                "first": None,
+                "last": None,
+                "max_gap": None,
+            }
+
+        input_count = int(len(novelty_rows))
+        target = int(round(float(input_count) * float(target_ratio)))
+        target = max(int(target_min), min(int(target_max), int(target)))
+        target = max(1, min(target, input_count))
+        bins = int(max(1, bins))
+        effective_total_frames = int(max(total_frames, 1))
+        bin_width = float(max(1, effective_total_frames)) / float(max(1, bins))
+
+        def _bin_idx(frame_index: int) -> int:
+            b = int(np.floor(float(max(0, frame_index)) / max(bin_width, 1e-12)))
+            return max(0, min(bins - 1, b))
+
+        rows_by_bin: Dict[int, List[Dict[str, Any]]] = {b: [] for b in range(bins)}
+        for row in novelty_rows:
+            rows_by_bin[_bin_idx(int(row["frame_index"]))].append(row)
+        for b in range(bins):
+            rows_by_bin[b] = sorted(
+                rows_by_bin[b],
+                key=lambda r: (-float(r.get("novelty", 0.0)), int(r.get("frame_index", 0))),
+            )
+
+        active_bins = [b for b in range(bins) if rows_by_bin[b]]
+        quota: Dict[int, int] = {b: 0 for b in range(bins)}
+        if active_bins:
+            q_base = target // len(active_bins)
+            q_rem = target % len(active_bins)
+            for rank, b in enumerate(active_bins):
+                quota[b] = int(q_base + (1 if rank < q_rem else 0))
+
+        selected: Dict[int, Dict[str, Any]] = {}
+
+        def _try_add(row: Dict[str, Any], *, reason: str) -> bool:
+            idx = int(row["frame_index"])
+            for delta in range(-int(dense_neighbor_frames), int(dense_neighbor_frames) + 1):
+                if delta == 0:
+                    continue
+                if (idx + delta) in selected:
+                    drop_reason_counts["dense_neighbor_low_novelty"] = int(
+                        drop_reason_counts.get("dense_neighbor_low_novelty", 0) + 1
+                    )
+                    return False
+            picked = dict(row)
+            picked["selection_reason"] = str(reason)
+            selected[idx] = picked
+            return True
+
+        for b in range(bins):
+            rows = rows_by_bin[b]
+            if not rows:
+                continue
+            q = int(quota.get(b, 0))
+            if q <= 0:
+                drop_reason_counts["bin_quota_exceeded"] = int(
+                    drop_reason_counts.get("bin_quota_exceeded", 0) + len(rows)
+                )
+                continue
+            kept = 0
+            for row in rows:
+                if kept >= q:
+                    break
+                if _try_add(row, reason="bin_allocation"):
+                    kept += 1
+            dropped_in_bin = max(0, len(rows) - kept)
+            if dropped_in_bin > 0:
+                drop_reason_counts["bin_quota_exceeded"] = int(
+                    drop_reason_counts.get("bin_quota_exceeded", 0) + dropped_in_bin
+                )
+
+        if len(selected) < target:
+            remaining = [
+                row
+                for row in sorted(
+                    novelty_rows,
+                    key=lambda r: (-float(r.get("novelty", 0.0)), int(r.get("frame_index", 0))),
+                )
+                if int(row["frame_index"]) not in selected
+            ]
+            for row in remaining:
+                if len(selected) >= target:
+                    break
+                _try_add(row, reason="global_fill")
+            if len(selected) < target:
+                drop_reason_counts["global_fill_shortfall"] = int(target - len(selected))
+
+        # 長ギャップごとに1件だけ救済する。
+        rescue_added = 0
+        selected_indices_before_rescue = sorted(selected.keys())
+        for left_idx, right_idx in zip(
+            selected_indices_before_rescue,
+            selected_indices_before_rescue[1:],
+        ):
+            if int(right_idx - left_idx) < int(max_gap_rescue_frames):
+                continue
+            mid = float(left_idx + right_idx) * 0.5
+            pool = [
+                row
+                for row in novelty_rows
+                if left_idx < int(row["frame_index"]) < right_idx and int(row["frame_index"]) not in selected
+            ]
+            if not pool:
+                continue
+            pool = sorted(
+                pool,
+                key=lambda r: (
+                    -float(r.get("novelty", 0.0)),
+                    abs(float(r.get("frame_index", 0)) - mid),
+                    int(r.get("frame_index", 0)),
+                ),
+            )
+            pick = dict(pool[0])
+            pick["selection_reason"] = "gap_rescue"
+            selected[int(pick["frame_index"])] = pick
+            rescue_added += 1
+
+        selected_rows = [selected[idx] for idx in sorted(selected.keys())]
+        selected_indices = [int(r["frame_index"]) for r in selected_rows]
+        stats = self._index_stats_from_indices(selected_indices)
+        bins_occupied = self._count_time_bins_occupied(
+            selected_indices,
+            total_frames=int(max(1, effective_total_frames)),
+            bins=int(bins),
+        )
+        if rescue_added > 0:
+            drop_reason_counts["gap_rescue_added"] = int(rescue_added)
+        unselected = max(0, input_count - len(selected_rows))
+        if unselected > 0:
+            drop_reason_counts["unselected"] = int(unselected)
+        return selected_rows, {
+            "target_count": int(target),
+            "input_count": int(input_count),
+            "bins_occupied": int(bins_occupied),
+            "drop_reason_counts": dict(drop_reason_counts),
+            "first": stats.get("first"),
+            "last": stats.get("last"),
+            "max_gap": stats.get("max_gap"),
+        }
+
+    def _compute_stage3_diagnostics_v1(
+        self,
+        *,
+        keyframes: List[KeyframeInfo],
+        stage2_records: List[Stage2FrameRecord],
+        total_frames: int,
+        bins: int = 24,
+    ) -> Dict[str, Any]:
+        frame_indices = sorted(set(int(k.frame_index) for k in keyframes if int(k.frame_index) >= 0))
+        stats = self._index_stats_from_indices(frame_indices)
+        novelty_rows = self._build_stage2_novelty_rows(stage2_records)
+        novelty_map = {int(r["frame_index"]): float(r.get("novelty", 0.0)) for r in novelty_rows}
+        quality_map = {int(r["frame_index"]): float(r.get("quality", 0.0)) for r in novelty_rows}
+
+        if frame_indices:
+            run = 1
+            run_max = 1
+            for prev_idx, cur_idx in zip(frame_indices, frame_indices[1:]):
+                if int(cur_idx - prev_idx) <= 2:
+                    run += 1
+                else:
+                    run = 1
+                run_max = max(run_max, run)
+        else:
+            run_max = 0
+
+        bins = int(max(1, bins))
+        coverage_bins = self._count_time_bins_occupied(
+            frame_indices,
+            total_frames=int(max(1, total_frames)),
+            bins=int(bins),
+        )
+        dominant_ratio = 0.0
+        if frame_indices:
+            counts = [0 for _ in range(bins)]
+            width = float(max(1, total_frames)) / float(max(1, bins))
+            for idx in frame_indices:
+                b = int(np.floor(float(max(0, idx)) / max(width, 1e-12)))
+                b = max(0, min(bins - 1, b))
+                counts[b] += 1
+            dominant_ratio = float(max(counts) / max(len(frame_indices), 1))
+
+        novelty_vals = [float(novelty_map.get(idx, 0.0)) for idx in frame_indices] if frame_indices else []
+        quality_vals = [float(quality_map.get(idx, 0.0)) for idx in frame_indices] if frame_indices else []
+        low_novelty_ratio = (
+            float(sum(1 for v in novelty_vals if float(v) < 0.35) / max(len(novelty_vals), 1))
+            if novelty_vals
+            else 0.0
+        )
+        quality_tail_ratio = (
+            float(sum(1 for v in quality_vals if float(v) < 0.40) / max(len(quality_vals), 1))
+            if quality_vals
+            else 0.0
+        )
+
+        cluster_alert = bool(int(run_max) >= 80 or float(dominant_ratio) >= 0.30)
+        coverage_alert = bool(int(coverage_bins) < 11)
+        novelty_alert = bool(float(low_novelty_ratio) >= 0.65)
+        reasons: List[str] = []
+        if int(run_max) >= 80:
+            reasons.append("contiguous_run_max_high")
+        if float(dominant_ratio) >= 0.30:
+            reasons.append("dominant_bin_ratio_high")
+        if int(coverage_bins) < 11:
+            reasons.append("coverage_bins_low")
+        if float(low_novelty_ratio) >= 0.65:
+            reasons.append("low_novelty_ratio_high")
+
+        return {
+            "version": "stage3_diagnostics_v1",
+            "count": int(stats.get("count", 0)),
+            "first": stats.get("first"),
+            "last": stats.get("last"),
+            "max_gap": stats.get("max_gap"),
+            "contiguous_run_max": int(run_max),
+            "dominant_bin_ratio": float(dominant_ratio),
+            "coverage_bins_occupied": int(coverage_bins),
+            "low_novelty_ratio": float(low_novelty_ratio),
+            "quality_tail_ratio": float(quality_tail_ratio),
+            "cluster_alert": bool(cluster_alert),
+            "coverage_alert": bool(coverage_alert),
+            "novelty_alert": bool(novelty_alert),
+            "alerts": list(reasons),
+        }
+
+    @staticmethod
     def _estimate_sky_ratio(frame: Optional[np.ndarray], valid_mask: Optional[np.ndarray] = None) -> float:
         if frame is None:
             return 0.0
@@ -2873,6 +3219,269 @@ class KeyframeSelector:
             "after": len(out),
         }
 
+    def _enforce_stage1_candidate_floor(
+        self,
+        stage1_candidates: List[Dict[str, Any]],
+        *,
+        total_frames: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        enabled = bool(
+            self.config.get(
+                "STAGE1_CANDIDATE_FLOOR_ENABLED",
+                self.config.get("stage1_candidate_floor_enabled", True),
+            )
+        )
+        min_ratio = float(
+            np.clip(
+                self.config.get("STAGE1_MIN_PASS_RATIO", self.config.get("stage1_min_pass_ratio", 0.12)),
+                0.0,
+                1.0,
+            )
+        )
+        min_count = int(
+            max(
+                0,
+                self.config.get("STAGE1_MIN_PASS_COUNT", self.config.get("stage1_min_pass_count", 120)),
+            )
+        )
+        max_count = int(
+            max(
+                min_count,
+                self.config.get("STAGE1_MAX_PASS_COUNT", self.config.get("stage1_max_pass_count", 2400)),
+            )
+        )
+
+        selected_map: Dict[int, Dict[str, Any]] = {}
+        for cand in stage1_candidates:
+            if not isinstance(cand, dict):
+                continue
+            idx = int(cand.get("frame_idx", -1))
+            if idx < 0:
+                continue
+            selected_map[idx] = dict(cand)
+
+        current_count = len(selected_map)
+        if not enabled or total_frames <= 0:
+            return list(stage1_candidates), {
+                "enabled": bool(enabled),
+                "required_count": int(current_count),
+                "before_count": int(current_count),
+                "after_count": int(current_count),
+                "added_count": 0,
+                "added_time_bins": 0,
+                "added_quality_pool": 0,
+                "min_ratio": float(min_ratio),
+                "min_count": int(min_count),
+                "max_count": int(max_count),
+            }
+
+        required_count = int(np.ceil(float(total_frames) * float(min_ratio)))
+        required_count = int(max(required_count, min_count))
+        required_count = int(min(required_count, max_count, total_frames))
+        if current_count >= required_count:
+            return sorted(selected_map.values(), key=lambda x: int(x.get("frame_idx", 0))), {
+                "enabled": bool(enabled),
+                "required_count": int(required_count),
+                "before_count": int(current_count),
+                "after_count": int(current_count),
+                "added_count": 0,
+                "added_time_bins": 0,
+                "added_quality_pool": 0,
+                "min_ratio": float(min_ratio),
+                "min_count": int(min_count),
+                "max_count": int(max_count),
+            }
+
+        pool_rows: List[Dict[str, Any]] = []
+        for rec in list(self.stage1_quality_records or []):
+            cand = self._stage1_candidate_from_quality_record(rec)
+            if cand is None:
+                continue
+            pool_rows.append(cand)
+        if not pool_rows:
+            return sorted(selected_map.values(), key=lambda x: int(x.get("frame_idx", 0))), {
+                "enabled": bool(enabled),
+                "required_count": int(required_count),
+                "before_count": int(current_count),
+                "after_count": int(current_count),
+                "added_count": 0,
+                "added_time_bins": 0,
+                "added_quality_pool": 0,
+                "min_ratio": float(min_ratio),
+                "min_count": int(min_count),
+                "max_count": int(max_count),
+            }
+
+        need = int(max(0, required_count - len(selected_map)))
+        added_time_bins = 0
+        bins = int(np.clip(max(6, required_count // 16), 6, 64))
+        bin_width = float(max(1, total_frames)) / float(max(1, bins))
+
+        for b in range(bins):
+            if need <= 0:
+                break
+            start = int(np.floor(b * bin_width))
+            end = int(np.floor((b + 1) * bin_width)) if b < bins - 1 else int(max(total_frames, 1))
+            pool = [
+                c for c in pool_rows
+                if start <= int(c["frame_idx"]) < end and int(c["frame_idx"]) not in selected_map
+            ]
+            if not pool:
+                continue
+            best = max(
+                pool,
+                key=lambda c: (
+                    self._score_from_stage1_candidate(c),
+                    -abs(int(c["frame_idx"]) - int((start + end) * 0.5)),
+                ),
+            )
+            idx = int(best["frame_idx"])
+            if idx in selected_map:
+                continue
+            selected_map[idx] = dict(best)
+            added_time_bins += 1
+            need -= 1
+
+        added_quality_pool = 0
+        if need > 0:
+            leftovers = [c for c in pool_rows if int(c["frame_idx"]) not in selected_map]
+            leftovers = sorted(
+                leftovers,
+                key=lambda c: (self._score_from_stage1_candidate(c), -int(c["frame_idx"])),
+                reverse=True,
+            )
+            for cand in leftovers:
+                if need <= 0:
+                    break
+                idx = int(cand["frame_idx"])
+                if idx in selected_map:
+                    continue
+                selected_map[idx] = dict(cand)
+                added_quality_pool += 1
+                need -= 1
+
+        out = sorted(selected_map.values(), key=lambda x: int(x.get("frame_idx", 0)))
+        return out, {
+            "enabled": bool(enabled),
+            "required_count": int(required_count),
+            "before_count": int(current_count),
+            "after_count": int(len(out)),
+            "added_count": int(max(0, len(out) - current_count)),
+            "added_time_bins": int(added_time_bins),
+            "added_quality_pool": int(added_quality_pool),
+            "min_ratio": float(min_ratio),
+            "min_count": int(min_count),
+            "max_count": int(max_count),
+        }
+
+    def _apply_stage1_stddev_adaptive_threshold(
+        self,
+        stage1_candidates: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        enabled = bool(
+            self.config.get(
+                "STAGE1_STDDEV_ADAPTIVE_ENABLED",
+                self.config.get("stage1_stddev_adaptive_enabled", True),
+            )
+        )
+        sigma_factor = float(
+            np.clip(
+                self.config.get(
+                    "STAGE1_STDDEV_SIGMA_FACTOR",
+                    self.config.get("stage1_stddev_sigma_factor", 0.5),
+                ),
+                0.0,
+                3.0,
+            )
+        )
+        threshold_min = float(
+            np.clip(
+                self.config.get(
+                    "STAGE1_STDDEV_THRESHOLD_MIN",
+                    self.config.get("stage1_stddev_threshold_min", 0.20),
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        base_threshold = float(
+            np.clip(
+                self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50)),
+                0.0,
+                1.0,
+            )
+        )
+        threshold_max_cfg = float(
+            np.clip(
+                self.config.get(
+                    "STAGE1_STDDEV_THRESHOLD_MAX",
+                    self.config.get("stage1_stddev_threshold_max", base_threshold),
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        threshold_max = float(min(base_threshold, threshold_max_cfg))
+
+        selected_map: Dict[int, Dict[str, Any]] = {}
+        for cand in stage1_candidates:
+            if not isinstance(cand, dict):
+                continue
+            idx = int(cand.get("frame_idx", -1))
+            if idx < 0:
+                continue
+            selected_map[idx] = dict(cand)
+        before_count = len(selected_map)
+
+        quality_vals: List[float] = []
+        for rec in list(self.stage1_quality_records or []):
+            if not isinstance(rec, dict):
+                continue
+            qv = rec.get("quality", None)
+            if isinstance(qv, (int, float)):
+                quality_vals.append(float(np.clip(float(qv), 0.0, 1.0)))
+
+        if not enabled or len(quality_vals) < 2:
+            return sorted(selected_map.values(), key=lambda x: int(x.get("frame_idx", 0))), {
+                "enabled": bool(enabled),
+                "mean_quality": float(np.mean(quality_vals)) if quality_vals else 0.0,
+                "std_quality": float(np.std(quality_vals)) if quality_vals else 0.0,
+                "sigma_factor": float(sigma_factor),
+                "base_threshold": float(base_threshold),
+                "effective_threshold": float(base_threshold),
+                "added_count": 0,
+            }
+
+        q_arr = np.asarray(quality_vals, dtype=np.float64)
+        mean_q = float(np.mean(q_arr))
+        std_q = float(np.std(q_arr))
+        raw_threshold = float(mean_q - sigma_factor * std_q)
+        adaptive_threshold = float(np.clip(raw_threshold, threshold_min, threshold_max))
+        effective_threshold = float(min(base_threshold, adaptive_threshold))
+
+        added = 0
+        for rec in list(self.stage1_quality_records or []):
+            cand = self._stage1_candidate_from_quality_record(rec)
+            if cand is None:
+                continue
+            idx = int(cand.get("frame_idx", -1))
+            if idx < 0 or idx in selected_map:
+                continue
+            if self._score_from_stage1_candidate(cand) >= effective_threshold:
+                selected_map[idx] = dict(cand)
+                added += 1
+
+        out = sorted(selected_map.values(), key=lambda x: int(x.get("frame_idx", 0)))
+        return out, {
+            "enabled": bool(enabled),
+            "mean_quality": float(mean_q),
+            "std_quality": float(std_q),
+            "sigma_factor": float(sigma_factor),
+            "base_threshold": float(base_threshold),
+            "effective_threshold": float(effective_threshold),
+            "added_count": int(max(0, len(out) - before_count)),
+        }
+
     @staticmethod
     def _compute_temporal_coverage(
         keyframes: List[KeyframeInfo],
@@ -3314,6 +3923,14 @@ class KeyframeSelector:
             "stage0_executed_count": 0,
             "stage3_executed_count": 0,
             "stage2_read_success_count": 0,
+            "stage2_colmap_preview_count": 0,
+            "stage2_colmap_preview_first": None,
+            "stage2_colmap_preview_last": None,
+            "stage2_colmap_preview_max_gap": None,
+            "stage2_colmap_preview_bins_occupied": 0,
+            "stage2_colmap_preview_drop_reason_counts": {},
+            "stage2_colmap_preview_indices": [],
+            "stage3_diagnostics": {},
             "stage1_adaptive_threshold_base": float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50))),
             "stage1_adaptive_threshold_effective": float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50))),
             "stage1_bin_floor_added_count": 0,
@@ -3495,6 +4112,27 @@ class KeyframeSelector:
                 "motion_bins": 0,
                 "after": int(len(stage1_candidates)),
             }
+            stage1_stddev_info: Dict[str, Any] = {
+                "enabled": bool(self.config.get("STAGE1_STDDEV_ADAPTIVE_ENABLED", self.config.get("stage1_stddev_adaptive_enabled", True))),
+                "mean_quality": 0.0,
+                "std_quality": 0.0,
+                "sigma_factor": float(self.config.get("STAGE1_STDDEV_SIGMA_FACTOR", self.config.get("stage1_stddev_sigma_factor", 0.5))),
+                "base_threshold": float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50))),
+                "effective_threshold": float(self.config.get("QUALITY_THRESHOLD", self.config.get("quality_threshold", 0.50))),
+                "added_count": 0,
+            }
+            stage1_floor_info: Dict[str, Any] = {
+                "enabled": bool(self.config.get("STAGE1_CANDIDATE_FLOOR_ENABLED", self.config.get("stage1_candidate_floor_enabled", True))),
+                "required_count": int(len(stage1_candidates)),
+                "before_count": int(len(stage1_candidates)),
+                "after_count": int(len(stage1_candidates)),
+                "added_count": 0,
+                "added_time_bins": 0,
+                "added_quality_pool": 0,
+                "min_ratio": float(self.config.get("STAGE1_MIN_PASS_RATIO", self.config.get("stage1_min_pass_ratio", 0.12))),
+                "min_count": int(self.config.get("STAGE1_MIN_PASS_COUNT", self.config.get("stage1_min_pass_count", 120))),
+                "max_count": int(self.config.get("STAGE1_MAX_PASS_COUNT", self.config.get("stage1_max_pass_count", 2400))),
+            }
             stage1_effective_rows = []
             if colmap_runtime["colmap_shortcut"] and resume_enabled:
                 stage1_effective_rows = [
@@ -3524,6 +4162,35 @@ class KeyframeSelector:
                         f"added={int(stage1_backfill_info.get('added', 0))}, "
                         f"time_added={int(stage1_backfill_info.get('added_time_bins', 0))}, "
                         f"bins={int(stage1_backfill_info.get('bins', 0))}"
+                    )
+
+            if not colmap_runtime["colmap_shortcut"]:
+                stage1_candidates, stage1_stddev_info = self._apply_stage1_stddev_adaptive_threshold(
+                    stage1_candidates
+                )
+                if int(stage1_stddev_info.get("added_count", 0)) > 0:
+                    logger.info(
+                        "stage1_stddev_threshold_applied, "
+                        f"mean={float(stage1_stddev_info.get('mean_quality', 0.0)):.4f}, "
+                        f"std={float(stage1_stddev_info.get('std_quality', 0.0)):.4f}, "
+                        f"base={float(stage1_stddev_info.get('base_threshold', 0.0)):.4f}, "
+                        f"effective={float(stage1_stddev_info.get('effective_threshold', 0.0)):.4f}, "
+                        f"added={int(stage1_stddev_info.get('added_count', 0))}"
+                    )
+
+                stage1_candidates, stage1_floor_info = self._enforce_stage1_candidate_floor(
+                    stage1_candidates,
+                    total_frames=int(total_frames),
+                )
+                if int(stage1_floor_info.get("added_count", 0)) > 0:
+                    logger.info(
+                        "stage1_candidate_floor_applied, "
+                        f"before={int(stage1_floor_info.get('before_count', 0))}, "
+                        f"required={int(stage1_floor_info.get('required_count', 0))}, "
+                        f"after={int(stage1_floor_info.get('after_count', 0))}, "
+                        f"added={int(stage1_floor_info.get('added_count', 0))}, "
+                        f"time_bin_added={int(stage1_floor_info.get('added_time_bins', 0))}, "
+                        f"quality_pool_added={int(stage1_floor_info.get('added_quality_pool', 0))}"
                     )
 
             stage1_effective_path = store.save_stage1_effective(stage1_candidates)
@@ -3568,6 +4235,18 @@ class KeyframeSelector:
                     "stage1_threshold_added_count": int(stage1_adaptive_info.get("threshold_added_count", 0)),
                     "stage1_bin_floor_added_count": int(stage1_adaptive_info.get("bin_floor_added_count", 0)),
                     "stage1_backfill_added_count": int(stage1_backfill_info.get("added", 0)),
+                    "stage1_stddev_adaptive_enabled": bool(stage1_stddev_info.get("enabled", False)),
+                    "stage1_stddev_mean_quality": float(stage1_stddev_info.get("mean_quality", 0.0)),
+                    "stage1_stddev_quality": float(stage1_stddev_info.get("std_quality", 0.0)),
+                    "stage1_stddev_sigma_factor": float(stage1_stddev_info.get("sigma_factor", 0.0)),
+                    "stage1_stddev_threshold_effective": float(stage1_stddev_info.get("effective_threshold", 0.0)),
+                    "stage1_stddev_added_count": int(stage1_stddev_info.get("added_count", 0)),
+                    "stage1_candidate_floor_enabled": bool(stage1_floor_info.get("enabled", False)),
+                    "stage1_candidate_floor_required_count": int(stage1_floor_info.get("required_count", 0)),
+                    "stage1_candidate_floor_added_count": int(stage1_floor_info.get("added_count", 0)),
+                    "stage1_candidate_floor_min_ratio": float(stage1_floor_info.get("min_ratio", 0.0)),
+                    "stage1_candidate_floor_min_count": int(stage1_floor_info.get("min_count", 0)),
+                    "stage1_candidate_floor_max_count": int(stage1_floor_info.get("max_count", 0)),
                     "stage1_lr_merge_mode": str(stage1_lr_summary.get("stage1_lr_merge_mode", "")),
                     "stage1_lr_merge_counts": dict(stage1_lr_summary.get("stage1_lr_merge_counts", {})),
                     "stage1_lens_pass_matrix": dict(stage1_lr_summary.get("stage1_lens_pass_matrix", {})),
@@ -3864,6 +4543,94 @@ class KeyframeSelector:
             if stage2_drop_reason_counts:
                 logger.info(f"stage2_drop_reason_counts, {stage2_drop_reason_counts}")
 
+            stage2_colmap_preview_rows: List[Dict[str, Any]] = []
+            stage2_colmap_preview_indices: List[int] = []
+            stage2_colmap_preview_summary: Dict[str, Any] = {
+                "target_count": 0,
+                "input_count": 0,
+                "bins_occupied": 0,
+                "drop_reason_counts": {},
+                "first": None,
+                "last": None,
+                "max_gap": None,
+            }
+            if colmap_runtime["minimal_mode"]:
+                if resume_enabled and store.has_stage2_colmap_preview():
+                    stage2_colmap_preview_rows = [
+                        dict(row) for row in store.load_stage2_colmap_preview() if isinstance(row, dict)
+                    ]
+                    stage2_colmap_preview_indices = self._extract_frame_indices_from_rows(stage2_colmap_preview_rows)
+                    stage2_colmap_preview_summary = {
+                        "target_count": int(len(stage2_colmap_preview_indices)),
+                        "input_count": int(stage2_read_success_count),
+                        "bins_occupied": int(
+                            self._count_time_bins_occupied(
+                                stage2_colmap_preview_indices,
+                                total_frames=int(total_frames),
+                                bins=24,
+                            )
+                        ),
+                        "drop_reason_counts": {},
+                        "first": self._index_stats_from_indices(stage2_colmap_preview_indices).get("first"),
+                        "last": self._index_stats_from_indices(stage2_colmap_preview_indices).get("last"),
+                        "max_gap": self._index_stats_from_indices(stage2_colmap_preview_indices).get("max_gap"),
+                    }
+                else:
+                    stage2_colmap_preview_rows, stage2_colmap_preview_summary = self._build_stage2_colmap_preview_v1(
+                        stage2_records,
+                        total_frames=int(total_frames),
+                    )
+                    stage2_colmap_preview_indices = self._extract_frame_indices_from_rows(stage2_colmap_preview_rows)
+                    preview_path = store.save_stage2_colmap_preview(stage2_colmap_preview_rows)
+                    store.mark_stage_done(
+                        "2",
+                        files={
+                            "candidates": str(store.run_dir / store.STAGE2_CANDIDATES_FILE),
+                            "records": str(store.run_dir / store.STAGE2_RECORDS_FILE),
+                            "colmap_preview": str(preview_path),
+                        },
+                        counts={
+                            "candidates": int(len(stage2_candidates)),
+                            "records": int(len(stage2_records)),
+                            "read_success": int(stage2_read_success_count),
+                            "colmap_preview": int(len(stage2_colmap_preview_indices)),
+                        },
+                    )
+                if stage2_colmap_preview_rows and not stage2_colmap_preview_indices:
+                    stage2_colmap_preview_indices = self._extract_frame_indices_from_rows(stage2_colmap_preview_rows)
+                stage2_preview_stats = self._index_stats_from_indices(stage2_colmap_preview_indices)
+                stage2_colmap_preview_summary["first"] = stage2_preview_stats.get("first")
+                stage2_colmap_preview_summary["last"] = stage2_preview_stats.get("last")
+                stage2_colmap_preview_summary["max_gap"] = stage2_preview_stats.get("max_gap")
+                stage2_colmap_preview_summary["bins_occupied"] = int(
+                    self._count_time_bins_occupied(
+                        stage2_colmap_preview_indices,
+                        total_frames=int(total_frames),
+                        bins=24,
+                    )
+                )
+                self.last_selection_runtime.update(
+                    {
+                        "stage2_colmap_preview_count": int(len(stage2_colmap_preview_indices)),
+                        "stage2_colmap_preview_first": stage2_colmap_preview_summary.get("first"),
+                        "stage2_colmap_preview_last": stage2_colmap_preview_summary.get("last"),
+                        "stage2_colmap_preview_max_gap": stage2_colmap_preview_summary.get("max_gap"),
+                        "stage2_colmap_preview_bins_occupied": int(stage2_colmap_preview_summary.get("bins_occupied", 0)),
+                        "stage2_colmap_preview_drop_reason_counts": dict(stage2_colmap_preview_summary.get("drop_reason_counts", {})),
+                        "stage2_colmap_preview_indices": [int(v) for v in stage2_colmap_preview_indices],
+                    }
+                )
+                logger.info(
+                    "stage2_colmap_preview, "
+                    f"input={int(stage2_colmap_preview_summary.get('input_count', 0))}, "
+                    f"target={int(stage2_colmap_preview_summary.get('target_count', 0))}, "
+                    f"selected={int(len(stage2_colmap_preview_indices))}, "
+                    f"first={stage2_colmap_preview_summary.get('first')}, "
+                    f"last={stage2_colmap_preview_summary.get('last')}, "
+                    f"max_gap={stage2_colmap_preview_summary.get('max_gap')}, "
+                    f"bins={int(stage2_colmap_preview_summary.get('bins_occupied', 0))}"
+                )
+
             if colmap_runtime["minimal_mode"]:
                 stage2_keyframes_pre_stage3 = list(stage2_candidates)
             else:
@@ -3883,58 +4650,111 @@ class KeyframeSelector:
             current_stage = "3"
             keyframes = stage2_keyframes_pre_stage3
             stage3_executed_count = 0
-            if mode_enable_stage3 and resume_enabled and store.has_stage3():
-                stage3_executed_count = 1
-                logger.info("Stage 3: テンポラリ結果を再利用")
-                keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
-            else:
-                if mode_enable_stage3:
-                    stage3_executed_count = 1
-                    t_stage3 = perf_counter() if profile_enabled else 0.0
-                    _stage_start("3", input_candidates=len(stage2_candidates))
-                    logger.info("Stage 3: 軌跡再評価開始")
-                    stage2_candidates = run_stage3_refiner(
-                        self,
-                        metadata=metadata,
-                        stage2_candidates=stage2_candidates,
-                        stage2_final=stage2_keyframes_pre_stage3,
-                        stage2_records=stage2_records,
-                        stage0_metrics=stage0_metrics,
-                        video_loader=video_loader,
-                    )
-                    keyframes = self._enforce_max_interval(
-                        self._apply_nms(
-                            stage2_candidates,
-                            time_window=colmap_runtime["effective_nms_window"],
-                            cumulative_motion_map=cumulative_motion_map,
-                            motion_window=effective_motion_window,
-                            motion_aware_selection=bool(colmap_runtime.get("colmap_motion_aware_selection", True)),
-                        ),
-                        metadata.fps,
-                        source_candidates=stage2_candidates,
-                    )
-                    if profile_enabled:
-                        _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
-                stage3_rows = [self._serialize_keyframe_info(kf) for kf in keyframes]
-                stage3_path = store.save_stage3(stage3_rows)
-                stage3_counts = (
-                    {"keyframes": 0, "compat_keyframes": len(stage3_rows)}
-                    if colmap_runtime["minimal_mode"]
-                    else {"keyframes": len(stage3_rows)}
-                )
-                store.mark_stage_done("3", files={"keyframes": stage3_path}, counts=stage3_counts)
-                keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
-
+            stage3_diagnostics: Dict[str, Any] = {}
+            stage3_diag_path: Optional[str] = None
             if colmap_runtime["minimal_mode"]:
-                stage3_executed_count = 0
+                stage3_executed_count = 1
+                _stage_start("3", input_candidates=len(stage2_candidates), mode="diagnostics_only")
+                if resume_enabled and store.has_stage3() and store.has_stage3_diagnostics():
+                    logger.info("Stage 3(minimal_v1): テンポラリ診断結果を再利用")
+                    keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
+                    stage3_diagnostics = dict(store.load_stage3_diagnostics())
+                else:
+                    stage3_rows = [self._serialize_keyframe_info(kf) for kf in keyframes]
+                    stage3_path = store.save_stage3(stage3_rows)
+                    stage3_diagnostics = self._compute_stage3_diagnostics_v1(
+                        keyframes=keyframes,
+                        stage2_records=stage2_records,
+                        total_frames=int(total_frames),
+                    )
+                    stage3_diag_path = store.save_stage3_diagnostics(stage3_diagnostics)
+                    store.mark_stage_done(
+                        "3",
+                        files={"keyframes": stage3_path, "diagnostics": str(stage3_diag_path)},
+                        counts={
+                            "keyframes": 0,
+                            "compat_keyframes": len(stage3_rows),
+                            "diagnostics_runs": 1,
+                        },
+                    )
+                    keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
+                    stage3_diagnostics = dict(store.load_stage3_diagnostics())
+                if not stage3_diagnostics:
+                    stage3_diagnostics = self._compute_stage3_diagnostics_v1(
+                        keyframes=keyframes,
+                        stage2_records=stage2_records,
+                        total_frames=int(total_frames),
+                    )
+                    stage3_diag_path = store.save_stage3_diagnostics(stage3_diagnostics)
+            else:
+                if mode_enable_stage3 and resume_enabled and store.has_stage3():
+                    stage3_executed_count = 1
+                    logger.info("Stage 3: テンポラリ結果を再利用")
+                    keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
+                else:
+                    if mode_enable_stage3:
+                        stage3_executed_count = 1
+                        t_stage3 = perf_counter() if profile_enabled else 0.0
+                        _stage_start("3", input_candidates=len(stage2_candidates))
+                        logger.info("Stage 3: 軌跡再評価開始")
+                        stage2_candidates = run_stage3_refiner(
+                            self,
+                            metadata=metadata,
+                            stage2_candidates=stage2_candidates,
+                            stage2_final=stage2_keyframes_pre_stage3,
+                            stage2_records=stage2_records,
+                            stage0_metrics=stage0_metrics,
+                            video_loader=video_loader,
+                        )
+                        keyframes = self._enforce_max_interval(
+                            self._apply_nms(
+                                stage2_candidates,
+                                time_window=colmap_runtime["effective_nms_window"],
+                                cumulative_motion_map=cumulative_motion_map,
+                                motion_window=effective_motion_window,
+                                motion_aware_selection=bool(colmap_runtime.get("colmap_motion_aware_selection", True)),
+                            ),
+                            metadata.fps,
+                            source_candidates=stage2_candidates,
+                        )
+                        if profile_enabled:
+                            _profile_log("3", perf_counter() - t_stage3, len(stage2_candidates))
+                    stage3_rows = [self._serialize_keyframe_info(kf) for kf in keyframes]
+                    stage3_path = store.save_stage3(stage3_rows)
+                    keyframes = [self._deserialize_keyframe_info(row) for row in store.load_stage3()]
+                    stage3_diagnostics = self._compute_stage3_diagnostics_v1(
+                        keyframes=keyframes,
+                        stage2_records=stage2_records,
+                        total_frames=int(total_frames),
+                    )
+                    stage3_diag_path = store.save_stage3_diagnostics(stage3_diagnostics)
+                    store.mark_stage_done(
+                        "3",
+                        files={"keyframes": stage3_path, "diagnostics": str(stage3_diag_path)},
+                        counts={"keyframes": len(stage3_rows), "diagnostics_runs": 1},
+                    )
+                if not stage3_diagnostics and store.has_stage3_diagnostics():
+                    stage3_diagnostics = dict(store.load_stage3_diagnostics())
+                if not stage3_diagnostics:
+                    stage3_diagnostics = self._compute_stage3_diagnostics_v1(
+                        keyframes=keyframes,
+                        stage2_records=stage2_records,
+                        total_frames=int(total_frames),
+                    )
+                    stage3_diag_path = store.save_stage3_diagnostics(stage3_diagnostics)
+
+            if stage3_diag_path is None and store.has_stage3_diagnostics():
+                stage3_diag_path = str(store.run_dir / store.STAGE3_DIAGNOSTICS_FILE)
             self.last_selection_runtime["stage3_executed_count"] = int(stage3_executed_count)
+            self.last_selection_runtime["stage3_diagnostics"] = dict(stage3_diagnostics)
             logger.info(f"Stage 3完了: {len(keyframes)}個")
             _stage_summary(
                 "3",
                 keyframes=(0 if colmap_runtime["minimal_mode"] else len(keyframes)),
                 compat_keyframes=len(keyframes),
                 temp_file=str(store.run_dir / store.STAGE3_KEYFRAMES_FILE),
-                skipped=("minimal_v1" if colmap_runtime["minimal_mode"] else ""),
+                diagnostics_file=(str(stage3_diag_path) if stage3_diag_path else ""),
+                skipped=("minimal_v1_selection_disabled" if colmap_runtime["minimal_mode"] else ""),
             )
 
             pre_retarget_count = len(keyframes)
@@ -4066,6 +4886,9 @@ class KeyframeSelector:
                     "stage2_candidates": int(len(stage2_candidates)),
                     "stage2_records": int(len(stage2_records)),
                     "stage2_read_success_count": int(stage2_read_success_count),
+                    "stage2_colmap_preview_count": int(
+                        self.last_selection_runtime.get("stage2_colmap_preview_count", 0)
+                    ),
                     "stage3_keyframes_pre_retarget": int(pre_retarget_count),
                     "final_keyframes": int(
                         stage2_read_success_count if colmap_runtime["minimal_mode"] else len(keyframes)
@@ -4080,6 +4903,18 @@ class KeyframeSelector:
                 ),
                 "stage15_drop_reason_counts": dict(stage15_info.get("drop_reason_counts", {})),
                 "stage2_read_success_count": int(stage2_read_success_count),
+                "stage2_colmap_preview_count": int(
+                    self.last_selection_runtime.get("stage2_colmap_preview_count", 0)
+                ),
+                "stage2_colmap_preview_first": self.last_selection_runtime.get("stage2_colmap_preview_first"),
+                "stage2_colmap_preview_last": self.last_selection_runtime.get("stage2_colmap_preview_last"),
+                "stage2_colmap_preview_max_gap": self.last_selection_runtime.get("stage2_colmap_preview_max_gap"),
+                "stage2_colmap_preview_bins_occupied": int(
+                    self.last_selection_runtime.get("stage2_colmap_preview_bins_occupied", 0)
+                ),
+                "stage2_colmap_preview_drop_reason_counts": dict(
+                    self.last_selection_runtime.get("stage2_colmap_preview_drop_reason_counts", {})
+                ),
                 "stage1_adaptive_threshold_base": float(stage1_adaptive_info.get("base_threshold", 0.0)),
                 "stage1_adaptive_threshold_effective": float(stage1_adaptive_info.get("effective_threshold", 0.0)),
                 "stage1_q_pass_target": float(stage1_adaptive_info.get("q_pass_target", 0.0)),
@@ -4109,6 +4944,7 @@ class KeyframeSelector:
                     "coverage_before": dict(coverage_before),
                     "coverage_after": dict(coverage_after),
                 },
+                "stage3_diagnostics": dict(self.last_selection_runtime.get("stage3_diagnostics", {})),
                 "selection_trace_csv": str(selection_trace_path) if selection_trace_path is not None else "",
                 "selection_runtime": dict(self.last_selection_runtime),
             }

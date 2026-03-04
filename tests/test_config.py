@@ -57,6 +57,12 @@ def test_keyframe_config_round_trip():
     assert restored.to_selector_dict()["COLMAP_WORKSPACE_SCOPE"] == "run_scoped"
     assert restored.to_selector_dict()["COLMAP_REUSE_DB"] is False
     assert restored.to_selector_dict()["COLMAP_ANALYSIS_MASK_PROFILE"] == "colmap_safe"
+    assert restored.to_selector_dict()["COLMAP_SPARSE_MODEL_PICK_POLICY"] == "registered_then_coverage"
+    assert restored.to_selector_dict()["COLMAP_INPUT_SUBSET_ENABLED"] is True
+    assert restored.to_selector_dict()["COLMAP_INPUT_GATE_METHOD"] == "homography_degeneracy_v1"
+    assert restored.to_selector_dict()["COLMAP_INPUT_GATE_STRENGTH"] == "medium"
+    assert restored.to_selector_dict()["COLMAP_INPUT_MIN_KEEP_RATIO"] == pytest.approx(0.20, abs=1e-6)
+    assert restored.to_selector_dict()["COLMAP_INPUT_MAX_GAP_RESCUE_FRAMES"] == 150
     assert restored.to_selector_dict()["POSE_EXPORT_FORMAT"] == "internal"
     assert restored.to_selector_dict()["POSE_SELECT_ENABLE_TRANSLATION"] is True
 

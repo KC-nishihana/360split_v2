@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from core.keyframe_selector import KeyframeSelector, KeyframeInfo
+from core.keyframe_selector import KeyframeSelector, KeyframeInfo, Stage2FrameRecord
 from core.stage_temp_store import StageTempStore
 
 
@@ -580,3 +580,64 @@ def test_stage1_lr_auto_relax_when_sky_threshold_unreachable(monkeypatch):
     assert rec["lr_weak_floor"] <= 0.30 + 1e-9
     assert rec["is_pass"] is True
     assert rec["quality_merge_strategy"] == "asymmetric_max_with_weak_floor"
+
+
+def test_stage2_colmap_preview_v1_is_deterministic_and_distributed():
+    selector = KeyframeSelector(config={"pose_backend": "colmap", "colmap_pipeline_mode": "minimal_v1"})
+    records = []
+    for idx in range(0, 2310, 5):
+        flow = float((idx % 240) / 8.0)
+        ssim_pair = float(max(0.2, min(0.98, 0.95 - ((idx % 180) / 360.0))))
+        quality = float(max(0.1, min(0.98, 0.45 + ((idx % 120) / 300.0))))
+        records.append(
+            Stage2FrameRecord(
+                frame_index=idx,
+                frame=None,
+                quality_scores={"quality": quality},
+                geometric_scores={},
+                adaptive_scores={"ssim_pair": ssim_pair, "optical_flow": flow},
+                metrics={"flow_mag": flow},
+                is_candidate=True,
+                drop_reason="selected",
+            )
+        )
+    rows_a, summary_a = selector._build_stage2_colmap_preview_v1(records, total_frames=2310)
+    rows_b, summary_b = selector._build_stage2_colmap_preview_v1(records, total_frames=2310)
+    idx_a = [int(r["frame_index"]) for r in rows_a]
+    idx_b = [int(r["frame_index"]) for r in rows_b]
+    assert idx_a == idx_b
+    assert 180 <= len(idx_a) <= 800
+    assert int(summary_a.get("bins_occupied", 0)) >= 20
+    assert idx_a[0] <= 100
+    assert idx_a[-1] >= 2100
+    assert int(summary_a.get("max_gap", 9999)) <= 180
+    assert summary_a == summary_b
+
+
+def test_stage3_diagnostics_v1_detects_cluster():
+    selector = KeyframeSelector(config={"pose_backend": "colmap", "colmap_pipeline_mode": "minimal_v1"})
+    keyframes = [
+        KeyframeInfo(frame_index=idx, timestamp=idx / 30.0, quality_scores={"quality": 0.25}, adaptive_scores={"ssim_pair": 0.99})
+        for idx in range(1000, 1110)
+    ]
+    records = [
+        Stage2FrameRecord(
+            frame_index=idx,
+            frame=None,
+            quality_scores={"quality": 0.25},
+            geometric_scores={},
+            adaptive_scores={"ssim_pair": 0.99, "optical_flow": 0.2},
+            metrics={"flow_mag": 0.2},
+            is_candidate=True,
+            drop_reason="selected",
+        )
+        for idx in range(1000, 1110)
+    ]
+    diag = selector._compute_stage3_diagnostics_v1(
+        keyframes=keyframes,
+        stage2_records=records,
+        total_frames=2310,
+    )
+    assert bool(diag.get("cluster_alert")) is True
+    assert int(diag.get("contiguous_run_max", 0)) >= 80
+    assert isinstance(diag.get("alerts", []), list)

@@ -711,6 +711,33 @@ def parse_arguments():
         help="COLMAP向け解析時マスクプロファイル"
     )
     parser.add_argument(
+        "--colmap-sparse-model-pick-policy",
+        type=str,
+        choices=["registered_then_coverage", "coverage_then_registered", "latest_legacy"],
+        default=None,
+        help="COLMAP sparse モデルの採用方針"
+    )
+    parser.add_argument(
+        "--colmap-input-subset-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="COLMAP入力に幾何縮退ゲート付きサブセットを使う"
+    )
+    parser.add_argument(
+        "--colmap-input-gate-method",
+        type=str,
+        choices=["homography_degeneracy_v1", "off"],
+        default=None,
+        help="COLMAP入力サブセットのゲート方式"
+    )
+    parser.add_argument(
+        "--colmap-input-gate-strength",
+        type=str,
+        choices=["weak", "medium", "strong"],
+        default=None,
+        help="COLMAP入力サブセットのゲート強度"
+    )
+    parser.add_argument(
         "--pose-export-format",
         type=str,
         choices=["internal", "metashape"],
@@ -1064,6 +1091,14 @@ def apply_cli_overrides(config: dict, args) -> None:
         config["colmap_reuse_db"] = bool(args.colmap_reuse_db)
     if args.colmap_analysis_mask_profile is not None:
         config["colmap_analysis_mask_profile"] = str(args.colmap_analysis_mask_profile).strip().lower()
+    if args.colmap_sparse_model_pick_policy is not None:
+        config["colmap_sparse_model_pick_policy"] = str(args.colmap_sparse_model_pick_policy).strip().lower()
+    if args.colmap_input_subset_enabled is not None:
+        config["colmap_input_subset_enabled"] = bool(args.colmap_input_subset_enabled)
+    if args.colmap_input_gate_method is not None:
+        config["colmap_input_gate_method"] = str(args.colmap_input_gate_method).strip().lower()
+    if args.colmap_input_gate_strength is not None:
+        config["colmap_input_gate_strength"] = str(args.colmap_input_gate_strength).strip().lower()
     if args.pose_export_format is not None:
         config["pose_export_format"] = str(args.pose_export_format).strip().lower()
     if args.pose_select_translation_threshold is not None:
@@ -1654,6 +1689,20 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     analysis_mask_profile = str(config.get("colmap_analysis_mask_profile", "") or "").strip().lower()
     if analysis_mask_profile not in {"legacy", "colmap_safe"}:
         analysis_mask_profile = "colmap_safe" if pose_backend == "colmap" else "legacy"
+    sparse_model_pick_policy = str(config.get("colmap_sparse_model_pick_policy", "") or "").strip().lower()
+    if sparse_model_pick_policy not in {"registered_then_coverage", "coverage_then_registered", "latest_legacy"}:
+        sparse_model_pick_policy = "registered_then_coverage"
+    colmap_input_subset_enabled = bool(config.get("colmap_input_subset_enabled", pose_backend == "colmap"))
+    colmap_input_gate_method = str(config.get("colmap_input_gate_method", "") or "").strip().lower()
+    if colmap_input_gate_method not in {"homography_degeneracy_v1", "off"}:
+        colmap_input_gate_method = "homography_degeneracy_v1"
+    colmap_input_gate_strength = str(config.get("colmap_input_gate_strength", "") or "").strip().lower()
+    if colmap_input_gate_strength not in {"weak", "medium", "strong"}:
+        colmap_input_gate_strength = "medium"
+    colmap_input_min_keep_ratio = float(
+        max(0.0, min(1.0, config.get("colmap_input_min_keep_ratio", 0.20)))
+    )
+    colmap_input_max_gap_rescue_frames = int(max(1, config.get("colmap_input_max_gap_rescue_frames", 150)))
 
     if minimal_mode:
         logger.warning(
@@ -1713,6 +1762,18 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     config["COLMAP_REUSE_DB"] = reuse_db
     config["colmap_analysis_mask_profile"] = analysis_mask_profile
     config["COLMAP_ANALYSIS_MASK_PROFILE"] = analysis_mask_profile
+    config["colmap_sparse_model_pick_policy"] = sparse_model_pick_policy
+    config["COLMAP_SPARSE_MODEL_PICK_POLICY"] = sparse_model_pick_policy
+    config["colmap_input_subset_enabled"] = colmap_input_subset_enabled
+    config["COLMAP_INPUT_SUBSET_ENABLED"] = colmap_input_subset_enabled
+    config["colmap_input_gate_method"] = colmap_input_gate_method
+    config["COLMAP_INPUT_GATE_METHOD"] = colmap_input_gate_method
+    config["colmap_input_gate_strength"] = colmap_input_gate_strength
+    config["COLMAP_INPUT_GATE_STRENGTH"] = colmap_input_gate_strength
+    config["colmap_input_min_keep_ratio"] = colmap_input_min_keep_ratio
+    config["COLMAP_INPUT_MIN_KEEP_RATIO"] = colmap_input_min_keep_ratio
+    config["colmap_input_max_gap_rescue_frames"] = colmap_input_max_gap_rescue_frames
+    config["COLMAP_INPUT_MAX_GAP_RESCUE_FRAMES"] = colmap_input_max_gap_rescue_frames
 
     if pose_backend == "colmap" and (policy != "legacy" or minimal_mode):
         stage0_enabled = bool(colmap_enable_stage0) and selection_profile != "no_vo_coverage" and (not minimal_mode)
@@ -1783,6 +1844,12 @@ def _apply_colmap_keyframe_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
         "workspace_scope": workspace_scope,
         "reuse_db": reuse_db,
         "analysis_mask_profile": analysis_mask_profile,
+        "sparse_model_pick_policy": sparse_model_pick_policy,
+        "colmap_input_subset_enabled": colmap_input_subset_enabled,
+        "colmap_input_gate_method": colmap_input_gate_method,
+        "colmap_input_gate_strength": colmap_input_gate_strength,
+        "colmap_input_min_keep_ratio": colmap_input_min_keep_ratio,
+        "colmap_input_max_gap_rescue_frames": colmap_input_max_gap_rescue_frames,
         "disabled_components": [
             "stage0",
             "stage1_5",
@@ -2342,6 +2409,17 @@ def run_cli(args):
     try:
         exported_entries = _build_exported_entries(pose_image_root, exported_image_paths)
         frame_metrics_map = _build_frame_metrics_map(frame_metrics_records)
+        colmap_preview_frame_indices = [
+            int(v)
+            for v in list(
+                getattr(selector, "last_selection_runtime", {}).get(
+                    "stage2_colmap_preview_indices",
+                    [],
+                )
+                or []
+            )
+            if isinstance(v, (int, float))
+        ]
         if not str(config.get("colmap_workspace", "") or "").strip():
             config["colmap_workspace"] = str((output_dir / "pose_colmap").resolve())
 
@@ -2365,6 +2443,13 @@ def run_cli(args):
                 "colmap_reuse_db": bool(config.get("colmap_reuse_db", False)),
                 "colmap_rig_policy": str(config.get("colmap_rig_policy", "lr_opk") or "lr_opk"),
                 "colmap_rig_seed_opk_deg": list(config.get("colmap_rig_seed_opk_deg", [0.0, 0.0, 180.0])),
+                "colmap_sparse_model_pick_policy": str(config.get("colmap_sparse_model_pick_policy", "registered_then_coverage") or "registered_then_coverage"),
+                "colmap_input_subset_enabled": bool(config.get("colmap_input_subset_enabled", True)),
+                "colmap_input_gate_method": str(config.get("colmap_input_gate_method", "homography_degeneracy_v1") or "homography_degeneracy_v1"),
+                "colmap_input_gate_strength": str(config.get("colmap_input_gate_strength", "medium") or "medium"),
+                "colmap_input_min_keep_ratio": float(config.get("colmap_input_min_keep_ratio", 0.20)),
+                "colmap_input_max_gap_rescue_frames": int(config.get("colmap_input_max_gap_rescue_frames", 150)),
+                "colmap_preview_frame_indices": colmap_preview_frame_indices,
             },
         )
         pose_result = pose_payload.get("result")
@@ -2387,6 +2472,8 @@ def run_cli(args):
             f"backend={pose_summary['backend']}, "
             f"trajectory={pose_summary['trajectory_count']}, "
             f"selected={pose_summary['selected_count']}, "
+            f"selected_frames={pose_summary.get('selection_stats', {}).get('selected_frame_count')}, "
+            f"spatial_post={pose_summary.get('selection_stats', {}).get('spatial_post_filter', {}).get('applied')}, "
             f"copied={pose_summary['copied_count']}"
         )
     except Exception as e:

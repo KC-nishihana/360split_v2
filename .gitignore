@@ -35,6 +35,7 @@ env/
 *.tmp
 *.swp
 .env
+out/
 
 # ビルド／配布用ディレクトリ
 dist/

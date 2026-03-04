@@ -1,0 +1,53 @@
+camera_front:
+  K: [[1200, 0, 960], [0, 1200, 960], [0, 0, 1]]
+  D: [0.01, -0.02, 0.005, -0.001]
+  image_size: [1920, 1920]
+  model: fisheye
+
+camera_back:
+  K: [[1200, 0, 960], [0, 1200, 960], [0, 0, 1]]
+  D: [0.01, -0.02, 0.005, -0.001]
+  image_size: [1920, 1920]
+  model: fisheye
+
+projection:
+  directions:
+    - {name: front, yaw_deg: 0}
+    - {name: left, yaw_deg: -90}
+    - {name: right, yaw_deg: 90}
+    - {name: back, yaw_deg: 180}
+  hfov_deg: 90
+  vfov_deg: 90
+  output_size: [1600, 1600]
+
+extraction:
+  fps: 2.0
+  start_sec: 0.0
+  end_sec: null
+  max_frames: null
+
+selection:
+  sfm:
+    sharpness_min: 150.0
+    exposure_min: 0.4
+    orb_min: 100
+    ssim_max: 0.92
+    per_direction_min: 20
+    max_total: null
+  gs:
+    sharpness_min: 80.0
+    exposure_min: 0.3
+    orb_min: 50
+    ssim_max: 0.96
+    per_direction_min: 10
+    max_total: null
+
+colmap:
+  enabled: false
+  binary_path: colmap
+  workspace: colmap_workspace
+  camera_model: PINHOLE
+  use_gpu: false
+
+output_dir: out
+project_name: my_project

@@ -16,6 +16,43 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class BatchNorms:
+    """P90-based normalization denominators computed from a full metrics batch.
+
+    Adapts quality score scaling to the actual distribution of the video being
+    processed, so that e.g. a high-quality outdoor clip and a dim indoor clip
+    each have their best frames score near 1.0 rather than being unfairly
+    penalised by fixed global constants.
+    """
+
+    laplacian_p90: float = 500.0   # divisor for laplacian_var normalisation
+    tenengrad_p90: float = 2000.0  # divisor for tenengrad normalisation
+    orb_p90: float = 500.0         # divisor for orb_keypoints normalisation
+
+
+def compute_batch_norms(metrics: List[FrameMetrics]) -> BatchNorms:
+    """Compute P90-based normalization denominators from all frame metrics.
+
+    Falls back to fixed defaults when a metric has no positive values
+    (e.g., all-black frames).
+    """
+    lap_vals = [m.laplacian_var for m in metrics if m.laplacian_var > 0]
+    ten_vals = [m.tenengrad for m in metrics if m.tenengrad > 0]
+    orb_vals = [m.orb_keypoints for m in metrics if m.orb_keypoints > 0]
+
+    norms = BatchNorms(
+        laplacian_p90=float(np.percentile(lap_vals, 90)) if lap_vals else 500.0,
+        tenengrad_p90=float(np.percentile(ten_vals, 90)) if ten_vals else 2000.0,
+        orb_p90=float(np.percentile(orb_vals, 90)) if orb_vals else 500.0,
+    )
+    logger.info(
+        f"BatchNorms P90 — laplacian={norms.laplacian_p90:.1f}, "
+        f"tenengrad={norms.tenengrad_p90:.1f}, orb={norms.orb_p90:.1f}"
+    )
+    return norms
+
+
+@dataclass
 class SelectedFrame:
     """A frame selected for output."""
 
@@ -60,22 +97,34 @@ class SelectionResult:
         return dict(counts)
 
 
-def _compute_quality_score(m: FrameMetrics) -> float:
+def _compute_quality_score(
+    m: FrameMetrics,
+    norms: Optional[BatchNorms] = None,
+) -> float:
     """Compute composite quality score [0, 1] from metrics.
 
     Weights:
-      Laplacian sharpness  25%  (normalized by 500)
-      Tenengrad            15%  (normalized by 2000; Sobel gradient energy)
+      Laplacian sharpness  25%  (normalized by BatchNorms.laplacian_p90 or 500)
+      Tenengrad            15%  (normalized by BatchNorms.tenengrad_p90 or 2000)
       Exposure             25%
-      ORB keypoints        20%  (normalized by 500)
+      ORB keypoints        20%  (normalized by BatchNorms.orb_p90 or 500)
       Novelty (1-SSIM)     15%
+
+    When ``norms`` is provided the denominators are video-adaptive (P90 of the
+    full batch), so the best frames in any given clip score near 1.0 regardless
+    of absolute metric magnitudes.  Passing ``None`` uses fixed fallback values
+    for backward compatibility.
     """
-    sharpness_norm = float(np.clip(m.laplacian_var / 500.0, 0.0, 1.0))
-    tenengrad_norm = float(np.clip(m.tenengrad / 2000.0, 0.0, 1.0))
-    exposure_norm = m.exposure_score
-    orb_norm = float(np.clip(m.orb_keypoints / 500.0, 0.0, 1.0))
+    lap_d = norms.laplacian_p90 if norms is not None else 500.0
+    ten_d = norms.tenengrad_p90 if norms is not None else 2000.0
+    orb_d = norms.orb_p90       if norms is not None else 500.0
+
+    sharpness_norm = float(np.clip(m.laplacian_var / max(lap_d, 1e-6), 0.0, 1.0))
+    tenengrad_norm = float(np.clip(m.tenengrad     / max(ten_d, 1e-6), 0.0, 1.0))
+    exposure_norm  = m.exposure_score
+    orb_norm       = float(np.clip(m.orb_keypoints / max(orb_d, 1e-6), 0.0, 1.0))
     # Novelty: lower SSIM = more novel content
-    novelty_norm = float(np.clip(1.0 - m.ssim_prev, 0.0, 1.0))
+    novelty_norm   = float(np.clip(1.0 - m.ssim_prev, 0.0, 1.0))
 
     score = (
         0.25 * sharpness_norm
@@ -94,11 +143,22 @@ class TierSelector:
         self._t = thresholds
         self._tier = tier_name
 
-    def select(self, all_metrics: List[FrameMetrics]) -> List[SelectedFrame]:
+    def select(
+        self,
+        all_metrics: List[FrameMetrics],
+        norms: Optional[BatchNorms] = None,
+    ) -> List[SelectedFrame]:
         """Select frames that pass quality thresholds.
 
+        Parameters
+        ----------
+        norms : optional batch-adaptive normalization denominators produced by
+            ``compute_batch_norms()``.  When provided, quality scores used for
+            rescue ranking and max_total sorting adapt to the video's own metric
+            distribution (P90-based) instead of fixed global constants.
+
         Steps:
-        1. Filter by absolute thresholds (sharpness, exposure, orb)
+        1. Filter by absolute thresholds (sharpness, tenengrad, exposure, orb)
         2. Filter by SSIM novelty (reject frames too similar to previous)
         3. Ensure per-direction minimum counts (rescue best frames if needed)
         4. Apply max_total limit if set
@@ -154,7 +214,7 @@ class TierSelector:
                 m for m in rejected_by_threshold
                 if (m.stream, m.direction) == pair
             ]
-            candidates.sort(key=_compute_quality_score, reverse=True)
+            candidates.sort(key=lambda m: _compute_quality_score(m, norms), reverse=True)
 
             for m in candidates[:deficit]:
                 rescued.append((m, f"rescued_for_{pair[0]}_{pair[1]}"))
@@ -170,7 +230,7 @@ class TierSelector:
                 direction=m.direction,
                 tier=self._tier,
                 reason=reason,
-                score=_compute_quality_score(m),
+                score=_compute_quality_score(m, norms),
                 metrics=m,
             ))
 
@@ -196,12 +256,18 @@ def select_two_tier(
     """Run both SfM (strict) and 3DGS (relaxed) selection.
 
     3DGS result is a superset of SfM result (SfM frames always included in 3DGS).
+
+    Computes P90-based batch normalization once from all metrics and shares it
+    across both tier selectors so quality scores adapt to the video's own metric
+    distribution.
     """
+    norms = compute_batch_norms(all_metrics)
+
     sfm_selector = TierSelector(config.sfm, "sfm")
     gs_selector = TierSelector(config.gs, "gs")
 
-    sfm_frames = sfm_selector.select(all_metrics)
-    gs_frames = gs_selector.select(all_metrics)
+    sfm_frames = sfm_selector.select(all_metrics, norms=norms)
+    gs_frames = gs_selector.select(all_metrics, norms=norms)
 
     # Merge: ensure all SfM frames are included in 3DGS
     gs_keys = {(f.frame_idx, f.stream, f.direction) for f in gs_frames}

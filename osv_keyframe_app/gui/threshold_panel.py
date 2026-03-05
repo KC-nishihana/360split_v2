@@ -82,12 +82,13 @@ class _TierControls(QGroupBox):
         layout = QVBoxLayout(self)
 
         self.sharpness = _ThresholdSlider("Sharpness min:", 0, 500, defaults.sharpness_min, 1)
+        self.tenengrad = _ThresholdSlider("Tenengrad min:", 0, 5000, defaults.tenengrad_min, 0)
         self.exposure = _ThresholdSlider("Exposure min:", 0.0, 1.0, defaults.exposure_min, 2)
         self.orb = _ThresholdSlider("ORB min:", 0, 1000, defaults.orb_min, 0)
         self.ssim = _ThresholdSlider("SSIM max:", 0.5, 1.0, defaults.ssim_max, 3)
         self.per_dir_min = _ThresholdSlider("Per-dir min:", 0, 100, defaults.per_direction_min, 0)
 
-        for slider in (self.sharpness, self.exposure, self.orb, self.ssim, self.per_dir_min):
+        for slider in (self.sharpness, self.tenengrad, self.exposure, self.orb, self.ssim, self.per_dir_min):
             slider.valueChanged.connect(self.thresholdsChanged.emit)
             layout.addWidget(slider)
 
@@ -98,6 +99,7 @@ class _TierControls(QGroupBox):
     def get_thresholds(self) -> ThresholdConfig:
         return ThresholdConfig(
             sharpness_min=self.sharpness.value(),
+            tenengrad_min=self.tenengrad.value(),
             exposure_min=self.exposure.value(),
             orb_min=int(self.orb.value()),
             ssim_max=self.ssim.value(),

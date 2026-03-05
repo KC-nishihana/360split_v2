@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 MANIFEST_FIELDS = [
     "frame_idx", "timestamp", "stream", "direction",
     "tier", "adopted", "reason", "score",
-    "laplacian_var", "mean_intensity", "clipped_high_ratio", "clipped_low_ratio",
+    "laplacian_var", "tenengrad", "mean_intensity", "clipped_high_ratio", "clipped_low_ratio",
     "exposure_score", "orb_keypoints", "ssim_prev",
     "filename",
 ]
@@ -66,6 +66,7 @@ def write_manifest_csv(
             "reason": sf.reason,
             "score": f"{sf.score:.4f}",
             "laplacian_var": f"{m.laplacian_var:.2f}",
+            "tenengrad": f"{m.tenengrad:.2f}",
             "mean_intensity": f"{m.mean_intensity:.2f}",
             "clipped_high_ratio": f"{m.clipped_high_ratio:.6f}",
             "clipped_low_ratio": f"{m.clipped_low_ratio:.6f}",

@@ -15,12 +15,14 @@ camera_back:
 
 projection:
   directions:
-    - {name: front, yaw_deg: 0}
-    - {name: left, yaw_deg: -90}
-    - {name: right, yaw_deg: 90}
-    - {name: back, yaw_deg: 180}
-  hfov_deg: 90
-  vfov_deg: 90
+    - {name: front, yaw_deg:     0.0}
+    - {name: left,  yaw_deg:    25.5}  # cross_yaw(50.5) - inward(25.0)
+    - {name: right, yaw_deg:   -25.5}  # cross_yaw(50.5) - inward(25.0)
+    - {name: up,    pitch_deg:  25.5} # cross_pitch(50.5) - inward(25.0)
+    - {name: down,  pitch_deg: -25.5} # cross_pitch(50.5) - inward(25.0)
+    # back は camera_back の front(yaw=0°) で生成されるため不要
+  hfov_deg: 80.0  # 前バージョン準拠 (90 → 80)
+  vfov_deg: 80.0  # 前バージョン準拠 (90 → 80)
   output_size: [1600, 1600]
 
 extraction:

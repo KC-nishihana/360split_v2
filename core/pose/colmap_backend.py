@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -208,12 +209,21 @@ class COLMAPPoseEstimator(PoseEstimator):
             found = shutil.which(requested)
             if found:
                 candidates.append(found)
-            candidates.extend(
-                [
-                    f"/opt/homebrew/bin/{requested}",
-                    f"/usr/local/bin/{requested}",
-                ]
-            )
+            if sys.platform == "win32":
+                exe = requested if requested.lower().endswith(".exe") else f"{requested}.exe"
+                candidates.extend(
+                    [
+                        str(Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "COLMAP" / exe),
+                        str(Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Public")) / "COLMAP" / exe),
+                    ]
+                )
+            else:
+                candidates.extend(
+                    [
+                        f"/opt/homebrew/bin/{requested}",
+                        f"/usr/local/bin/{requested}",
+                    ]
+                )
 
         seen = set()
         deduped: List[str] = []
@@ -224,9 +234,13 @@ class COLMAPPoseEstimator(PoseEstimator):
             deduped.append(c)
 
         if not deduped:
-            raise RuntimeError(
-                "COLMAP is not installed or not in PATH. Install with `brew install colmap` or pass --colmap-path."
-            )
+            if sys.platform == "win32":
+                install_hint = "Install COLMAP from https://colmap.github.io/install.html or pass --colmap-path."
+            elif sys.platform == "darwin":
+                install_hint = "Install with `brew install colmap` or pass --colmap-path."
+            else:
+                install_hint = "Install with `sudo apt install colmap` or pass --colmap-path."
+            raise RuntimeError(f"COLMAP is not installed or not in PATH. {install_hint}")
 
         errors: List[str] = []
         for c in deduped:
@@ -245,6 +259,13 @@ class COLMAPPoseEstimator(PoseEstimator):
                 if int(proc.returncode) == 0:
                     return c
                 detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                combined_err = " ".join(detail).lower()
+                if "library not loaded" in combined_err or "dyld" in combined_err:
+                    raise RuntimeError(
+                        f"COLMAP cannot load a required shared library (dyld error).\n"
+                        f"  Fix: brew reinstall glog && brew reinstall colmap\n"
+                        f"  Detail: {detail[-1] if detail else 'see stderr'}"
+                    )
                 tail = detail[-1] if detail else f"returncode={proc.returncode}"
                 errors.append(f"{c}: {tail}")
             except Exception as e:
@@ -330,7 +351,7 @@ class COLMAPPoseEstimator(PoseEstimator):
             if on_log:
                 on_log(f"[{step_name}] {msg}")
             low = msg.lower()
-            if "error" in low or "failed" in low:
+            if "error" in low or "failed" in low or "library not loaded" in low or "dyld" in low:
                 last_error = msg
 
         ret = process.wait()

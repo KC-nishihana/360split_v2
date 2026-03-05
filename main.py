@@ -1557,13 +1557,22 @@ def _validate_colmap_executable(colmap_path: str) -> Tuple[bool, str]:
         found = shutil.which(candidate)
         if found:
             candidates.append(found)
-        # Prefer Homebrew path if PATH is shadowed by legacy /usr/local binary.
-        candidates.extend(
-            [
-                f"/opt/homebrew/bin/{candidate}",
-                f"/usr/local/bin/{candidate}",
-            ]
-        )
+        if sys.platform == "win32":
+            exe = candidate if candidate.lower().endswith(".exe") else f"{candidate}.exe"
+            candidates.extend(
+                [
+                    str(Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "COLMAP" / exe),
+                    str(Path(os.environ.get("LOCALAPPDATA", r"C:\Users\Public")) / "COLMAP" / exe),
+                ]
+            )
+        else:
+            # Prefer Homebrew path if PATH is shadowed by legacy /usr/local binary.
+            candidates.extend(
+                [
+                    f"/opt/homebrew/bin/{candidate}",
+                    f"/usr/local/bin/{candidate}",
+                ]
+            )
 
     seen = set()
     final_candidates: List[str] = []

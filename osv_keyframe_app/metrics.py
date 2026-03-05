@@ -26,6 +26,7 @@ class FrameMetrics:
     stream: str
     direction: str
     laplacian_var: float
+    tenengrad: float
     mean_intensity: float
     clipped_high_ratio: float
     clipped_low_ratio: float
@@ -41,6 +42,24 @@ class FrameMetrics:
 METRICS_CSV_FIELDS = [f.name for f in fields(FrameMetrics)]
 
 
+def _build_gaussian_weight_map(height: int, width: int, sigma_ratio: float = 0.35) -> np.ndarray:
+    """Build a 2-D Gaussian weight map centred at the image centre.
+
+    Used to up-weight the optically sharpest region of pinhole-projected images.
+
+    Parameters
+    ----------
+    sigma_ratio : standard deviation as a fraction of min(height, width).
+    """
+    cy, cx = (height - 1) / 2.0, (width - 1) / 2.0
+    sigma = sigma_ratio * min(height, width)
+    ys = np.arange(height, dtype=np.float32)
+    xs = np.arange(width, dtype=np.float32)
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    weight = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * sigma ** 2))
+    return weight.astype(np.float32)
+
+
 class MetricsComputer:
     """Compute quality metrics for projected pinhole images."""
 
@@ -48,6 +67,8 @@ class MetricsComputer:
         self._orb = cv2.ORB_create(nfeatures=orb_features)
         self._ssim_computer = AdaptiveSelector(ssim_scale=ssim_scale)
         self._prev_images: Dict[str, np.ndarray] = {}  # key: "stream_direction"
+        # Cache Gaussian weight maps keyed by (height, width) to avoid recomputing
+        self._weight_cache: Dict[tuple, np.ndarray] = {}
 
     def reset(self) -> None:
         """Clear previous frame cache."""
@@ -76,8 +97,21 @@ class MetricsComputer:
         results: List[FrameMetrics] = []
 
         for direction, img in images.items():
+            # Build / retrieve cached Gaussian weight map for this image size
+            h, w = img.shape[:2]
+            wmap_key = (h, w)
+            if wmap_key not in self._weight_cache:
+                self._weight_cache[wmap_key] = _build_gaussian_weight_map(h, w)
+            weight_map = self._weight_cache[wmap_key]
+
             # Compute raw quality metrics (reuse existing)
-            raw = compute_raw_metrics(img, roi_spec=None, use_orb=True, orb=self._orb)
+            raw = compute_raw_metrics(
+                img,
+                roi_spec=None,
+                use_orb=True,
+                orb=self._orb,
+                tenengrad_weight_map=weight_map,
+            )
 
             # Compute additional exposure details
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
@@ -105,6 +139,7 @@ class MetricsComputer:
                 stream=stream,
                 direction=direction,
                 laplacian_var=float(raw["laplacian_var"]),
+                tenengrad=float(raw["tenengrad"]),
                 mean_intensity=mean_intensity,
                 clipped_high_ratio=clipped_high_ratio,
                 clipped_low_ratio=clipped_low_ratio,
@@ -130,6 +165,7 @@ def write_metrics_csv(metrics: List[FrameMetrics], path: Path) -> None:
                 "stream": m.stream,
                 "direction": m.direction,
                 "laplacian_var": f"{m.laplacian_var:.2f}",
+                "tenengrad": f"{m.tenengrad:.2f}",
                 "mean_intensity": f"{m.mean_intensity:.2f}",
                 "clipped_high_ratio": f"{m.clipped_high_ratio:.6f}",
                 "clipped_low_ratio": f"{m.clipped_low_ratio:.6f}",
@@ -153,6 +189,7 @@ def load_metrics_csv(path: Path) -> List[FrameMetrics]:
                 stream=row["stream"],
                 direction=row["direction"],
                 laplacian_var=float(row["laplacian_var"]),
+                tenengrad=float(row.get("tenengrad", 0.0)),
                 mean_intensity=float(row["mean_intensity"]),
                 clipped_high_ratio=float(row["clipped_high_ratio"]),
                 clipped_low_ratio=float(row["clipped_low_ratio"]),

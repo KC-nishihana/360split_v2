@@ -119,6 +119,7 @@ class ThresholdConfig:
     """Selection thresholds for one tier (SfM or 3DGS)."""
 
     sharpness_min: float = 100.0
+    tenengrad_min: float = 0.0  # 0 = disabled; SfM recommend ~500, 3DGS ~200
     exposure_min: float = 0.3
     orb_min: int = 50
     ssim_max: float = 0.95
@@ -131,12 +132,12 @@ class SelectionConfig:
     """2-tier selection configuration."""
 
     sfm: ThresholdConfig = field(default_factory=lambda: ThresholdConfig(
-        sharpness_min=150.0, exposure_min=0.4, orb_min=100,
-        ssim_max=0.92, per_direction_min=20,
+        sharpness_min=150.0, tenengrad_min=500.0, exposure_min=0.4,
+        orb_min=100, ssim_max=0.92, per_direction_min=20,
     ))
     gs: ThresholdConfig = field(default_factory=lambda: ThresholdConfig(
-        sharpness_min=80.0, exposure_min=0.3, orb_min=50,
-        ssim_max=0.96, per_direction_min=10,
+        sharpness_min=80.0, tenengrad_min=200.0, exposure_min=0.3,
+        orb_min=50, ssim_max=0.96, per_direction_min=10,
     ))
 
 

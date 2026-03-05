@@ -61,16 +61,29 @@ class SelectionResult:
 
 
 def _compute_quality_score(m: FrameMetrics) -> float:
-    """Compute composite quality score [0, 1] from metrics."""
-    # Normalize components to rough [0, 1] range
+    """Compute composite quality score [0, 1] from metrics.
+
+    Weights:
+      Laplacian sharpness  25%  (normalized by 500)
+      Tenengrad            15%  (normalized by 2000; Sobel gradient energy)
+      Exposure             25%
+      ORB keypoints        20%  (normalized by 500)
+      Novelty (1-SSIM)     15%
+    """
     sharpness_norm = float(np.clip(m.laplacian_var / 500.0, 0.0, 1.0))
+    tenengrad_norm = float(np.clip(m.tenengrad / 2000.0, 0.0, 1.0))
     exposure_norm = m.exposure_score
     orb_norm = float(np.clip(m.orb_keypoints / 500.0, 0.0, 1.0))
     # Novelty: lower SSIM = more novel content
     novelty_norm = float(np.clip(1.0 - m.ssim_prev, 0.0, 1.0))
 
-    # Weighted combination
-    score = 0.35 * sharpness_norm + 0.25 * exposure_norm + 0.20 * orb_norm + 0.20 * novelty_norm
+    score = (
+        0.25 * sharpness_norm
+        + 0.15 * tenengrad_norm
+        + 0.25 * exposure_norm
+        + 0.20 * orb_norm
+        + 0.15 * novelty_norm
+    )
     return float(np.clip(score, 0.0, 1.0))
 
 
@@ -98,6 +111,8 @@ class TierSelector:
             reasons = []
             if m.laplacian_var < self._t.sharpness_min:
                 reasons.append(f"sharpness({m.laplacian_var:.1f}<{self._t.sharpness_min})")
+            if self._t.tenengrad_min > 0 and m.tenengrad < self._t.tenengrad_min:
+                reasons.append(f"tenengrad({m.tenengrad:.1f}<{self._t.tenengrad_min})")
             if m.exposure_score < self._t.exposure_min:
                 reasons.append(f"exposure({m.exposure_score:.3f}<{self._t.exposure_min})")
             if m.orb_keypoints < self._t.orb_min:

@@ -29,11 +29,13 @@ DIRECTION_COLORS = {
     "front": (66, 133, 244),   # blue
     "left": (234, 67, 53),     # red
     "right": (52, 168, 83),    # green
-    "back": (251, 188, 4),     # yellow
+    "up": (251, 188, 4),       # yellow
+    "down": (161, 66, 244),    # purple
 }
 
 METRIC_LABELS = {
     "laplacian_var": "Sharpness (Laplacian Var)",
+    "tenengrad": "Sharpness (Tenengrad)",
     "exposure_score": "Exposure Score",
     "orb_keypoints": "ORB Keypoints",
     "ssim_prev": "SSIM (Adjacent Frame)",
@@ -63,7 +65,7 @@ class MetricsTab(QWidget):
 
         filter_layout.addWidget(QLabel("Direction:"))
         self._direction_combo = QComboBox()
-        self._direction_combo.addItems(["All", "front", "left", "right", "back"])
+        self._direction_combo.addItems(["All", "front", "left", "right", "up", "down"])
         self._direction_combo.currentTextChanged.connect(self._update_plots)
         filter_layout.addWidget(self._direction_combo)
 
@@ -90,7 +92,7 @@ class MetricsTab(QWidget):
             self._plots[metric_key] = plot_widget
             self._curves[metric_key] = {}
 
-            if metric_key in ("laplacian_var", "exposure_score"):
+            if metric_key in ("laplacian_var", "tenengrad", "exposure_score"):
                 top_splitter.addWidget(plot_widget)
             else:
                 bottom_splitter.addWidget(plot_widget)

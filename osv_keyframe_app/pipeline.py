@@ -46,6 +46,8 @@ class Pipeline:
         self._config = config
         self._projector = FisheyeProjector(config)
         self._metrics = MetricsComputer()
+        # Track last read index per cap to avoid redundant seeks on consecutive frames
+        self._last_idx: Dict[int, int] = {}
 
     def run(
         self,
@@ -96,6 +98,7 @@ class Pipeline:
 
         cap_front = cv2.VideoCapture(str(split.front_path))
         cap_back = cv2.VideoCapture(str(split.back_path))
+        self._last_idx = {}  # Reset seek tracking for new run
 
         try:
             for i, frame_idx in enumerate(frame_indices):
@@ -188,13 +191,20 @@ class Pipeline:
         )
         return indices
 
-    @staticmethod
-    def _read_frame(cap: cv2.VideoCapture, frame_idx: int) -> Optional[np.ndarray]:
-        """Read a specific frame from a video capture."""
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    def _read_frame(self, cap: cv2.VideoCapture, frame_idx: int) -> Optional[np.ndarray]:
+        """Read a specific frame from a video capture.
+
+        Avoids redundant GOP seeks when frames are read consecutively.
+        """
+        cap_id = id(cap)
+        if self._last_idx.get(cap_id) != frame_idx - 1:
+            # Non-consecutive: explicit seek required
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret or frame is None:
+            self._last_idx.pop(cap_id, None)
             return None
+        self._last_idx[cap_id] = frame_idx
         return frame
 
     @staticmethod

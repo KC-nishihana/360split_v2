@@ -54,6 +54,18 @@ class ColmapRunner:
         self._config = config
         self._projection = projection
         self._colmap_bin = self._resolve_binary(config.binary_path)
+        # Detect GPU option names: COLMAP 3.13+ renamed SiftExtraction/SiftMatching
+        # to FeatureExtraction/FeatureMatching.
+        self._extract_gpu_opt = (
+            "--FeatureExtraction.use_gpu"
+            if self._command_supports_option(self._colmap_bin, "feature_extractor", "--FeatureExtraction.use_gpu")
+            else "--SiftExtraction.use_gpu"
+        )
+        self._match_gpu_opt = (
+            "--FeatureMatching.use_gpu"
+            if self._command_supports_option(self._colmap_bin, "sequential_matcher", "--FeatureMatching.use_gpu")
+            else "--SiftMatching.use_gpu"
+        )
 
     @staticmethod
     def _resolve_binary(binary_path: str) -> str:
@@ -67,6 +79,21 @@ class ColmapRunner:
             f"COLMAP binary not found: {binary_path}\n"
             "Install COLMAP: https://colmap.github.io/install.html"
         )
+
+    @staticmethod
+    def _command_supports_option(colmap_bin: str, command: str, option_name: str) -> bool:
+        """Return True if the given COLMAP command lists option_name in its help text."""
+        try:
+            proc = subprocess.run(
+                [colmap_bin, command, "-h"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+            )
+            return option_name in (proc.stdout or "")
+        except Exception:
+            return False
 
     def _camera_params_str(self) -> str:
         """Build COLMAP camera params string from projection config."""
@@ -261,7 +288,7 @@ class ColmapRunner:
             "--ImageReader.camera_params", self._camera_params_str(),
         ]
         if not self._config.use_gpu:
-            cmd.extend(["--SiftExtraction.use_gpu", "0"])
+            cmd.extend([self._extract_gpu_opt, "0"])
         self._run_cmd(cmd, log_callback, full_log)
 
     def _run_matcher(
@@ -274,7 +301,7 @@ class ColmapRunner:
             "--database_path", str(db_path),
         ]
         if not self._config.use_gpu:
-            cmd.extend(["--SiftMatching.use_gpu", "0"])
+            cmd.extend([self._match_gpu_opt, "0"])
         self._run_cmd(cmd, log_callback, full_log)
 
     def _run_mapper(

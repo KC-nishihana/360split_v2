@@ -93,19 +93,40 @@ def _safe_scale(scale: float) -> float:
     return float(np.clip(value, 0.1, 1.0))
 
 
-def _compute_tenengrad(gray: np.ndarray, mask: np.ndarray, tenengrad_scale: float) -> float:
+def _compute_tenengrad(
+    gray: np.ndarray,
+    mask: np.ndarray,
+    tenengrad_scale: float,
+    weight_map: Optional[np.ndarray] = None,
+) -> float:
+    """Compute Tenengrad (Sobel gradient energy) sharpness score.
+
+    Parameters
+    ----------
+    weight_map : optional float32/float64 array same shape as ``gray`` (before
+        scaling), with values in [0, 1].  When provided, the gradient-energy map
+        is multiplied element-wise by the (possibly resized) weight map before
+        averaging.  Pass ``None`` (default) for the original unweighted behaviour.
+        Typical use: 2-D Gaussian centered at the principal point for pinhole-
+        projected images to up-weight the sharp optical centre.
+    """
     scale = _safe_scale(tenengrad_scale)
     work_gray = gray
     work_mask = mask
+    work_weight = weight_map
     if scale < 0.999:
         h, w = gray.shape[:2]
         nw = max(1, int(round(w * scale)))
         nh = max(1, int(round(h * scale)))
         work_gray = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_AREA)
         work_mask = cv2.resize(mask, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        if work_weight is not None:
+            work_weight = cv2.resize(work_weight, (nw, nh), interpolation=cv2.INTER_AREA)
     sobel_x = cv2.Sobel(work_gray, cv2.CV_64F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(work_gray, cv2.CV_64F, 0, 1, ksize=3)
     tenengrad_map = (sobel_x * sobel_x) + (sobel_y * sobel_y)
+    if work_weight is not None:
+        tenengrad_map = tenengrad_map * work_weight.astype(np.float64)
     tenengrad_vals = _masked_values(tenengrad_map, work_mask)
     return float(np.mean(tenengrad_vals)) if tenengrad_vals.size > 0 else 0.0
 
@@ -137,8 +158,17 @@ def compute_raw_metrics(
     use_orb: bool = True,
     orb: Optional[cv2.ORB] = None,
     tenengrad_scale: float = 1.0,
+    tenengrad_weight_map: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    """Compute raw quality metrics on ROI."""
+    """Compute raw quality metrics on ROI.
+
+    Parameters
+    ----------
+    tenengrad_weight_map : optional spatial weight map (same H×W as frame,
+        values in [0, 1]) applied to the Tenengrad gradient-energy map before
+        averaging.  Useful for pinhole-projected images where the optical centre
+        is sharpest: pass a 2-D Gaussian centred at ``(cx, cy)``.
+    """
     gray = _to_gray(frame)
     spec = parse_roi_spec(roi_spec)
     mask = _build_roi_mask(gray, spec)
@@ -148,7 +178,7 @@ def compute_raw_metrics(
     lap_vals = _masked_values(lap, mask)
     lap_var = float(np.var(lap_vals)) if lap_vals.size > 0 else 0.0
 
-    tenengrad = _compute_tenengrad(gray, mask, tenengrad_scale)
+    tenengrad = _compute_tenengrad(gray, mask, tenengrad_scale, tenengrad_weight_map)
 
     black_clip = float(np.mean(vals <= 16.0)) if vals.size > 0 else 1.0
     white_clip = float(np.mean(vals >= 245.0)) if vals.size > 0 else 1.0

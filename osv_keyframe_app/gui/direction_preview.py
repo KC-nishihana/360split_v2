@@ -32,14 +32,14 @@ def _cv2_to_qpixmap(img: np.ndarray, max_size: int = THUMBNAIL_SIZE) -> QPixmap:
 
 
 class DirectionPreview(QWidget):
-    """2x4 grid of thumbnail images for front/back x 4 directions."""
+    """2x5 grid of thumbnail images for front/back x 5 directions."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._projected_dir: Optional[Path] = None
         self._frame_indices: List[int] = []
         self._streams = ["front", "back"]
-        self._directions = ["front", "left", "right", "back"]
+        self._directions = ["front", "left", "right", "up", "down"]
         self._labels: Dict[str, QLabel] = {}
         self._setup_ui()
 
